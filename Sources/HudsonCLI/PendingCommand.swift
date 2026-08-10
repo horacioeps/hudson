@@ -20,12 +20,15 @@ struct PendingCommand: AsyncParsableCommand {
                 return
             }
             for mutation in mutations {
-                // Message ids are Gmail-issued but still echoed back
-                // verbatim from the queue row — single-line sanitize as a
-                // defense-in-depth match for `list`/`show`'s row output.
+                // Message and label ids are Gmail-issued but still echoed
+                // back verbatim from the queue row — single-line sanitize
+                // both as a defense-in-depth match for `list`/`show`'s row
+                // output (a user-named label is user-controlled text one
+                // level up, same as a message's From/Subject).
                 let id = Sanitizer.terminalSafe(mutation.messageID, singleLine: true)
+                let labelID = Sanitizer.terminalSafe(mutation.labelID, singleLine: true)
                 let op = mutation.op.rawValue.padding(toLength: 6, withPad: " ", startingAt: 0)
-                print("\(id)  \(op) \(mutation.labelID)  [\(mutation.state)]")
+                print("\(id)  \(op) \(labelID)  [\(mutation.state)]")
             }
         } catch let error as GmailError {
             throw reportAndFail(error)
