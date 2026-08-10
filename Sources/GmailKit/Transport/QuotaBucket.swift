@@ -9,6 +9,8 @@ public enum GmailQuotaCost {
     public static let messagesList = 5
     public static let messagesGet = 20
     public static let messagesSend = 100
+    public static let messagesModify = 5
+    public static let messagesBatchModify = 50
 }
 
 /// Client-side rolling-minute rate limiter. Google enforces 6,000 quota
