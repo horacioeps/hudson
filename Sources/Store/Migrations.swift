@@ -1,5 +1,44 @@
 import GRDB
 
+/// The one-time bulk build that seeds `thread_rollup`, `message_seq`, and
+/// `fts_messages` from whatever's already in `messages` / `message_bodies` /
+/// `message_labels`. Run exactly once, by migration `v3`, against
+/// whatever's already synced (so a 100k-message install doesn't open to an
+/// empty inbox) — the query layer's incremental maintenance keeps these
+/// tables current afterward. Extracted to a named function (rather than
+/// inlined raw SQL in the migration closure) so `QueryLayerMigrationTests`
+/// can exercise the exact same statements against seeded data: this is raw
+/// SQL with no compiler type-checking, and a subtle bug here would silently
+/// mis-populate every existing install's inbox.
+func runQueryLayerBulkBuild(_ db: Database) throws {
+    try db.execute(sql: """
+        INSERT INTO thread_rollup (account_email, thread_id, last_message_at, last_message_id,
+                                   subject, snippet, from_summary, message_count, unread, in_inbox)
+        SELECT m.account_email, m.thread_id,
+               MAX(m.internal_date),
+               (SELECT id FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
+                 ORDER BY internal_date DESC, id DESC LIMIT 1),
+               (SELECT subject FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
+                 ORDER BY internal_date DESC, id DESC LIMIT 1),
+               (SELECT snippet FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
+                 ORDER BY internal_date DESC, id DESC LIMIT 1),
+               '', COUNT(*),
+               MAX(EXISTS(SELECT 1 FROM message_labels ml WHERE ml.account_email=m.account_email AND ml.message_id=m.id AND ml.label_id='UNREAD')),
+               MAX(EXISTS(SELECT 1 FROM message_labels ml WHERE ml.account_email=m.account_email AND ml.message_id=m.id AND ml.label_id='INBOX'))
+        FROM messages m GROUP BY m.account_email, m.thread_id
+        """)
+
+    try db.execute(sql: """
+        INSERT INTO message_seq (account_email, message_id) SELECT account_email, id FROM messages
+        """)
+    try db.execute(sql: """
+        INSERT INTO fts_messages (rowid, subject, from_addr, to_addr, body, message_id, thread_id)
+        SELECT s.seq, m.subject, m.from_line, m.to_line, IFNULL(b.plain_text,''), m.id, m.thread_id
+        FROM messages m JOIN message_seq s ON s.account_email=m.account_email AND s.message_id=m.id
+        LEFT JOIN message_bodies b ON b.account_email=m.account_email AND b.message_id=m.id
+        """)
+}
+
 /// Schema history. Migrations are append-only: never edit a registered
 /// migration after it ships — add a new one.
 let migrator: DatabaseMigrator = {
@@ -228,34 +267,10 @@ let migrator: DatabaseMigrator = {
         // --- One-time bulk build: an install with 100k already-synced
         // messages must not open to an empty inbox. This GROUP BY runs
         // exactly once, here, in the migration — the query layer's
-        // incremental maintenance (Tasks 2/3) keeps it current afterward. ---
-
-        try db.execute(sql: """
-            INSERT INTO thread_rollup (account_email, thread_id, last_message_at, last_message_id,
-                                       subject, snippet, from_summary, message_count, unread, in_inbox)
-            SELECT m.account_email, m.thread_id,
-                   MAX(m.internal_date),
-                   (SELECT id FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
-                     ORDER BY internal_date DESC, id DESC LIMIT 1),
-                   (SELECT subject FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
-                     ORDER BY internal_date DESC, id DESC LIMIT 1),
-                   (SELECT snippet FROM messages m2 WHERE m2.account_email=m.account_email AND m2.thread_id=m.thread_id
-                     ORDER BY internal_date DESC, id DESC LIMIT 1),
-                   '', COUNT(*),
-                   MAX(EXISTS(SELECT 1 FROM message_labels ml WHERE ml.account_email=m.account_email AND ml.message_id=m.id AND ml.label_id='UNREAD')),
-                   MAX(EXISTS(SELECT 1 FROM message_labels ml WHERE ml.account_email=m.account_email AND ml.message_id=m.id AND ml.label_id='INBOX'))
-            FROM messages m GROUP BY m.account_email, m.thread_id
-            """)
-
-        try db.execute(sql: """
-            INSERT INTO message_seq (account_email, message_id) SELECT account_email, id FROM messages
-            """)
-        try db.execute(sql: """
-            INSERT INTO fts_messages (rowid, subject, from_addr, to_addr, body, message_id, thread_id)
-            SELECT s.seq, m.subject, m.from_line, m.to_line, IFNULL(b.plain_text,''), m.id, m.thread_id
-            FROM messages m JOIN message_seq s ON s.account_email=m.account_email AND s.message_id=m.id
-            LEFT JOIN message_bodies b ON b.account_email=m.account_email AND b.message_id=m.id
-            """)
+        // incremental maintenance (Tasks 2/3) keeps it current afterward.
+        // See `runQueryLayerBulkBuild` — shared with QueryLayerMigrationTests
+        // so the test exercises the exact SQL the migration runs. ---
+        try runQueryLayerBulkBuild(db)
     }
 
     return migrator
