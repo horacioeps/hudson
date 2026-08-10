@@ -15,7 +15,7 @@ struct ListCommand: AsyncParsableCommand {
 
     func run() async throws {
         do {
-            let runtime = try await Runtime.bootstrap()
+            let runtime = try await LocalRuntime.local()
             let rows = try await runtime.database.recentMessages(
                 account: runtime.account.email, limit: limit)
             guard !rows.isEmpty else {

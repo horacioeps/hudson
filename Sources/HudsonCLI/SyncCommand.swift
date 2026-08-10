@@ -19,11 +19,12 @@ struct SyncCommand: AsyncParsableCommand {
 
     func run() async throws {
         do {
-            let runtime = try await Runtime.bootstrap()
             if status {
+                let runtime = try await LocalRuntime.local()
                 try await printStatus(runtime)
                 return
             }
+            let runtime = try await Runtime.bootstrap()
             var totalMessages = 0
             var totalBodies = 0
             repeat {
@@ -42,7 +43,7 @@ struct SyncCommand: AsyncParsableCommand {
         }
     }
 
-    private func printStatus(_ runtime: Runtime) async throws {
+    private func printStatus(_ runtime: LocalRuntime) async throws {
         let account = runtime.account
         print("Account:        \(account.email)")
         print("Backfill:       \(account.backfillState) (\(account.backfilledCount) messages)")
