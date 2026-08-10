@@ -158,6 +158,8 @@ Every triage action (archive, star, read/unread, label, trash, snooze) becomes:
 
 **Conflict model — rebase, not deferral:** history events always apply immediately, in order, to the canonical server-state tables, and the cursor always advances. Effective local state = server state **plus** the pending queue's label deltas re-applied as an overlay (keyed by message id + label id; all in-scope ops are commutative set operations). An overlay entry is dropped when its op's flush returns 2xx (not by matching echo history events — Gmail events carry no origin tag) or on terminal failure, letting server state show through. This eliminates head-of-line blocking, the crash-window loss of deferred events, and cursor stalls that the earlier "defer contradicting events" design implied.
 
+**M3 Implementation:** The read-time overlay, cursor-gated retirement (dropping stale queued mutations when the cursor advances past them), and mutation flusher with dedup are implemented as described in the architecture doc (docs/superpowers/design/2026-08-10-speed-ai-architecture.md, M3 section).
+
 ## 6. Auth (BYO OAuth)
 
 ### 6.1 Guided setup
@@ -255,7 +257,7 @@ Each gets its own implementation plan (superpowers writing-plans):
 
 - **M1 — DONE:** OAuth wizard (publish-status verification, client ID+secret), token store + CLI signing script, typed client, quota-aware transport. CLI: `auth`, `profile`.
 - **M2 — DONE:** schema, migrations, versioned writes + tombstones, sanitizer pipeline, concurrent backfill/poll skeleton. CLI: `sync`, `list`, `show`.
-- **M3 — Mutations + incremental sync:** queue, overlay model, flusher, single-flight discipline, reconciliation path. CLI: `archive`, `star`, `read`.
+- **M3 — DONE:** queue, overlay model, flusher, single-flight discipline, reconciliation path. CLI: `archive`, `star`, `read`, `pending`, `undo`.
 - **M4 — Query layer:** FTS5 search (+ server-merge during hydration, `--rebuild-index`) and split inbox (`split_rules`, category persistence test). CLI: `search`, `inbox --split`.
 - **M5 — Send:** MIME builder, dedup state machine, send, reply threading. CLI: `send`, `reply`.
 - **M6 — Scheduling:** snooze, send-later with draft mirror, wake/clock-change catch-up. CLI: `snooze`, `later`.

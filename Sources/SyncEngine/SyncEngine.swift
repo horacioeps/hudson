@@ -10,6 +10,8 @@ public protocol GmailAPI: Sendable {
     func getMessage(id: String, format: String) async throws -> GmailMessage
     func listHistory(startHistoryID: String, pageToken: String?) async throws -> HistoryPage
     func listLabels() async throws -> [GmailLabel]
+    func modify(id: String, addLabelIDs: [String], removeLabelIDs: [String]) async throws -> GmailMessage
+    func batchModify(ids: [String], addLabelIDs: [String], removeLabelIDs: [String]) async throws
 }
 
 extension GmailClient: GmailAPI {}
@@ -102,11 +104,23 @@ public actor SyncEngine {
     // MARK: - History (M2: applied via Store; expiry fallback restarts backfill)
 
     /// Polls history.list from the stored cursor and applies each page's
-    /// changes in order — one transaction per page, cursor advanced inside it
-    /// (spec §4.3). Unknown ids get hydrated afterwards. A 404 from
-    /// `listHistory` (and *only* from `listHistory` — see below) means the
-    /// cursor expired: M2's fallback resets backfill and re-lists (M3 brings
-    /// the cheaper format=minimal reconciliation).
+    /// changes in order, then advances the cursor exactly ONCE, after the
+    /// last page (spec §4.3). Unknown ids get hydrated afterwards. A 404
+    /// from `listHistory` (and *only* from `listHistory` — see below) means
+    /// the cursor expired: M2's fallback resets backfill and re-lists (M3
+    /// brings the cheaper format=minimal reconciliation).
+    ///
+    /// The cursor is deliberately NOT committed per page: Gmail reports the
+    /// *current mailbox* historyId on every page of a poll, not "as of this
+    /// page," so a per-page commit would jump the cursor to its final value
+    /// on page 1 while pages 2..N are still unapplied — a crash between
+    /// pages would then silently lose them (M2-review-deferred crash-window
+    /// fix). Instead each page's changes are applied via
+    /// `applyHistoryChanges` (cursor untouched) and the last page's
+    /// historyId is committed via `advanceCursor` only once pagination
+    /// finishes. A crash anywhere in the loop leaves the cursor at its old
+    /// value, so the next pass's re-poll simply re-applies from there —
+    /// safe because of the §4.2 version guard.
     private func pollHistory() async throws -> Int {
         historyExpiredThisPass = false
         guard let cursor = try await requireAccount().historyCursor else { return 0 }
@@ -115,9 +129,11 @@ public actor SyncEngine {
         // Fixed for the whole pagination loop: a Gmail page token continues
         // the listing it was created by, so pairing it with a startHistoryId
         // that changed between pages is undefined. Only pageToken advances
-        // between pages; the per-page cursor is still committed to the store
-        // via applyHistory(newCursor: page.historyId) below.
+        // between pages.
         let start = String(cursor)
+        // Tracks the most recently seen page historyId, committed once via
+        // `advanceCursor` after the loop — see the doc comment above.
+        var lastHistoryID = cursor
         repeat {
             let page: HistoryPage
             do {
@@ -139,9 +155,8 @@ public actor SyncEngine {
                 return 0
             }
             let changes = HistoryMapping.changes(from: page.history ?? [])
-            let newCursor = page.historyId.flatMap(Int64.init) ?? cursor
-            let unknownIDs = try await database.applyHistory(
-                changes, newCursor: newCursor, account: account)
+            lastHistoryID = page.historyId.flatMap(Int64.init) ?? lastHistoryID
+            let unknownIDs = try await database.applyHistoryChanges(changes, account: account)
             applied += changes.count
             for id in unknownIDs {
                 do {
@@ -155,13 +170,14 @@ public actor SyncEngine {
                     // no id/content in logs), the same treatment backfill
                     // gives a per-message 404 (see `logSkippedMessage`
                     // below). Any other error still propagates: the cursor
-                    // for this page has already been committed by
-                    // `applyHistory` above, so a real failure here should
-                    // surface rather than be swallowed.
+                    // hasn't been committed yet (only `advanceCursor` after
+                    // the loop does that), so a real failure here simply
+                    // leaves it at its old value — safe to retry from.
                 }
             }
             pageToken = page.nextPageToken
         } while pageToken != nil
+        try await database.advanceCursor(to: lastHistoryID, account: account)
         return applied
     }
 
@@ -176,20 +192,23 @@ public actor SyncEngine {
         for _ in 0..<maxPages {
             let page = try await api.listMessages(
                 pageToken: record.backfillPageToken, maxResults: pageSize)
-            var added = 0
+            var snapshots: [MessageSnapshot] = []
             for ref in page.messages ?? [] {
                 do {
                     let message = try await api.getMessage(id: ref.id, format: "metadata")
                     guard let snapshot = SnapshotMapping.snapshot(from: message) else { continue }
-                    if try await database.applySnapshot(snapshot, account: account) == .applied {
-                        added += 1
-                    }
+                    snapshots.append(snapshot)
                 } catch let error as GmailError {
                     // One bad message must not abort the pass — the page token
                     // still needs to persist so backfill keeps advancing.
                     logSkippedMessage(error, phase: "backfill")
                 }
             }
+            // One commit per page instead of per message: the load-bearing
+            // control against the SwiftUI ValueObservation storm during the
+            // ~6h backfill (architecture M3). Each message is still guarded
+            // by its own SAVEPOINT inside `applySnapshots`.
+            let added = try await database.applySnapshots(snapshots, account: account)
             report.backfilledThisPass += added
             let finished = page.nextPageToken == nil
             try await database.updateBackfill(

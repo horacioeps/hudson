@@ -40,7 +40,65 @@ public struct GmailClient: Sendable {
     func get<Response: Decodable>(
         template: String, path: String, query: [URLQueryItem] = [], cost: Int
     ) async throws -> Response {
-        try await quota.acquire(cost: cost)
+        let (data, _) = try await performNoBody(
+            method: "GET", template: template, path: path, query: query, cost: cost)
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+
+    /// POST returning a decoded body (e.g. messages.modify → Message).
+    /// `quotaClass` defaults to `.background`, the lane every pre-M3 caller
+    /// belongs to; interactive callers (triage's modify/batchModify) pass
+    /// `.interactive` explicitly.
+    func post<Body: Encodable, Response: Decodable>(
+        template: String, path: String, body: Body, cost: Int, class quotaClass: QuotaClass = .background
+    ) async throws -> Response {
+        let (data, _) = try await perform(
+            method: "POST", template: template, path: path, body: body, cost: cost, class: quotaClass)
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+
+    /// POST with no meaningful response body — succeeds on 200 or 204
+    /// (batchModify returns 204 with an empty body). The `get`/`post` decode
+    /// path would throw trying to JSON-decode that empty body; this path
+    /// must not. `quotaClass` defaults to `.background` — see `post` above.
+    func postVoid<Body: Encodable>(
+        template: String, path: String, body: Body, cost: Int, class quotaClass: QuotaClass = .background
+    ) async throws {
+        _ = try await perform(
+            method: "POST", template: template, path: path, body: body, cost: cost, class: quotaClass)
+    }
+
+    /// Sentinel body type for GET's `performNoBody` — GET requests never
+    /// send a JSON body, so this is never actually encoded (`perform`'s
+    /// body branch is skipped when the value is `nil`).
+    private struct NoBody: Encodable {}
+
+    /// GET convenience over `perform`: GET requests never send a body, so
+    /// callers don't have to spell out `Optional<Body>.none` themselves.
+    /// Forwards into the generic `perform` rather than looping itself, so
+    /// GET and POST share one attempt loop.
+    private func performNoBody(
+        method: String, template: String, path: String, query: [URLQueryItem] = [], cost: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        try await perform(
+            method: method, template: template, path: path, query: query,
+            body: Optional<NoBody>.none, cost: cost)
+    }
+
+    /// Shared attempt loop for `get`/`post`/`postVoid`: quota acquire →
+    /// bearer token (one-force-refresh rule) → request → error mapping →
+    /// bounded retry. Returns the final successful `(data, response)` on
+    /// status 200 or 204, or throws. Callers that require a body (`get`,
+    /// `post`) are responsible for handling an unexpected 204 themselves
+    /// (JSON-decoding empty data throws there, which is what we want).
+    /// `quotaClass` defaults to `.background`; `get` (and thus
+    /// `performNoBody`) never overrides it — only `post`/`postVoid` callers
+    /// that need the interactive lane (triage's modify/batchModify) do.
+    private func perform<Body: Encodable>(
+        method: String, template: String, path: String, query: [URLQueryItem] = [],
+        body: Body?, cost: Int, class quotaClass: QuotaClass = .background
+    ) async throws -> (Data, HTTPURLResponse) {
+        try await quota.acquire(cost: cost, class: quotaClass)
         // `hasRetriedAuth` never resets — it gates the ONE-force-refresh rule.
         // `needsForceRefresh` is consumed on next use so only the attempt right
         // after an auth failure force-refreshes; later attempts (429/5xx) go
@@ -60,6 +118,11 @@ public struct GmailClient: Sendable {
                 throw GmailError.invalidRequest(status: 0, message: "Failed to build request URL")
             }
             var request = URLRequest(url: url)
+            request.httpMethod = method
+            if let body {
+                request.httpBody = try JSONEncoder().encode(body)
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            }
             let token: String
             if needsForceRefresh {
                 needsForceRefresh = false
@@ -70,10 +133,10 @@ public struct GmailClient: Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await transport.send(request)
-            Log.transport.info("GET \(template, privacy: .public) -> \(response.statusCode)")
+            Log.transport.info("\(method, privacy: .public) \(template, privacy: .public) -> \(response.statusCode)")
 
-            if response.statusCode == 200 {
-                return try JSONDecoder().decode(Response.self, from: data)
+            if response.statusCode == 200 || response.statusCode == 204 {
+                return (data, response)
             }
 
             let error = GmailError.from(

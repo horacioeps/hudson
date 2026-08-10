@@ -15,7 +15,7 @@ struct ShowCommand: AsyncParsableCommand {
 
     func run() async throws {
         do {
-            let runtime = try await Runtime.bootstrap()
+            let runtime = try await LocalRuntime.local()
             guard let fetched = try await runtime.database.message(
                 id: id, account: runtime.account.email) else {
                 print("No message \(Sanitizer.terminalSafe(id)) in the local store.")
