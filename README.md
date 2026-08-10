@@ -5,7 +5,7 @@ your own API keys, no subscription, no server, no telemetry.
 
 > **Status:** pre-alpha. The headless core is being built milestone by
 > milestone ([spec](docs/superpowers/specs/2026-08-10-hudson-foundation-design.md));
-> the Mac app UI follows. Today you can authenticate, sync your mailbox into a local SQLite store, and read it back instantly from the CLI.
+> the Mac app UI follows. Today you can authenticate, sync your mailbox into a local SQLite store, and read it back instantly from the CLI. Triage actions (archive, star, read) are instant locally and sync to Gmail in the background.
 
 ## Why
 
@@ -27,6 +27,11 @@ swift build
 .build/debug/hudson sync       # download your mailbox into the local store
 .build/debug/hudson list       # newest messages, straight from SQLite
 .build/debug/hudson show <id>  # one message, sanitized, instant
+.build/debug/hudson archive <id>     # archive (instant, optimistic)
+.build/debug/hudson star <id>        # star
+.build/debug/hudson read <id>        # mark read
+.build/debug/hudson pending          # queued triage actions
+.build/debug/hudson undo <id>        # undo a triage action
 ```
 
 `hudson auth` walks you through creating your **own** free Google Cloud OAuth
