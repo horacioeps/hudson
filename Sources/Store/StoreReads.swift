@@ -23,7 +23,7 @@ extension HudsonDatabase {
                 db,
                 sql: """
                     SELECT * FROM messages WHERE account_email = ?
-                    ORDER BY internal_date DESC LIMIT ?
+                    ORDER BY internal_date DESC, id DESC LIMIT ?
                     """,
                 arguments: [account, limit])
             return try rows.map { try Self.messageRow(from: $0, account: account, db: db) }

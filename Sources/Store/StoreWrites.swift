@@ -14,9 +14,11 @@ extension HudsonDatabase {
 
     /// Applies history changes in order and advances the cursor — all in ONE
     /// transaction, so a crash resumes cleanly from the stored cursor (§4.3).
-    /// Returns ids of label events targeting unknown messages: the caller
-    /// hydrates them (dropping would also be safe under the version guard —
-    /// spec §4.1 — but hydration converges faster).
+    /// Returns ids of label events targeting unknown, non-tombstoned
+    /// messages: these must be hydrated by the caller — a `.labels` event
+    /// alone can't materialize a message row (no thread/subject/snippet/etc.),
+    /// so without hydration the message would stay permanently missing from
+    /// the store rather than merely converging slower (spec §4.1).
     public func applyHistory(
         _ changes: [HistoryChange], newCursor: Int64, account: String
     ) async throws -> [String] {
@@ -39,7 +41,15 @@ extension HudsonDatabase {
                         sql: "SELECT EXISTS(SELECT 1 FROM messages WHERE account_email = ? AND id = ?)",
                         arguments: [account, id]) ?? false
                     guard exists else {
-                        unknownIDs.append(id)
+                        // A tombstoned id is known-deleted, not unknown — don't
+                        // hand it back for hydration (it would just 404 forever).
+                        let tombstoned = try Bool.fetchOne(
+                            db,
+                            sql: "SELECT EXISTS(SELECT 1 FROM tombstones WHERE account_email = ? AND message_id = ?)",
+                            arguments: [account, id]) ?? false
+                        if !tombstoned && !unknownIDs.contains(id) {
+                            unknownIDs.append(id)
+                        }
                         continue
                     }
                     let stored = try Int64.fetchOne(
@@ -56,6 +66,14 @@ extension HudsonDatabase {
             try db.execute(
                 sql: "UPDATE accounts SET history_cursor = ? WHERE email = ?",
                 arguments: [newCursor, account])
+            // §4.3 requires the cursor advance to be atomic with the applied
+            // changes — if there's no accounts row to update, fail loudly
+            // rather than silently reporting success with a stale cursor.
+            guard db.changesCount == 1 else {
+                throw DatabaseError(
+                    resultCode: .SQLITE_ERROR,
+                    message: "applyHistory: no accounts row for '\(account)' — cursor not advanced")
+            }
             return unknownIDs
         }
     }
@@ -98,7 +116,8 @@ extension HudsonDatabase {
             sql: """
                 INSERT INTO threads (account_email, id, last_message_at) VALUES (?, ?, ?)
                 ON CONFLICT(account_email, id)
-                DO UPDATE SET last_message_at = MAX(last_message_at, excluded.last_message_at)
+                DO UPDATE SET last_message_at = MAX(
+                    IFNULL(last_message_at, excluded.last_message_at), excluded.last_message_at)
                 """,
             arguments: [account, snapshot.threadID, snapshot.internalDate])
         try db.execute(
@@ -132,7 +151,7 @@ extension HudsonDatabase {
             arguments: [account, messageID])
         for labelID in labelIDs {
             try db.execute(
-                sql: "INSERT INTO message_labels (account_email, message_id, label_id) VALUES (?, ?, ?)",
+                sql: "INSERT OR IGNORE INTO message_labels (account_email, message_id, label_id) VALUES (?, ?, ?)",
                 arguments: [account, messageID, labelID])
         }
     }
