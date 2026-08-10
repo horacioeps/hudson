@@ -7,12 +7,16 @@ import SwiftUI
 /// swallow). If a face fails to register or is absent, `serif`/`ui` fall back to
 /// the system serif / system font so the app still renders — fidelity degrades,
 /// nothing crashes.
+/// `@MainActor`-isolated because every caller is a SwiftUI `View` body (itself
+/// main-actor), so the compiler can verify the `didRegister` guard is race-free
+/// without an `unsafe` escape — and a future off-main caller is then forced to
+/// hop, which is exactly the Swift 6 guarantee we want here.
+@MainActor
 public enum Typography {
-    // `nonisolated(unsafe)`: guarded only by the idempotency of `register()`
-    // itself — CoreText registration is safe to invoke redundantly, and the
-    // flag is a pure best-effort skip, not a correctness-critical lock. Swift
-    // 6 strict concurrency otherwise flags any mutable static as unsafe.
-    private nonisolated(unsafe) static var didRegister = false
+    // A one-shot idempotency guard: `register()` returns early once the bundled
+    // faces are in. Plain mutable static — main-actor isolation (above) makes it
+    // safe, no lock needed.
+    private static var didRegister = false
 
     /// Registers every `.ttf` bundled under `Resources/Fonts`. Enumerates the
     /// directory rather than hard-coding filenames, so a missing or renamed
