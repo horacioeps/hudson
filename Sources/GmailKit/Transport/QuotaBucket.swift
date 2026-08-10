@@ -5,6 +5,7 @@ import Foundation
 public enum GmailQuotaCost {
     public static let getProfile = 1
     public static let historyList = 2
+    public static let labelsList = 1
     public static let messagesList = 5
     public static let messagesGet = 20
     public static let messagesSend = 100
@@ -14,12 +15,25 @@ public enum GmailQuotaCost {
 /// units/min/user (spec §4.5); we cap ourselves at 5,500 by default so a
 /// second device or the Gmail app itself never pushes the account over.
 /// `now`/`sleep` are injected so tests run on a virtual clock.
+///
+/// Waiters are served strictly FIFO by a single drain task, so a large-cost
+/// acquirer (e.g. `messages.send`, cost 100) queued behind sustained
+/// small-cost traffic (e.g. `history.list` polling) is never starved by
+/// later, cheaper requests that would otherwise fit sooner.
 public actor QuotaBucket {
     private let unitsPerMinute: Int
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (TimeInterval) async throws -> Void
     /// Spends inside the current 60s window, oldest first.
     private var spends: [(date: Date, cost: Int)] = []
+    /// FIFO queue: heads are served strictly before later arrivals, even when
+    /// a later, cheaper request would fit sooner (prevents starvation of
+    /// large-cost calls like messages.send behind polling traffic).
+    private var waiters: [(cost: Int, continuation: CheckedContinuation<Void, Error>)] = []
+    /// Whether a drain task is currently running the waiter queue. Only ever
+    /// one drain task is active at a time, which is what keeps service order
+    /// stable; `acquire` starts one whenever it enqueues into an idle queue.
+    private var isDraining = false
 
     /// Initializes a quota bucket with per-minute unit limit and optional time/sleep providers.
     public init(
@@ -35,25 +49,60 @@ public actor QuotaBucket {
     }
 
     /// Waits until `cost` units fit in the rolling window, then records them.
+    /// Service order is strict FIFO: a request only takes the fast (no-wait)
+    /// path when the waiter queue is empty, so it can never cut ahead of an
+    /// already-queued acquirer even if it would otherwise fit immediately.
     public func acquire(cost: Int) async throws {
         guard cost <= unitsPerMinute else {
             throw GmailError.invalidRequest(
                 status: 0,
                 message: "Quota cost \(cost) exceeds the per-minute budget of \(unitsPerMinute).")
         }
-        while true {
-            pruneExpiredSpends()
-            let spent = spends.reduce(0) { $0 + $1.cost }
-            if spent + cost <= unitsPerMinute {
-                spends.append((now(), cost))
-                return
+        pruneExpiredSpends()
+        if waiters.isEmpty && spentInWindow() + cost <= unitsPerMinute {
+            spends.append((now(), cost))
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            waiters.append((cost, continuation))
+            // `isDraining` is only ever flipped on this actor's serial
+            // executor, and this whole closure runs synchronously within
+            // that continuation body — no suspension happens between the
+            // append above and this check — so a waiter can never be
+            // enqueued into a window where drain() has already seen the
+            // queue empty and is about to (or just did) flip `isDraining`
+            // false without observing this entry.
+            if !isDraining {
+                isDraining = true
+                Task { await self.drain() }
             }
-            // Sleep until the oldest spend leaves the window, then re-check.
-            let oldest = spends[0].date
-            let waitSeconds = max(60 - now().timeIntervalSince(oldest), 0.05)
-            try await sleep(waitSeconds)
         }
     }
+
+    /// Serves waiters in order; sleeps until the head's cost fits, grants it,
+    /// moves on. Only ever one drain task (isDraining), so order is stable.
+    private func drain() async {
+        while let head = waiters.first {
+            pruneExpiredSpends()
+            if spentInWindow() + head.cost <= unitsPerMinute {
+                spends.append((now(), head.cost))
+                waiters.removeFirst().continuation.resume()
+                continue
+            }
+            let oldest = spends[0].date  // non-empty: head doesn't fit, so something is spent
+            let wait = max(60 - now().timeIntervalSince(oldest), 0.05)
+            do { try await sleep(wait) } catch {
+                // Sleep failure (cancellation) — fail every waiter rather than hang.
+                while let waiter = waiters.first {
+                    waiters.removeFirst()
+                    waiter.continuation.resume(throwing: error)
+                }
+            }
+        }
+        isDraining = false
+    }
+
+    private func spentInWindow() -> Int { spends.reduce(0) { $0 + $1.cost } }
 
     private func pruneExpiredSpends() {
         let cutoff = now().addingTimeInterval(-60)
