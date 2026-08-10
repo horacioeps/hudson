@@ -14,7 +14,21 @@ extension HudsonDatabase {
         _ snapshot: MessageSnapshot, account: String
     ) async throws -> SnapshotOutcome {
         try await writer.write { db in
-            try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+            let result = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+            if result.outcome == .applied && !result.wasInsert {
+                // A same-message UPDATE's snapshot may have dropped
+                // UNREAD/INBOX; `maintainRollup`'s OR-merge can't lower
+                // those (see its doc comment), so this single targeted,
+                // bounded (one thread) recompute closes the gap. This is
+                // the routine path after a cursor-expiry re-list
+                // (SyncEngine's 404 branch resets backfill, which then
+                // re-applies every already-known message as an update) —
+                // without this, archived/read threads would stay stuck in
+                // the inbox as unread until an unrelated `.labels` event
+                // happened to touch them.
+                try ThreadRollup.recomputeThreadFlags(threadID: snapshot.threadID, account: account, db: db)
+            }
+            return result.outcome
         }
     }
 
@@ -27,12 +41,37 @@ extension HudsonDatabase {
     ) async throws -> Int {
         try await writer.write { db in
             var applied = 0
+            // Split rules are loaded ONCE for the whole batch (not
+            // re-queried per message) and threaded through
+            // `applySnapshotInTransaction` → `ThreadRollup.maintainRollup` —
+            // this is the actual backfill/re-list hot path (one commit per
+            // page of many messages), so this is where a per-message rules
+            // re-query would matter.
+            let splitRules = try SplitInbox.fetchRules(account: account, db: db)
+            // Batch-deduped, not per-message: an UPDATE's rollup flags can
+            // only be correctly lowered by a bounded per-thread recompute
+            // (see `applySnapshot`), but running that recompute inside the
+            // loop — once per updated message — would cost O(thread size)
+            // PER message, i.e. O(N²) across a large-thread re-list (this is
+            // exactly the cursor-expiry 404 path: backfill resets and
+            // re-`getMessage`s every already-known message as an update).
+            // Collecting the distinct touched thread ids and recomputing
+            // each ONCE after the loop keeps the whole batch O(total
+            // messages) — inserts still take the O(1) OR-merge path in
+            // `maintainRollup` and never enter this set at all.
+            var updatedThreadIDs = Set<String>()
             for snapshot in snapshots {
                 do {
                     try db.execute(sql: "SAVEPOINT s")
-                    let outcome = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+                    let result = try Self.applySnapshotInTransaction(
+                        snapshot, account: account, db: db, splitRules: splitRules)
                     try db.execute(sql: "RELEASE s")
-                    if outcome == .applied { applied += 1 }
+                    if result.outcome == .applied {
+                        applied += 1
+                        if !result.wasInsert {
+                            updatedThreadIDs.insert(snapshot.threadID)
+                        }
+                    }
                 } catch {
                     try db.execute(sql: "ROLLBACK TO s")
                     try db.execute(sql: "RELEASE s")
@@ -41,6 +80,9 @@ extension HudsonDatabase {
                     // this one message. No id/content logged (spec §9.1).
                     storeLog.warning("applySnapshots: skipped a message on apply error")
                 }
+            }
+            for threadID in updatedThreadIDs {
+                try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
             }
             return applied
         }
@@ -68,17 +110,76 @@ extension HudsonDatabase {
     ) async throws -> [String] {
         try await writer.write { db in
             var unknownIDs: [String] = []
+            // Loaded once per page, same rationale as `applySnapshots` —
+            // shared by every `.added` change below.
+            let splitRules = try SplitInbox.fetchRules(account: account, db: db)
+            // Same batch-dedup as `applySnapshots` — see its comment.
+            // `.added` updates (wasInsert == false) AND `.labels` events
+            // both need `recomputeThreadFlags` (unread/in_inbox can only be
+            // LOWERED by that bounded per-thread recompute — never by
+            // `maintainRollup`'s insert-only OR-merge), so they share this
+            // ONE set: `recomputeThreadFlags` is idempotent, so a thread
+            // touched by both still gets recomputed exactly once, post-loop,
+            // instead of once per `.labels` event (Fix wave 2 — a thread
+            // with K label events in one batch previously recomputed K
+            // times, each a bounded-but-real scan of that thread's M
+            // messages, i.e. O(K×M) for the batch; deferred+deduped here
+            // like `.added` already was). `.added` inserts take
+            // `maintainRollup`'s O(1) OR-merge path and never enter this
+            // set at all.
+            var flagsRecomputeThreadIDs = Set<String>()
+            // `.labels` events' split/category refresh IS deduped, unlike
+            // unread/in_inbox above: a thread with several `.labels` events
+            // in one batch (all touching the same thread) would otherwise
+            // redo the newest-message split lookup once per event instead
+            // of once for the batch. Collected here, applied once per
+            // unique thread after the loop — see `recomputeThreadSplit`.
+            var splitRefreshThreadIDs = Set<String>()
+            // `.deleted` events' rollup rebuild — kept in its OWN set,
+            // separate from `flagsRecomputeThreadIDs`/`splitRefreshThreadIDs`
+            // above, because `recomputeThreadRollup` is a strictly HEAVIER,
+            // superseding recompute (full survivor from_line fetch + Swift
+            // dedup, count/newest re-derivation — not just unread/in_inbox
+            // or split/category). Deferred and deduped for the identical
+            // reason: K deletes on one large thread previously ran this
+            // heavy rebuild K times inline — O(K×M) for the batch, and the
+            // heaviest of the three (this is the one that blocks triage
+            // inside the write transaction against the 5s busy timeout).
+            // Reconciled against the two lighter sets after the loop below.
+            var deletedThreadIDs = Set<String>()
             for change in changes {
                 switch change.kind {
                 case .added(let snapshot):
-                    _ = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+                    let result = try Self.applySnapshotInTransaction(
+                        snapshot, account: account, db: db, splitRules: splitRules)
+                    if result.outcome == .applied && !result.wasInsert {
+                        flagsRecomputeThreadIDs.insert(snapshot.threadID)
+                    }
                 case .deleted(let id):
+                    // thread_id fetched BEFORE the delete — needed to
+                    // rebuild (or drop) that thread's rollup row afterward.
+                    // A deletion isn't expressible as an incremental delta
+                    // (count must drop, and the deleted message may have
+                    // been the thread's newest), so this thread is queued
+                    // for the full per-thread rebuild post-loop rather than
+                    // `maintainRollup`. `AIArtifacts.purge` below (Task 8)
+                    // purges any cached AI artifact this message fed, in
+                    // the same transaction.
+                    let threadID = try String.fetchOne(
+                        db,
+                        sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
+                        arguments: [account, id])
                     try db.execute(
                         sql: "INSERT OR IGNORE INTO tombstones (account_email, message_id) VALUES (?, ?)",
                         arguments: [account, id])
                     try db.execute(
                         sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                         arguments: [account, id])
+                    try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
+                    try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
+                    if let threadID {
+                        deletedThreadIDs.insert(threadID)
+                    }
                 case .labels(let id, let historyID, let labelIDs):
                     let exists = try Bool.fetchOne(
                         db,
@@ -96,16 +197,57 @@ extension HudsonDatabase {
                         }
                         continue
                     }
-                    let stored = try Int64.fetchOne(
+                    // thread_id fetched alongside history_id (one query) so
+                    // the targeted rollup recompute below knows which
+                    // thread's row to touch without a second round trip.
+                    let messageRow = try Row.fetchOne(
                         db,
-                        sql: "SELECT history_id FROM messages WHERE account_email = ? AND id = ?",
-                        arguments: [account, id]) ?? 0
+                        sql: "SELECT history_id, thread_id FROM messages WHERE account_email = ? AND id = ?",
+                        arguments: [account, id])
+                    let stored: Int64 = messageRow?["history_id"] ?? 0
                     guard historyID >= stored else { continue }
                     try db.execute(
                         sql: "UPDATE messages SET history_id = ? WHERE account_email = ? AND id = ?",
                         arguments: [historyID, account, id])
                     try Self.replaceLabels(labelIDs, messageID: id, account: account, db: db)
+                    // A label-only event can LOWER unread/in_inbox (e.g. the
+                    // thread's last unread message just got marked read) —
+                    // maintainRollup's insert-time OR-merge can't do that, so
+                    // this thread is queued for a targeted, bounded (one
+                    // thread) recompute post-loop — see
+                    // `flagsRecomputeThreadIDs`'s doc comment above for why
+                    // this no longer runs inline here.
+                    if let threadID: String = messageRow?["thread_id"] {
+                        flagsRecomputeThreadIDs.insert(threadID)
+                        splitRefreshThreadIDs.insert(threadID)
+                    }
                 }
+            }
+            // `.deleted`'s full rebuild (queued in `deletedThreadIDs`)
+            // re-derives unread/in_inbox AND split_key/category from
+            // scratch, so it supersedes a flags-only or split-only
+            // recompute for the SAME thread — drop those threads from the
+            // two lighter sets so each thread gets exactly ONE authoritative
+            // post-loop recompute, never two. Safe regardless of event
+            // order within the batch: every message/label write above ran
+            // inline, in order, so by the time any of these post-loop
+            // recomputes run, all three see that thread's fully up-to-date
+            // messages/labels — only the ROLLUP recompute itself was
+            // deferred.
+            for threadID in deletedThreadIDs {
+                flagsRecomputeThreadIDs.remove(threadID)
+                splitRefreshThreadIDs.remove(threadID)
+            }
+            for threadID in deletedThreadIDs {
+                try ThreadRollup.recomputeThreadRollup(
+                    threadID: threadID, account: account, db: db, rules: splitRules)
+            }
+            for threadID in flagsRecomputeThreadIDs {
+                try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
+            }
+            for threadID in splitRefreshThreadIDs {
+                try ThreadRollup.recomputeThreadSplit(
+                    threadID: threadID, account: account, rules: splitRules, db: db)
             }
             return unknownIDs
         }
@@ -157,15 +299,36 @@ extension HudsonDatabase {
     /// the `.deleted` branch of `applyHistory`: tombstone then delete, in ONE
     /// transaction, so the row leaves `messageIDsNeedingBodies`'s work-list
     /// instead of 404ing forever. `message_bodies`/`message_labels` rows
-    /// cascade via their foreign keys.
+    /// cascade via their foreign keys; `fts_messages`/`message_seq` do not
+    /// (a plain FTS5 table has no FK/cascade machinery), so `FTSIndex.deleteIndex`
+    /// removes those explicitly. Also mirrors `.deleted`'s rollup
+    /// handling: thread_id captured before the delete, then the ONE
+    /// affected thread's rollup row is fully rebuilt (or dropped) via
+    /// `ThreadRollup.recomputeThreadRollup` — a deletion can't be folded
+    /// into `maintainRollup`'s incremental upsert. Also mirrors `.deleted`'s
+    /// AI-artifact purge (Task 8): `AIArtifacts.purge` deletes any cached
+    /// artifact `id` fed, in this same transaction — a thread summary has no
+    /// FK cascade from one of its source messages (see
+    /// `ai_artifact_sources`'s schema comment in `Migrations.swift`), so
+    /// this is what keeps the cache from serving stale content built from a
+    /// message that no longer exists.
     public func deleteVanishedMessage(id: String, account: String) async throws {
         try await writer.write { db in
+            let threadID = try String.fetchOne(
+                db,
+                sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
+                arguments: [account, id])
             try db.execute(
                 sql: "INSERT OR IGNORE INTO tombstones (account_email, message_id) VALUES (?, ?)",
                 arguments: [account, id])
             try db.execute(
                 sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                 arguments: [account, id])
+            try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
+            try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
+            if let threadID {
+                try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
+            }
         }
     }
 
@@ -187,21 +350,47 @@ extension HudsonDatabase {
 
     // MARK: - Transaction bodies (synchronous, called inside writer.write)
 
+    /// Returns `wasInsert` alongside the outcome so callers (`applySnapshot`,
+    /// `applySnapshots`, `applyHistoryChanges`'s `.added` branch) know
+    /// whether this was a same-message UPDATE — needed to trigger the
+    /// targeted `ThreadRollup.recomputeThreadFlags` that `maintainRollup`'s
+    /// insert-only OR-merge can't do (see `ThreadRollup.maintainRollup`).
+    /// `wasInsert` is meaningless (`false`) for `.tombstoned`/`.stale`,
+    /// which never reach the upsert.
+    ///
+    /// `splitRules` lets a batch caller (`applySnapshots`,
+    /// `applyHistoryChanges`) load the account's `split_rules` ONCE and
+    /// pass the same array to every message in the batch, instead of each
+    /// message re-querying it — see `ThreadRollup.maintainRollup`'s doc
+    /// comment. `nil` (the default, used by the single-message
+    /// `applySnapshot`) fetches them once here instead — still exactly one
+    /// small indexed read for that one message, not a re-query "per
+    /// message in a loop".
     static func applySnapshotInTransaction(
-        _ snapshot: MessageSnapshot, account: String, db: Database
-    ) throws -> SnapshotOutcome {
+        _ snapshot: MessageSnapshot, account: String, db: Database,
+        splitRules: [SplitRule]? = nil
+    ) throws -> (outcome: SnapshotOutcome, wasInsert: Bool) {
         let tombstoned = try Bool.fetchOne(
             db,
             sql: "SELECT EXISTS(SELECT 1 FROM tombstones WHERE account_email = ? AND message_id = ?)",
             arguments: [account, snapshot.id]) ?? false
-        if tombstoned { return .tombstoned }
+        if tombstoned { return (.tombstoned, false) }
 
         if let stored = try Int64.fetchOne(
             db,
             sql: "SELECT history_id FROM messages WHERE account_email = ? AND id = ?",
             arguments: [account, snapshot.id]), stored > snapshot.historyID {
-            return .stale
+            return (.stale, false)
         }
+
+        // Determined BEFORE the upsert below (which would make every row
+        // "exist") — gates `ThreadRollup.maintainRollup`'s message_count
+        // increment: a re-applied update of a message we already have must
+        // not double-count.
+        let wasInsert = try !(Bool.fetchOne(
+            db,
+            sql: "SELECT EXISTS(SELECT 1 FROM messages WHERE account_email = ? AND id = ?)",
+            arguments: [account, snapshot.id]) ?? false)
 
         try db.execute(
             sql: """
@@ -231,7 +420,11 @@ extension HudsonDatabase {
                 snapshot.subject, snapshot.snippet,
             ])
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
-        return .applied
+        let rules = try splitRules ?? SplitInbox.fetchRules(account: account, db: db)
+        try ThreadRollup.maintainRollup(
+            afterApplying: snapshot, wasInsert: wasInsert, account: account, db: db, rules: rules)
+        try FTSIndex.stubIndex(snapshot, account: account, db: db)
+        return (.applied, wasInsert)
     }
 
     static func replaceLabels(

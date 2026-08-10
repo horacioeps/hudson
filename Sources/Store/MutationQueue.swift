@@ -28,6 +28,15 @@ extension HudsonDatabase {
     /// unique index satisfied (same row, not a second insert) and the
     /// effective-read overlay correct throughout: `messageRow` treats every
     /// row here as live regardless of state.
+    ///
+    /// **M3↔M4 seam (Task 5):** every branch that actually changes the
+    /// queue also calls `ThreadRollup.recomputeThreadFlags` for
+    /// `messageID`'s thread, in the SAME transaction — `thread_rollup`'s
+    /// `in_inbox`/`unread` are overlay-aware (Task 2), so this is what
+    /// makes an optimistic archive/read/star drop or surface a thread in
+    /// `inboxThreads` (Task 5) instantly, before the change ever reaches
+    /// Gmail. The idempotent same-op return is the one exception: nothing
+    /// changed, so there's nothing to recompute.
     public func enqueueMutation(
         messageID: String, labelID: String, op: LabelOp, account: String, now: Int64
     ) async throws {
@@ -55,10 +64,12 @@ extension HudsonDatabase {
                             WHERE id = ?
                             """,
                         arguments: [op.rawValue, now, id])
+                    try Self.recomputeThreadsForMessages([messageID], account: account, db: db)
                     return
                 }
                 try db.execute(
                     sql: "DELETE FROM mutation_queue WHERE id = ?", arguments: [id])  // opposite, still pending: cancel
+                try Self.recomputeThreadsForMessages([messageID], account: account, db: db)
                 return
             }
             try db.execute(
@@ -68,6 +79,7 @@ extension HudsonDatabase {
                     VALUES (?, ?, ?, ?, ?)
                     """,
                 arguments: [account, messageID, labelID, op.rawValue, now])
+            try Self.recomputeThreadsForMessages([messageID], account: account, db: db)
         }
     }
 
@@ -125,12 +137,27 @@ extension HudsonDatabase {
     /// Retires in_flight deltas whose echo has landed (account cursor has
     /// reached the modify's historyId). Retiring earlier — on 2xx — would drop
     /// the overlay before the canonical write echoes back, flickering the row.
+    ///
+    /// **M3↔M4 seam (Task 5):** the affected messages' `message_id`s are
+    /// captured BEFORE the delete (the rows are gone afterward), then each
+    /// distinct touched thread's rollup flags are recomputed once — so
+    /// `thread_rollup` stays in lockstep with `mutation_queue` the instant
+    /// the overlay changes under it, rather than relying on some other,
+    /// unrelated event to eventually touch that thread.
     public func retireConfirmedMutations(account: String) async throws -> Int {
         try await writer.write { db in
             let cursor = try Int64.fetchOne(
                 db, sql: "SELECT history_cursor FROM accounts WHERE email = ?",
                 arguments: [account])
             guard let cursor else { return 0 }
+            let affectedMessageIDs = try String.fetchAll(
+                db,
+                sql: """
+                    SELECT DISTINCT message_id FROM mutation_queue
+                    WHERE account_email = ? AND state = 'in_flight'
+                      AND expected_history_id IS NOT NULL AND expected_history_id <= ?
+                    """,
+                arguments: [account, cursor])
             try db.execute(
                 sql: """
                     DELETE FROM mutation_queue
@@ -138,16 +165,52 @@ extension HudsonDatabase {
                       AND expected_history_id IS NOT NULL AND expected_history_id <= ?
                     """,
                 arguments: [account, cursor])
-            return db.changesCount
+            let retired = db.changesCount
+            try Self.recomputeThreadsForMessages(affectedMessageIDs, account: account, db: db)
+            return retired
         }
     }
 
     /// Terminal-failure removal — the flusher re-derives truth afterwards.
+    /// **M3↔M4 seam (Task 5):** the message id is read off the row BEFORE
+    /// deleting it, then its thread's rollup flags are recomputed — a
+    /// dropped optimistic archive/read must revert the thread back to
+    /// canonical truth in `inboxThreads` immediately, not just in the
+    /// per-message overlay read.
     public func dropMutation(id: Int64, account: String) async throws {
         try await writer.write { db in
+            let messageID = try String.fetchOne(
+                db, sql: "SELECT message_id FROM mutation_queue WHERE id = ? AND account_email = ?",
+                arguments: [id, account])
             try db.execute(
                 sql: "DELETE FROM mutation_queue WHERE id = ? AND account_email = ?",
                 arguments: [id, account])
+            if let messageID {
+                try Self.recomputeThreadsForMessages([messageID], account: account, db: db)
+            }
+        }
+    }
+
+    /// Recomputes `thread_rollup`'s overlay-aware `unread`/`in_inbox` flags
+    /// for every DISTINCT thread among `messageIDs` — deduped so a batch
+    /// touching several messages in the same thread (`retireConfirmedMutations`)
+    /// costs one recompute per thread, not one per message. A message id
+    /// with no known thread (not locally hydrated yet) is silently skipped.
+    private static func recomputeThreadsForMessages(
+        _ messageIDs: [String], account: String, db: Database
+    ) throws {
+        guard !messageIDs.isEmpty else { return }
+        var threadIDs = Set<String>()
+        for messageID in messageIDs {
+            if let threadID = try String.fetchOne(
+                db, sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
+                arguments: [account, messageID]
+            ) {
+                threadIDs.insert(threadID)
+            }
+        }
+        for threadID in threadIDs {
+            try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
         }
     }
 }

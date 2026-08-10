@@ -104,6 +104,8 @@ Mail content is hostile input. Raw HTML is stored as opaque bytes and never inte
 
 **CLI display rule:** every message-derived string printed to the terminal (subject, snippet, body text, sender name) is stripped of C0/C1 control characters and ANSI/OSC escape sequences — terminal escape injection is reachable from the first `hudson list` otherwise.
 
+**M4 implementation:** the thread_rollup (materialized inbox), FTS5 search, split_rules/categories, attachments metadata, and AIKit hooks (ai_artifacts/ai_config, LLMKeyStore) are implemented as the architecture doc (docs/superpowers/design/2026-08-10-speed-ai-architecture.md M4 section) describes.
+
 ## 4. SyncEngine
 
 Three invariants:
@@ -258,7 +260,7 @@ Each gets its own implementation plan (superpowers writing-plans):
 - **M1 — DONE:** OAuth wizard (publish-status verification, client ID+secret), token store + CLI signing script, typed client, quota-aware transport. CLI: `auth`, `profile`.
 - **M2 — DONE:** schema, migrations, versioned writes + tombstones, sanitizer pipeline, concurrent backfill/poll skeleton. CLI: `sync`, `list`, `show`.
 - **M3 — DONE:** queue, overlay model, flusher, single-flight discipline, reconciliation path. CLI: `archive`, `star`, `read`, `pending`, `undo`.
-- **M4 — Query layer:** FTS5 search (+ server-merge during hydration, `--rebuild-index`) and split inbox (`split_rules`, category persistence test). CLI: `search`, `inbox --split`.
+- **M4 — DONE:** FTS5 search (+ server-merge during hydration, `--rebuild-index`) and split inbox (`split_rules`, category persistence test). CLI: `search`, `inbox --split`.
 - **M5 — Send:** MIME builder, dedup state machine, send, reply threading. CLI: `send`, `reply`.
 - **M6 — Scheduling:** snooze, send-later with draft mirror, wake/clock-change catch-up. CLI: `snooze`, `later`.
 - **M7 — AIKit:** providers, summarize, draft-in-voice, ask-inbox. CLI: `summarize`, `draft`, `ask`.

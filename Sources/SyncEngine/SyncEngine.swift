@@ -265,9 +265,15 @@ public actor SyncEngine {
             do {
                 let message = try await api.getMessage(id: id, format: "full")
                 let content = message.extractContent()
+                let attachments = message.attachments().map {
+                    AttachmentMeta(
+                        id: $0.attachmentID, filename: $0.filename,
+                        mimeType: $0.mimeType, size: $0.size)
+                }
                 try await database.saveBody(
                     messageID: id, account: account,
-                    body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText))
+                    body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText),
+                    attachments: attachments)
                 hydrated += 1
             } catch GmailError.invalidRequest(let status, _) where status == 404 {
                 // The message provably no longer exists server-side — unlike
