@@ -61,3 +61,38 @@ private func historyPage(_ json: String) -> HistoryPage {
     #expect(account.historyCursor == 500)       // fresh cursor recorded
     #expect(account.backfillState != "complete")  // re-list scheduled
 }
+
+@Test func hydrationGet404IsSkippedNotTreatedAsExpiry() async throws {
+    // A message can vanish between a history event and our follow-up
+    // hydration get for an unknown id — a normal race, not a sign the
+    // history cursor itself expired. This regression-guards that a 404 from
+    // that get (unlike a 404 from listHistory) must not trigger the expiry
+    // fallback: it must not reset backfill, nor discard the cursor already
+    // committed by this page's applyHistory call.
+    let (gmail, database, engine) = try await makeSyncedWorld()
+    await gmail.setHistory([historyPage("""
+        {"historyId": "130", "history": [
+          {"id": "125", "messagesAdded": [{"message":
+            {"id": "m1", "threadId": "t1", "historyId": "125",
+             "internalDate": "1000", "labelIds": ["INBOX"], "snippet": "sn",
+             "payload": {"headers": [{"name": "Subject", "value": "s"}]}}}]},
+          {"id": "128", "labelsAdded": [{"message":
+            {"id": "mGone", "threadId": "t2", "historyId": "128", "labelIds": ["INBOX"]}}]}
+        ]}
+        """)])
+    // "mGone" is never registered in messagesByID, so ScriptedGmail.getMessage
+    // 404s for it, simulating a message deleted before hydration could run.
+    let report = try await engine.syncOnce()
+    // Both of the page's changes counted as applied — the unknown-id
+    // hydration 404 doesn't erase that.
+    #expect(report.eventsApplied == 2)
+    // m1's add landed; mGone was never materialized (no row to hydrate it
+    // into), but that's expected — it must not abort the other change.
+    #expect(try await database.recentMessages(account: "x", limit: 5).map(\.id) == ["m1"])
+    let account = try #require(try await database.primaryAccount())
+    // Cursor advanced to this page's own historyId — NOT reset to a fresh
+    // profile cursor, which is what the (mis-triggered) expiry fallback would do.
+    #expect(account.historyCursor == 130)
+    // Backfill state untouched: the expiry fallback never fired.
+    #expect(account.backfillState == "complete")
+}

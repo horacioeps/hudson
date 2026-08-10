@@ -103,7 +103,8 @@ public actor SyncEngine {
 
     /// Polls history.list from the stored cursor and applies each page's
     /// changes in order — one transaction per page, cursor advanced inside it
-    /// (spec §4.3). Unknown ids get hydrated afterwards. A 404 means the
+    /// (spec §4.3). Unknown ids get hydrated afterwards. A 404 from
+    /// `listHistory` (and *only* from `listHistory` — see below) means the
     /// cursor expired: M2's fallback resets backfill and re-lists (M3 brings
     /// the cheaper format=minimal reconciliation).
     private func pollHistory() async throws -> Int {
@@ -112,35 +113,51 @@ public actor SyncEngine {
         var applied = 0
         var pageToken: String?
         var start = String(cursor)
-        do {
-            repeat {
-                let page = try await api.listHistory(startHistoryID: start, pageToken: pageToken)
-                let changes = HistoryMapping.changes(from: page.history ?? [])
-                let newCursor = page.historyId.flatMap(Int64.init) ?? cursor
-                let unknownIDs = try await database.applyHistory(
-                    changes, newCursor: newCursor, account: account)
-                applied += changes.count
-                for id in unknownIDs {
+        repeat {
+            let page: HistoryPage
+            do {
+                page = try await api.listHistory(startHistoryID: start, pageToken: pageToken)
+            } catch GmailError.invalidRequest(let status, _) where status == 404 {
+                // Cursor expired (spec §4.3). Blunt-but-correct M2 fallback:
+                // fresh cursor, full re-list; the §4.2 guard makes re-listing
+                // safe. Scoped to `listHistory` alone — a 404 from the
+                // hydration `getMessage` below is a different, unrelated
+                // event (a message that vanished, not an expired cursor) and
+                // must never trigger this branch.
+                Log.transport.warning("History cursor expired; falling back to full re-list.")
+                historyExpiredThisPass = true
+                let profile = try await api.getProfile()
+                _ = try await database.applyHistory(
+                    [], newCursor: Int64(profile.historyId) ?? 0, account: account)
+                try await database.updateBackfill(
+                    email: account, state: "pending", pageToken: nil, addedCount: 0)
+                return 0
+            }
+            let changes = HistoryMapping.changes(from: page.history ?? [])
+            let newCursor = page.historyId.flatMap(Int64.init) ?? cursor
+            let unknownIDs = try await database.applyHistory(
+                changes, newCursor: newCursor, account: account)
+            applied += changes.count
+            for id in unknownIDs {
+                do {
                     let message = try await api.getMessage(id: id, format: "metadata")
                     if let snapshot = SnapshotMapping.snapshot(from: message) {
                         _ = try await database.applySnapshot(snapshot, account: account)
                     }
+                } catch GmailError.invalidRequest(let status, _) where status == 404 {
+                    // The message vanished between the history event and
+                    // this hydration get — expected and silent (spec §9.1:
+                    // no id/content in logs), the same treatment backfill
+                    // gives a per-message 404 (see `logSkippedBackfillMessage`
+                    // below). Any other error still propagates: the cursor
+                    // for this page has already been committed by
+                    // `applyHistory` above, so a real failure here should
+                    // surface rather than be swallowed.
                 }
-                pageToken = page.nextPageToken
-                start = String(newCursor)
-            } while pageToken != nil
-        } catch GmailError.invalidRequest(let status, _) where status == 404 {
-            // Cursor expired (spec §4.3). Blunt-but-correct M2 fallback:
-            // fresh cursor, full re-list; the §4.2 guard makes re-listing safe.
-            Log.transport.warning("History cursor expired; falling back to full re-list.")
-            historyExpiredThisPass = true
-            let profile = try await api.getProfile()
-            _ = try await database.applyHistory(
-                [], newCursor: Int64(profile.historyId) ?? 0, account: account)
-            try await database.updateBackfill(
-                email: account, state: "pending", pageToken: nil, addedCount: 0)
-            return 0
-        }
+            }
+            pageToken = page.nextPageToken
+            start = String(newCursor)
+        } while pageToken != nil
         return applied
     }
 
