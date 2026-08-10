@@ -78,6 +78,23 @@ extension HudsonDatabase {
         }
     }
 
+    /// Removes a message that provably no longer exists server-side (a
+    /// hydration `getMessage` 404 — see `SyncEngine.hydrateBodies`). Mirrors
+    /// the `.deleted` branch of `applyHistory`: tombstone then delete, in ONE
+    /// transaction, so the row leaves `messageIDsNeedingBodies`'s work-list
+    /// instead of 404ing forever. `message_bodies`/`message_labels` rows
+    /// cascade via their foreign keys.
+    public func deleteVanishedMessage(id: String, account: String) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: "INSERT OR IGNORE INTO tombstones (account_email, message_id) VALUES (?, ?)",
+                arguments: [account, id])
+            try db.execute(
+                sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
+                arguments: [account, id])
+        }
+    }
+
     /// Caches Gmail's label id→name mapping for display.
     public func upsertLabels(
         _ labels: [(id: String, name: String)], account: String

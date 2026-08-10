@@ -13,10 +13,6 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
     return (gmail, database, engine)
 }
 
-private func historyPage(_ json: String) -> HistoryPage {
-    try! JSONDecoder().decode(HistoryPage.self, from: Data(json.utf8))
-}
-
 @Test func historyEventsApplyInOrderAndAdvanceCursor() async throws {
     let (gmail, database, engine) = try await makeSyncedWorld()
     await gmail.setHistory([historyPage("""

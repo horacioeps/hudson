@@ -148,7 +148,7 @@ public actor SyncEngine {
                     // The message vanished between the history event and
                     // this hydration get — expected and silent (spec §9.1:
                     // no id/content in logs), the same treatment backfill
-                    // gives a per-message 404 (see `logSkippedBackfillMessage`
+                    // gives a per-message 404 (see `logSkippedMessage`
                     // below). Any other error still propagates: the cursor
                     // for this page has already been committed by
                     // `applyHistory` above, so a real failure here should
@@ -183,7 +183,7 @@ public actor SyncEngine {
                 } catch let error as GmailError {
                     // One bad message must not abort the pass — the page token
                     // still needs to persist so backfill keeps advancing.
-                    logSkippedBackfillMessage(error)
+                    logSkippedMessage(error, phase: "backfill")
                 }
             }
             report.backfilledThisPass += added
@@ -201,27 +201,31 @@ public actor SyncEngine {
         }
     }
 
-    /// A message that vanished between `messages.list` and `messages.get`
-    /// (404) is expected and silent — it's simply gone, nothing to persist.
-    /// No standalone Store API tombstones a single id without also advancing
-    /// the history cursor (that coupling belongs to `applyHistory`, not
-    /// backfill), so we just skip rather than misuse it here. Any other
-    /// GmailError also skips the message (never id/content, spec §9.1) so one
-    /// bad message can't stall the whole page.
-    private func logSkippedBackfillMessage(_ error: GmailError) {
+    /// A message that vanished between `messages.list` (or a history poll)
+    /// and a follow-up `messages.get` (404) is expected and silent — it's
+    /// simply gone, nothing to persist. No standalone Store API tombstones a
+    /// single id without also advancing the history cursor (that coupling
+    /// belongs to `applyHistory`, not backfill), so we just skip rather than
+    /// misuse it here. Any other GmailError also skips the message (never
+    /// id/content, spec §9.1) so one bad message can't stall the whole page.
+    /// Shared by `backfill` and `hydrateBodies`; `hydrateBodies` handles its
+    /// own 404s separately (it tombstones instead of silently skipping — see
+    /// there) and only routes here for everything else. `phase` is a fixed,
+    /// content-free label identifying which loop skipped the message.
+    private func logSkippedMessage(_ error: GmailError, phase: String) {
         switch error {
         case .invalidRequest(let status, _) where status == 404:
             return
         case .invalidRequest(let status, _):
-            Log.sync.warning("backfill getMessage skipped: invalidRequest status=\(status, privacy: .public)")
+            Log.sync.warning("\(phase) getMessage skipped: invalidRequest status=\(status, privacy: .public)")
         case .server(let status):
-            Log.sync.warning("backfill getMessage skipped: server status=\(status, privacy: .public)")
+            Log.sync.warning("\(phase) getMessage skipped: server status=\(status, privacy: .public)")
         case .rateLimited:
-            Log.sync.warning("backfill getMessage skipped: rateLimited")
+            Log.sync.warning("\(phase) getMessage skipped: rateLimited")
         case .network:
-            Log.sync.warning("backfill getMessage skipped: network")
+            Log.sync.warning("\(phase) getMessage skipped: network")
         case .auth:
-            Log.sync.warning("backfill getMessage skipped: auth")
+            Log.sync.warning("\(phase) getMessage skipped: auth")
         }
     }
 
@@ -235,12 +239,28 @@ public actor SyncEngine {
             account: account, since: windowStart, limit: hydrationBatch)
         var hydrated = 0
         for id in ids {
-            let message = try await api.getMessage(id: id, format: "full")
-            let content = message.extractContent()
-            try await database.saveBody(
-                messageID: id, account: account,
-                body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText))
-            hydrated += 1
+            do {
+                let message = try await api.getMessage(id: id, format: "full")
+                let content = message.extractContent()
+                try await database.saveBody(
+                    messageID: id, account: account,
+                    body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText))
+                hydrated += 1
+            } catch GmailError.invalidRequest(let status, _) where status == 404 {
+                // The message provably no longer exists server-side — unlike
+                // backfill's silent skip (nothing was ever persisted for it),
+                // this id is already sitting in the store with has_body=0, so
+                // skipping alone would leave it at the head of
+                // `messageIDsNeedingBodies`'s work-list forever, failing
+                // every future `hudson sync` with the same 404 (e.g. a ghost
+                // row left by the §4.3 expiry re-list). Tombstone + delete
+                // instead so it leaves the work-list for good.
+                try await database.deleteVanishedMessage(id: id, account: account)
+            } catch let error as GmailError {
+                // Any other failure skips just this message — never lets one
+                // bad id stall the whole hydration batch.
+                logSkippedMessage(error, phase: "hydrateBodies")
+            }
         }
         return hydrated
     }

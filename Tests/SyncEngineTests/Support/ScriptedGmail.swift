@@ -74,6 +74,11 @@ actor ScriptedGmail: GmailAPI {
     }
 }
 
+/// Decodes a canned `history.list` page response for tests.
+func historyPage(_ json: String) -> HistoryPage {
+    try! JSONDecoder().decode(HistoryPage.self, from: Data(json.utf8))
+}
+
 /// Builds a metadata-format GmailMessage for tests.
 func testMessage(
     id: String, threadID: String = "t1", historyID: String, internalDate: String = "1000",
