@@ -37,6 +37,9 @@ public actor SyncEngine {
     private let prefetchWindowDays: Int
     private let now: @Sendable () -> Date
     private var passInFlight = false
+    /// Set by `pollHistory()` when this pass hit a 404 expiry, so `syncOnce()`
+    /// can defer the resulting re-list to the next pass (see its doc comment).
+    private var historyExpiredThisPass = false
 
     /// Wires the engine to one account's API client and store.
     public init(
@@ -63,7 +66,15 @@ public actor SyncEngine {
         var report = SyncReport()
         try await ensureCursor()
         report.eventsApplied = try await pollHistory()
-        try await backfill(maxPages: maxBackfillPages, into: &report)
+        // A just-expired cursor already reset backfill to "pending" (below);
+        // running backfill synchronously in this same pass would immediately
+        // re-list and could re-flip it straight back to "complete" before the
+        // caller ever observes the reset — the re-list is scheduled, not
+        // performed inline, so it gets its own pass (and its own
+        // `maxBackfillPages` budget) like any other backfill progress.
+        if !historyExpiredThisPass {
+            try await backfill(maxPages: maxBackfillPages, into: &report)
+        }
         report.bodiesHydrated = try await hydrateBodies()
         return report
     }
@@ -90,9 +101,48 @@ public actor SyncEngine {
 
     // MARK: - History (M2: applied via Store; expiry fallback restarts backfill)
 
-    /// Polls history.list and applies changes in order. Returns events applied.
-    /// Task 10 extends this; the Task 9 skeleton returns 0 without polling.
-    private func pollHistory() async throws -> Int { 0 }
+    /// Polls history.list from the stored cursor and applies each page's
+    /// changes in order — one transaction per page, cursor advanced inside it
+    /// (spec §4.3). Unknown ids get hydrated afterwards. A 404 means the
+    /// cursor expired: M2's fallback resets backfill and re-lists (M3 brings
+    /// the cheaper format=minimal reconciliation).
+    private func pollHistory() async throws -> Int {
+        historyExpiredThisPass = false
+        guard let cursor = try await requireAccount().historyCursor else { return 0 }
+        var applied = 0
+        var pageToken: String?
+        var start = String(cursor)
+        do {
+            repeat {
+                let page = try await api.listHistory(startHistoryID: start, pageToken: pageToken)
+                let changes = HistoryMapping.changes(from: page.history ?? [])
+                let newCursor = page.historyId.flatMap(Int64.init) ?? cursor
+                let unknownIDs = try await database.applyHistory(
+                    changes, newCursor: newCursor, account: account)
+                applied += changes.count
+                for id in unknownIDs {
+                    let message = try await api.getMessage(id: id, format: "metadata")
+                    if let snapshot = SnapshotMapping.snapshot(from: message) {
+                        _ = try await database.applySnapshot(snapshot, account: account)
+                    }
+                }
+                pageToken = page.nextPageToken
+                start = String(newCursor)
+            } while pageToken != nil
+        } catch GmailError.invalidRequest(let status, _) where status == 404 {
+            // Cursor expired (spec §4.3). Blunt-but-correct M2 fallback:
+            // fresh cursor, full re-list; the §4.2 guard makes re-listing safe.
+            Log.transport.warning("History cursor expired; falling back to full re-list.")
+            historyExpiredThisPass = true
+            let profile = try await api.getProfile()
+            _ = try await database.applyHistory(
+                [], newCursor: Int64(profile.historyId) ?? 0, account: account)
+            try await database.updateBackfill(
+                email: account, state: "pending", pageToken: nil, addedCount: 0)
+            return 0
+        }
+        return applied
+    }
 
     // MARK: - Backfill
 

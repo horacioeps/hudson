@@ -62,6 +62,16 @@ actor ScriptedGmail: GmailAPI {
     }
 
     func setHistoryError(_ error: GmailError?) { historyError = error }
+
+    func setHistory(_ pages: [HistoryPage]) { historyPages = pages }
+    func setMessages(_ messages: [String: GmailMessage]) {
+        messagesByID.merge(messages) { _, new in new }
+    }
+    func setProfileHistoryID(_ id: String) {
+        profile = Profile(
+            emailAddress: profile.emailAddress, messagesTotal: profile.messagesTotal,
+            threadsTotal: profile.threadsTotal, historyId: id)
+    }
 }
 
 /// Builds a metadata-format GmailMessage for tests.
