@@ -475,7 +475,7 @@ git add -A && git commit -m "feat(store): GRDB dependency, database bootstrap, s
   - `func applyHistory(_ changes: [HistoryChange], newCursor: Int64, account: String) async throws -> [String]` — applies in order in ONE transaction, advances `accounts.history_cursor`, returns unknown message ids needing hydration (spec §4.1).
   - `func saveBody(messageID: String, account: String, body: SanitizedBody) async throws` *(SanitizedBody arrives in Task 7 — this task stubs the signature with the struct defined there; implement `saveBody` in Task 7 instead if you prefer — but the row update `has_body = true` lives here as `markBodySaved`)*. **Correction for implementers: `saveBody` is Task 7's. This task produces only the snapshot/history/read APIs below.**
   - `func upsertLabels(_ labels: [(id: String, name: String)], account: String) async throws`
-  - `public struct MessageRow: Sendable, Equatable, Codable, FetchableRecord` — mirrors the `messages` columns (`id, threadID, historyID, internalDate, fromLine, toLine, subject, snippet, hasBody, labelIDs: [String]`).
+  - `public struct MessageRow: Sendable, Equatable` — mirrors the `messages` columns (`id, threadID, historyID, internalDate, fromLine, toLine, subject, snippet, hasBody, labelIDs: [String]`). (Hand-built from rows — `labelIDs` needs a second query, so `FetchableRecord` is deliberately not used.)
   - `func recentMessages(account: String, limit: Int) async throws -> [MessageRow]` (newest first, tombstones excluded)
   - `func message(id: String, account: String) async throws -> (row: MessageRow, plainText: String?)?`
 
