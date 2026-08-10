@@ -45,24 +45,29 @@ struct ProfileCommand: AsyncParsableCommand {
             // Routed through the clean stderr printer instead of letting
             // ArgumentParser's default handler debug-print (and mangle) it —
             // see GmailErrorReporting.swift.
-            throw reportAndFail(annotated(error, consentedAt: consentedAt))
+            if let consentedAt {
+                throw reportAndFail(Self.annotated(error, consentedAt: consentedAt))
+            } else {
+                throw reportAndFail(error)
+            }
         }
     }
 
-    /// The spec-§6.1 heuristic: a dead refresh token within ~8 days of consent
-    /// usually means the OAuth app was left in Testing status.
-    private func annotated(_ error: GmailError, consentedAt: Date?) -> GmailError {
-        guard let consentedAt,
-              case .auth(let message) = error, message.contains("invalid_grant"),
-              Date().timeIntervalSince(consentedAt) < 8 * 24 * 3600 else {
+    /// The spec-§6.1 heuristic: a dead grant within ~8 days of consent usually
+    /// means the OAuth app was left in Testing status. Pure for testability.
+    static func annotated(
+        _ error: GmailError, consentedAt: Date, now: Date = Date()
+    ) -> GmailError {
+        guard error.indicatesInvalidGrant, case .auth(let message) = error,
+              now.timeIntervalSince(consentedAt) < 8 * 24 * 3600 else {
             return error
         }
         return .auth(message + """
 
 
         Your grant died within a week of setup — the OAuth app is probably still in
-        “Testing” status, where refresh tokens expire every 7 days. Fix: Google Cloud
-        Console → APIs & Services → OAuth consent screen → PUBLISH APP, then `hudson auth`.
+        Testing status, where refresh tokens expire every 7 days. Fix: Google Auth
+        Platform → Audience → Publishing status → PUBLISH APP, then `hudson auth`.
         """)
     }
 }

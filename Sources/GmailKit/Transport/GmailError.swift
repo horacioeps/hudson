@@ -53,4 +53,14 @@ public enum GmailError: Error, Equatable {
         let decoded = try? JSONDecoder().decode(Envelope.self, from: data)
         return decoded?.error?.message ?? "Unexpected Gmail API response."
     }
+
+    /// True when this error means Google revoked or expired the OAuth grant.
+    /// Contract: `OAuthClient.requestTokens` formats token-endpoint failures
+    /// as "\(error): \(description)", so invalid_grant is always the message
+    /// PREFIX. `ProfileCommand.annotated` builds its Testing-status hint on
+    /// this predicate — if you change the phrasing there, this must move with it.
+    public var indicatesInvalidGrant: Bool {
+        if case .auth(let message) = self { return message.hasPrefix("invalid_grant") }
+        return false
+    }
 }

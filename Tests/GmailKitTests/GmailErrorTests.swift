@@ -40,3 +40,9 @@ import Testing
     #expect(GmailError.from(status: 403, data: Data(body.utf8), retryAfterHeader: nil)
         == .rateLimited(retryAfter: nil))
 }
+
+@Test func invalidGrantPredicateMatchesOAuthClientPhrasing() {
+    #expect(GmailError.auth("invalid_grant: Token has been expired or revoked.").indicatesInvalidGrant)
+    #expect(!GmailError.auth("No stored tokens — run `hudson auth` first.").indicatesInvalidGrant)
+    #expect(!GmailError.rateLimited(retryAfter: nil).indicatesInvalidGrant)
+}
