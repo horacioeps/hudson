@@ -106,9 +106,28 @@ private final class VirtualClock: @unchecked Sendable {
     #expect(order.values == ["big", "small"])
 }
 
-@Test func fifoStillRejectsOversizedCost() async {
-    let bucket = QuotaBucket(unitsPerMinute: 100)
-    await #expect(throws: GmailError.self) { try await bucket.acquire(cost: 101) }
+@Test func fifoStillRejectsOversizedCost() async throws {
+    let clock = VirtualClock()
+    let waiterIsQueued = OneShotSignal()
+    let bucket = QuotaBucket(unitsPerMinute: 100, now: { clock.now }, sleep: { seconds in
+        await waiterIsQueued.fire()
+        clock.sleep(seconds)
+    })
+    try await bucket.acquire(cost: 100)  // saturate the window
+
+    // A real waiter, queued behind the saturated window (won't be granted
+    // until the window rolls over).
+    async let waiter: Void = { _ = try? await bucket.acquire(cost: 1) }()
+    await waiterIsQueued.wait()  // deterministic: the waiter has genuinely enqueued
+
+    // An oversized request must fail fast — the cost guard is checked
+    // unconditionally, before the waiter queue is ever consulted, so it must
+    // never join the queue behind an already-waiting acquirer.
+    await #expect(throws: GmailError.self) {
+        try await bucket.acquire(cost: 101)
+    }
+
+    _ = await waiter  // let the queued waiter resolve so teardown doesn't hang
 }
 
 /// Thread-safe ordered event log for the FIFO test.

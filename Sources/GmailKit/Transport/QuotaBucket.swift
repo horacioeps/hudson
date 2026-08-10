@@ -58,6 +58,12 @@ public actor QuotaBucket {
                 status: 0,
                 message: "Quota cost \(cost) exceeds the per-minute budget of \(unitsPerMinute).")
         }
+        // The drain task does not inherit a waiter's cancellation (that's a
+        // deferred redesign — see the catch below), so a caller that enters
+        // `acquire` already cancelled would otherwise sit in the queue until
+        // its grant instead of failing promptly. This catches that case;
+        // it does not help a caller cancelled *after* it starts waiting.
+        try Task.checkCancellation()
         pruneExpiredSpends()
         if waiters.isEmpty && spentInWindow() + cost <= unitsPerMinute {
             spends.append((now(), cost))
@@ -92,7 +98,12 @@ public actor QuotaBucket {
             let oldest = spends[0].date  // non-empty: head doesn't fit, so something is spent
             let wait = max(60 - now().timeIntervalSince(oldest), 0.05)
             do { try await sleep(wait) } catch {
-                // Sleep failure (cancellation) — fail every waiter rather than hang.
+                // Unreachable with the production `sleep` (plain `Task.sleep`,
+                // and this task — `drain()` — is never itself cancelled: it's
+                // detached from any waiter's task, so a caller cancelling its
+                // own `acquire` call does not cancel `drain`). Only reachable
+                // in tests that inject a throwing `sleep`. Kept as a
+                // fail-safe: fail every queued waiter rather than hang.
                 while let waiter = waiters.first {
                     waiters.removeFirst()
                     waiter.continuation.resume(throwing: error)
