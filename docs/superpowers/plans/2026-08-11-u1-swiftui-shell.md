@@ -437,17 +437,41 @@ public enum Typography {
 
     public static func serif(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
         register()
-        return .custom("Newsreader", size: size).weight(weight)
+        return resolved(serifCandidates, size: size, weight: weight, fallback: .serif)
     }
 
     public static func ui(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
         register()
-        return .custom("InstrumentSans", size: size).weight(weight)
+        return resolved(uiCandidates, size: size, weight: weight, fallback: nil)
+    }
+
+    // Candidate family names in preference order. The bundled VARIABLE fonts
+    // register under the first name in each list; if someone later swaps in a
+    // static instance that registers under a cleaner name, add it to the front.
+    // We probe `NSFont(name:size:)` to pick the first that actually resolves,
+    // rather than trusting one hard-coded string — `Font.custom` would silently
+    // fall back to the system font on a miss, and we'd never notice the face is
+    // wrong. Ground truth (confirmed from the shipped .ttf name tables):
+    //   Newsreader variable  → family "Newsreader 16pt"
+    //   Instrument Sans var.  → family "Instrument Sans"
+    private static let serifCandidates = ["Newsreader", "Newsreader 16pt"]
+    private static let uiCandidates    = ["Instrument Sans", "InstrumentSans"]
+
+    /// First candidate that resolves to a real `NSFont`, as a weighted
+    /// `Font.custom`; otherwise a system font (serif design when `fallback ==
+    /// .serif`) so the app always renders.
+    private static func resolved(
+        _ candidates: [String], size: CGFloat, weight: Font.Weight, fallback: Font.Design?
+    ) -> Font {
+        if let name = candidates.first(where: { NSFont(name: $0, size: size) != nil }) {
+            return .custom(name, size: size).weight(weight)
+        }
+        return .system(size: size, design: fallback ?? .default).weight(weight)
     }
 }
 ```
 
-(Note: `Font.custom` silently falls back to the system font when the family is unregistered, satisfying the graceful-fallback requirement. Use the PostScript/family name that the actual bundled files register — the implementer confirms the exact name via `CTFontManagerCreateFontDescriptorsFromURL` or by inspecting the font, and adjusts the string if the family registers under e.g. `"Newsreader"` vs `"Newsreader-Regular"`.)
+(This needs `import AppKit` for `NSFont`. Weight selection on a variable font is best-effort — `.weight()` maps to the CoreText weight trait; if a weight does not render distinctly the typeface is still correct, which is the fidelity that matters. Ground-truth family names above were confirmed by the controller from the bundled files' `name` tables; the candidate-probe means the code stays correct even if a face is later re-instanced under a different name.)
 
 - [ ] **Step 5: Run the theme test — expect PASS.** Run: `swift test --filter "accentTokenResolvesToPencilGreen|metricsMatchPencilRadii"`
 
@@ -508,7 +532,7 @@ git commit -m "feat(ui): design system — color/type/metric tokens + reusable a
   - `func observeThread(threadID: String, account: String) -> AsyncValueObservation<[MessageRow]>` — same SELECT as `threadMessages`, re-emitting on label/body changes.
   - `func observeSplitRules(account: String) -> AsyncValueObservation<[SplitRule]>`.
   - `func observePendingCount(account: String) -> AsyncValueObservation<Int>` — `COUNT(*)` of `mutation_queue` for the account (drives the "N pending / syncing" indicator).
-  - `struct LabelRecord: Sendable, Equatable { public let id: String; public let name: String; public let type: String }` and `func labels(account: String) async throws -> [LabelRecord]` — user + system labels for the sidebar, ordered by name.
+  - `struct LabelRecord: Sendable, Equatable { public let id: String; public let name: String }` and `func labels(account: String) async throws -> [LabelRecord]` — user + system labels for the sidebar, ordered by name. (The `labels` table has exactly `account_email, id, name` — PK `(account_email, id)` — confirmed against `Migrations.swift:151`; there is NO `type` column, so the sidebar distinguishes system vs user labels by the id prefix / known-system-id set, not a stored type.)
 - Consumes: existing tables `thread_rollup`, `messages`, `message_labels`, `mutation_queue`, `split_rules`, `labels`.
 
 Use GRDB's `ValueObservation.tracking { db in ... }` and expose it as an `AsyncValueObservation` via `.values(in: writer)`. Region tracking is automatic — `ValueObservation` observes exactly the tables the closure reads, so an `enqueueMutation` (which writes `mutation_queue` and `thread_rollup`) triggers a re-emit of `observeInboxThreads` for free.
@@ -576,7 +600,7 @@ extension HudsonDatabase {
 
 (Keep the SELECT byte-for-byte aligned with `InboxQuery.inboxThreads` so the two never drift — a comment on each observation method points at its one-shot twin. `observeThread` mirrors `AIStore.threadMessages`; `observeSplitRules` mirrors `splitRules`; `observePendingCount` is `SELECT COUNT(*) FROM mutation_queue WHERE account_email = ?`.)
 
-- [ ] **Step 4: Implement `LabelsRead.swift`** — `LabelRecord` + `labels(account:)` reading `SELECT id, name, type FROM labels WHERE account_email = ? ORDER BY name` (confirm the `labels` table's column names against `Migrations.swift`; adjust the SELECT to the actual schema).
+- [ ] **Step 4: Implement `LabelsRead.swift`** — `LabelRecord` + `labels(account:)` reading `SELECT id, name FROM labels WHERE account_email = ? ORDER BY name` (the `labels` table is `account_email, id, name` — no `type` column; confirmed at `Migrations.swift:151`).
 
 - [ ] **Step 5: Run the Store test — expect PASS.** Run: `swift test --filter observeInboxThreadsEmitsThenReemitsAfterArchive`
 
