@@ -155,6 +155,41 @@ private func artifactRowCount(
     #expect(untouched == "summary sourced from m2")
 }
 
+// MARK: - Fix wave 2: ai_artifact_sources stores composite key parts, not a rowid
+
+@Test func sourcesStoreCompositeArtifactKeyPartsNotAnArtifactRowid() async throws {
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(snap("m1"), account: "x")
+    try await db.putArtifact(
+        kind: "summary", key: "t1", model: "claude-x", promptVersion: 1,
+        content: "the summary", sources: ["m1"], account: "x", createdAt: 1_000)
+
+    // Extracted into a Sendable tuple inside the closure (rather than
+    // returned as a raw `Row`, which GRDB deliberately doesn't make
+    // Sendable) — the standard shape for a `db.writer.read` fetch from an
+    // async test, mirroring `rollupRow`'s pattern in `ThreadRollupTests.swift`.
+    let fetched: (kind: String, key: String, model: String, promptVersion: Int, messageID: String)? =
+        try await db.writer.read { conn in
+            guard
+                let row = try Row.fetchOne(
+                    conn,
+                    sql: "SELECT * FROM ai_artifact_sources WHERE account_email = ? AND message_id = ?",
+                    arguments: ["x", "m1"])
+            else { return nil }
+            return (
+                kind: row["kind"], key: row["artifact_key"], model: row["model"],
+                promptVersion: row["prompt_version"], messageID: row["message_id"])
+        }
+    let row = try #require(fetched)
+    // The source row carries the artifact's OWN composite primary-key
+    // parts directly — no separate rowid indirection to go stale.
+    #expect(row.kind == "summary")
+    #expect(row.key == "t1")
+    #expect(row.model == "claude-x")
+    #expect(row.promptVersion == 1)
+    #expect(row.messageID == "m1")
+}
+
 @Test func artifactWithNoSourcesSurvivesUnrelatedMessageDeletion() async throws {
     let db = try HudsonDatabase.inMemory()
     _ = try await db.applySnapshot(snap("m1"), account: "x")

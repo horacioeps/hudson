@@ -257,9 +257,22 @@ let migrator: DatabaseMigrator = {
         }
         try db.create(table: "ai_artifact_sources") { t in
             // Provenance for purge: which messages fed a given artifact.
-            // Simplified — stores the composite artifact key parts rather than
-            // a foreign key to ai_artifacts' rowid, so a source row survives
-            // (and can be swept) independently of artifact regeneration.
+            //
+            // CORRECTION (M4 final review, fix wave 2 — this comment was
+            // edited; the migration's SQL below is untouched, since
+            // migrations are append-only): this comment originally claimed
+            // the table "stores the composite artifact key parts", but the
+            // column below is actually `artifact_rowid` — `ai_artifacts`'
+            // IMPLICIT rowid (that table has a 5-column composite TEXT
+            // primary key, not an INTEGER PRIMARY KEY alias, so SQLite is
+            // free to renumber its rowid on VACUUM). A renumbered rowid
+            // would make `AIArtifacts.purge` delete the WRONG artifact —
+            // cached AI content of a deleted message surviving is a
+            // privacy invariant failure. Migration `v6` below drops and
+            // recreates this table storing the composite key parts for
+            // real, making the original claim true from then on; this
+            // table as created HERE keeps its original (buggy)
+            // `artifact_rowid` shape until `v6` runs.
             t.column("account_email", .text).notNull()
             t.column("artifact_rowid", .integer).notNull()
             t.column("message_id", .text).notNull()
@@ -366,6 +379,41 @@ let migrator: DatabaseMigrator = {
         // the full rationale (no-op on a fresh install, why nothing is
         // wrongly dropped, why this is safe as a one-time migration cost).
         try runFromSummaryBackfill(db)
+    }
+
+    migrator.registerMigration("v6") { db in
+        // M4 final review, fix wave 2: `ai_artifact_sources` (v3) links to
+        // `ai_artifacts`' IMPLICIT rowid via `artifact_rowid INTEGER` —
+        // VACUUM-fragile (see the corrected comment on v3's table above)
+        // and a contradiction of the plan's actual intent (Task 1's brief:
+        // "store the composite artifact key parts"). Drops and recreates
+        // the table storing those composite key parts —
+        // (account_email, kind, artifact_key, model, prompt_version,
+        // message_id) — matching `ai_artifacts`' own primary key exactly,
+        // so a purge lookup has no rowid dependency at all, by
+        // construction.
+        //
+        // Safe to DROP + CREATE rather than migrate data: M7 (the feature
+        // that will ever populate this table) hasn't shipped, so no
+        // installed database has ever written a row here — this is a
+        // schema correction over zero rows, not a data migration.
+        // `ai_artifacts` itself is untouched; only the sources linkage was
+        // wrong.
+        try db.drop(table: "ai_artifact_sources")
+        try db.create(table: "ai_artifact_sources") { t in
+            t.column("account_email", .text).notNull()
+            t.column("kind", .text).notNull()
+            t.column("artifact_key", .text).notNull()
+            t.column("model", .text).notNull()
+            t.column("prompt_version", .integer).notNull()
+            t.column("message_id", .text).notNull()
+        }
+        // Folds the "no index → full scan on every delete" minor:
+        // `AIArtifacts.purge`'s lookup filters on exactly these two
+        // columns.
+        try db.create(
+            index: "index_ai_artifact_sources_on_account_email_message_id",
+            on: "ai_artifact_sources", columns: ["account_email", "message_id"])
     }
 
     return migrator

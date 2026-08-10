@@ -285,3 +285,54 @@ import Testing
     #expect(splitA == "NewsA")
     #expect(splitB == "NewsB")
 }
+
+// MARK: - v6: ai_artifact_sources recreated with composite key parts (Fix wave 2)
+
+@Test func v6AddedAsAMigrationAfterV5() throws {
+    // `HudsonDatabase.inMemory()` running to completion without throwing
+    // already proves v6 registered and ran cleanly — named explicitly, same
+    // as v5's equivalent test above.
+    _ = try HudsonDatabase.inMemory()
+}
+
+@Test func v6RecreatesAIArtifactSourcesWithCompositeKeyColumnsNotRowid() throws {
+    // v3's `ai_artifact_sources.artifact_rowid` links to `ai_artifacts`'
+    // IMPLICIT rowid (a 5-column composite TEXT primary key, not an
+    // INTEGER PRIMARY KEY alias) — VACUUM-fragile: SQLite may renumber
+    // that rowid, which would make `AIArtifacts.purge` delete the WRONG
+    // artifact (a privacy invariant failure). v6 drops and recreates the
+    // table storing the artifact's own composite key parts instead, so a
+    // purge lookup has no rowid dependency at all.
+    let database = try HudsonDatabase.inMemory()
+    let cols = try database.writer.read { db in
+        try Row.fetchAll(db, sql: "PRAGMA table_info(ai_artifact_sources)").map { $0["name"] as String }
+    }
+    #expect(
+        Set(cols) == Set([
+            "account_email", "kind", "artifact_key", "model", "prompt_version", "message_id",
+        ]))
+    #expect(!cols.contains("artifact_rowid"))
+}
+
+@Test func v6AddsIndexOnAccountEmailAndMessageIDForPurgeLookups() throws {
+    // Folds the "no index → full scan on every delete" minor: purge's
+    // lookup filters on (account_email, message_id) — see `AIArtifacts.purge`.
+    let database = try HudsonDatabase.inMemory()
+    let indexNames = try database.writer.read { db in
+        try String.fetchAll(
+            db,
+            sql: "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_artifact_sources'")
+    }
+    var coversAccountThenMessage = false
+    for name in indexNames {
+        let info = try database.writer.read { db in
+            try Row.fetchAll(db, sql: "PRAGMA index_info(\(name))")
+        }
+        let columns = info.sorted { ($0["seqno"] as Int) < ($1["seqno"] as Int) }
+            .map { $0["name"] as String }
+        if columns.prefix(2) == ["account_email", "message_id"] {
+            coversAccountThenMessage = true
+        }
+    }
+    #expect(coversAccountThenMessage)
+}
