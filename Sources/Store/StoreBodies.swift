@@ -29,7 +29,9 @@ extension HudsonDatabase {
         }
     }
 
-    /// The hydration work-list: newest un-hydrated messages within the window.
+    /// The hydration work-list: newest un-hydrated messages, or those with
+    /// outdated sanitizer versions, within the window. Bumping Sanitizer.version
+    /// automatically re-derives all existing bodies.
     public func messageIDsNeedingBodies(
         account: String, since: Int64, limit: Int
     ) async throws -> [String] {
@@ -37,11 +39,17 @@ extension HudsonDatabase {
             try String.fetchAll(
                 db,
                 sql: """
-                    SELECT id FROM messages
-                    WHERE account_email = ? AND has_body = 0 AND internal_date >= ?
-                    ORDER BY internal_date DESC LIMIT ?
+                    SELECT m.id FROM messages m
+                    WHERE m.account_email = ? AND m.internal_date >= ?
+                      AND (m.has_body = 0 OR EXISTS (
+                        SELECT 1 FROM message_bodies b
+                        WHERE b.account_email = m.account_email
+                          AND b.message_id = m.id
+                          AND b.sanitizer_version < ?
+                      ))
+                    ORDER BY m.internal_date DESC LIMIT ?
                     """,
-                arguments: [account, since, limit])
+                arguments: [account, since, Sanitizer.version, limit])
         }
     }
 }

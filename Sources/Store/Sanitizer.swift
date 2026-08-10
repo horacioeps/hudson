@@ -20,8 +20,10 @@ public enum Sanitizer {
     /// Builds the derived body. Prefers the sender's text/plain part; falls
     /// back to stripping the HTML. Also inventories cid: and remote references
     /// so the future WKWebView renderer can block remote loads (spec §3.5).
+    /// Uses lossy UTF-8 decode (U+FFFD for invalid bytes) to prevent evasion
+    /// via malformed input.
     public static func sanitize(html: Data?, plainText: String?) -> SanitizedBody {
-        let htmlString = html.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let htmlString = html.map { String(decoding: $0, as: UTF8.self) } ?? ""
         let text: String
         if let plainText, !plainText.isEmpty {
             text = plainText
@@ -32,16 +34,19 @@ public enum Sanitizer {
             rawHTML: html,
             plainText: text,
             sanitizerVersion: version,
-            cidReferences: matches(#"src="cid:([^"]+)""#, in: htmlString),
-            remoteURLs: matches(#"(?:src|href)="(https?://[^"]+)""#, in: htmlString))
+            cidReferences: matches(#"(?i)src\s*=\s*["']?cid:([^"'\s>]+)"#, in: htmlString),
+            remoteURLs: deduped(matches(#"(?i)(?:src|href)\s*=\s*["']?(https?://[^"'\s>]+)"#, in: htmlString)
+                + matches(#"(?i)url\(\s*["']?(https?://[^"')\s]+)"#, in: htmlString)))
     }
 
-    /// Strips C0/C1 control characters (keeping \n and \t) and ANSI CSI/OSC
-    /// escape sequences. Every message-derived string printed to a terminal
-    /// goes through this — escape injection is reachable from `hudson list`.
-    public static func terminalSafe(_ string: String) -> String {
+    /// Strips C0/C1 control characters (keeping \n and \t), ANSI CSI/OSC
+    /// escape sequences, bidirectional marks, and zero-width characters.
+    /// Every message-derived string printed to a terminal goes through this —
+    /// escape injection is reachable from `hudson list`. When `singleLine`
+    /// is true, also replaces \n and \t with spaces (list-style renderers).
+    public static func terminalSafe(_ string: String, singleLine: Bool = false) -> String {
         // Drop CSI/OSC sequences first (ESC or 0x9B introducer), then any
-        // remaining control scalars.
+        // remaining control scalars, bidi marks, and zero-width characters.
         var cleaned = string
         for pattern in [
             #"(?:\x1B\[|\x{9B})[0-?]*[ -/]*[@-~]"#,     // CSI … final byte
@@ -51,28 +56,40 @@ public enum Sanitizer {
             cleaned = cleaned.replacingOccurrences(
                 of: pattern, with: "", options: .regularExpression)
         }
-        return String(cleaned.unicodeScalars.filter { scalar in
-            scalar == "\n" || scalar == "\t"
-                || !(scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value))
+        let result = String(cleaned.unicodeScalars.filter { scalar in
+            let val = scalar.value
+            // Keep newline and tab always; conditional replacement happens after
+            if scalar == "\n" || scalar == "\t" { return true }
+            // Reject C0 (0x00–0x1F), C1 (0x7F–0x9F)
+            if val < 0x20 || (0x7F...0x9F).contains(val) { return false }
+            // Reject bidi marks (U+200B–U+200F, U+202A–U+202E, U+2066–U+2069, U+2028, U+2029)
+            if (0x200B...0x200F).contains(val) || (0x202A...0x202E).contains(val)
+                || (0x2066...0x2069).contains(val) || val == 0x2028 || val == 0x2029 {
+                return false
+            }
+            return true
         })
+        return singleLine ? result.replacingOccurrences(of: #"[\n\t]"#, with: " ", options: .regularExpression) : result
     }
 
     // MARK: - HTML text extraction (M2: tag stripper; real rendering is WKWebView later)
 
     static func strippedText(fromHTML html: String) -> String {
         var text = html
-        // Drop script/style bodies entirely, then all tags, then decode the
-        // entities that matter for readability.
-        for pattern in [#"(?is)<(script|style)\b.*?</\1>"#, #"(?s)<br\s*/?>"#] {
+        // Drop script/style bodies entirely (both terminated and unterminated),
+        // then all tags, then decode entities (amp last to prevent double-decode).
+        for pattern in [#"(?is)<(script|style)\b.*?</\1>"#, #"(?is)<(script|style)\b[^>]*>.*"#, #"(?s)<br\s*/?>"#] {
             text = text.replacingOccurrences(
                 of: pattern, with: pattern.contains("br") ? "\n" : " ",
                 options: .regularExpression)
         }
         text = text.replacingOccurrences(
             of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+        // Decode entities with &amp; last to prevent re-encoding attacks
         for (entity, plain) in [
-            ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+            ("&lt;", "<"), ("&gt;", ">"),
             ("&quot;", "\""), ("&#39;", "'"), ("&nbsp;", " "),
+            ("&amp;", "&"),
         ] {
             text = text.replacingOccurrences(of: entity, with: plain)
         }
@@ -84,8 +101,27 @@ public enum Sanitizer {
     static func matches(_ pattern: String, in string: String) -> [String] {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(string.startIndex..., in: string)
-        return regex.matches(in: string, range: range).compactMap { match in
-            Range(match.range(at: 1), in: string).map { String(string[$0]) }
+        var results: [String] = []
+        for match in regex.matches(in: string, range: range) {
+            if results.count >= 200 { break }
+            if let range = Range(match.range(at: 1), in: string) {
+                let captured = String(string[range])
+                let truncated = captured.count > 2048 ? String(captured.prefix(2048)) : captured
+                results.append(truncated)
+            }
         }
+        return results
+    }
+
+    static func deduped(_ array: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for item in array {
+            if !seen.contains(item) {
+                seen.insert(item)
+                result.append(item)
+            }
+        }
+        return result
     }
 }
