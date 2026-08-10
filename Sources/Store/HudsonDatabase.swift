@@ -16,7 +16,7 @@ public struct HudsonDatabase: Sendable {
     static func tunedConfiguration() -> Configuration {
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
-        configuration.busyMode = .timeout(5)
+        configuration.busyMode = .timeout(5)  // seconds, not milliseconds
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode = WAL")
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
