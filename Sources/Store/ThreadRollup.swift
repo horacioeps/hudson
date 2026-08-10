@@ -18,9 +18,12 @@ enum ThreadRollup {
     ///   re-applied snapshot for a message the store already has (a later
     ///   history_id for the same id) must not double-count.
     /// - `last_message_at` is `MAX(existing, snapshot.internalDate)`; when
-    ///   this snapshot is (at least tied for) the thread's newest, its
+    ///   this snapshot is the thread's newest, its
     ///   `last_message_id`/`subject`/`snippet` are also written onto the
-    ///   rollup.
+    ///   rollup. "Newest" ties break on `last_message_id DESC`, matching
+    ///   the `ORDER BY internal_date DESC, id DESC` the v3 bulk build uses
+    ///   to pick a thread's newest message — so incrementally-maintained
+    ///   rollups and a from-scratch rebuild always agree on ties.
     /// - `unread`/`in_inbox` are OR-merged forward from the row's prior
     ///   value, but **only on insert**: a brand-new message can only ever
     ///   ADD to what's unread/in-inbox for the thread, so OR-merging is
@@ -51,13 +54,19 @@ enum ThreadRollup {
                     last_message_at = MAX(
                         IFNULL(thread_rollup.last_message_at, excluded.last_message_at), excluded.last_message_at),
                     last_message_id = CASE
-                        WHEN excluded.last_message_at >= IFNULL(thread_rollup.last_message_at, excluded.last_message_at)
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.last_message_id ELSE thread_rollup.last_message_id END,
                     subject = CASE
-                        WHEN excluded.last_message_at >= IFNULL(thread_rollup.last_message_at, excluded.last_message_at)
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.subject ELSE thread_rollup.subject END,
                     snippet = CASE
-                        WHEN excluded.last_message_at >= IFNULL(thread_rollup.last_message_at, excluded.last_message_at)
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.snippet ELSE thread_rollup.snippet END,
                     message_count = thread_rollup.message_count + excluded.message_count,
                     unread = CASE WHEN :was_insert
@@ -95,6 +104,75 @@ enum ThreadRollup {
                 WHERE account_email = ? AND thread_id = ?
                 """,
             arguments: [unread, inInbox, account, threadID])
+    }
+
+    /// Fully rebuilds ONE thread's rollup row from its current surviving
+    /// messages — `message_count`, the newest surviving message's
+    /// `last_message_id`/`subject`/`snippet`/`last_message_at`, and
+    /// overlay-aware `unread`/`in_inbox` — or deletes the rollup row
+    /// entirely if the thread has no messages left.
+    ///
+    /// Called after a `.deleted` history event: unlike `maintainRollup`'s
+    /// O(1) incremental upsert (correct for insert/update, where a message
+    /// is only ever ADDED), a deletion can't be expressed as an
+    /// incremental delta — the count must drop, and if the deleted message
+    /// was the thread's newest, a new newest has to be re-derived from the
+    /// survivors. Still bounded to the ONE thread's own messages throughout
+    /// (the same indexed `thread_id` scan `recomputeThreadFlags` and the
+    /// v3 bulk build use) — never touches other threads.
+    static func recomputeThreadRollup(threadID: String, account: String, db: Database) throws {
+        let count = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM messages WHERE account_email = ? AND thread_id = ?",
+            arguments: [account, threadID]) ?? 0
+
+        guard count > 0 else {
+            try db.execute(
+                sql: "DELETE FROM thread_rollup WHERE account_email = ? AND thread_id = ?",
+                arguments: [account, threadID])
+            return
+        }
+
+        // Newest-message tie-break matches `maintainRollup`/the bulk build:
+        // internal_date DESC, id DESC.
+        guard let newest = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT id, subject, snippet, internal_date FROM messages
+                WHERE account_email = ? AND thread_id = ?
+                ORDER BY internal_date DESC, id DESC LIMIT 1
+                """,
+            arguments: [account, threadID]
+        ) else { return }
+        let lastMessageAt: Int64 = newest["internal_date"]
+        let lastMessageID: String = newest["id"]
+        let subject: String = newest["subject"]
+        let snippet: String = newest["snippet"]
+
+        let unread = try effectiveLabelPresentInThread(
+            label: "UNREAD", threadID: threadID, account: account, db: db)
+        let inInbox = try effectiveLabelPresentInThread(
+            label: "INBOX", threadID: threadID, account: account, db: db)
+
+        try db.execute(
+            sql: """
+                INSERT INTO thread_rollup
+                    (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
+                     message_count, unread, in_inbox)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_email, thread_id) DO UPDATE SET
+                    last_message_at = excluded.last_message_at,
+                    last_message_id = excluded.last_message_id,
+                    subject = excluded.subject,
+                    snippet = excluded.snippet,
+                    message_count = excluded.message_count,
+                    unread = excluded.unread,
+                    in_inbox = excluded.in_inbox
+                """,
+            arguments: [
+                account, threadID, lastMessageAt, lastMessageID, subject, snippet,
+                count, unread, inInbox,
+            ])
     }
 
     /// Whether any message in the ONE given thread effectively carries
