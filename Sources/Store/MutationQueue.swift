@@ -64,4 +64,70 @@ extension HudsonDatabase {
             op: LabelOp(rawValue: row["op"]) ?? .add, state: row["state"],
             expectedHistoryID: row["expected_history_id"])
     }
+
+    /// Oldest `pending` rows for the flusher to send, FIFO.
+    public func claimPendingBatch(account: String, limit: Int) async throws -> [PendingMutation] {
+        try await writer.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM mutation_queue
+                    WHERE account_email = ? AND state = 'pending' ORDER BY id LIMIT ?
+                    """,
+                arguments: [account, limit]
+            ).map(Self.pendingMutation(from:))
+        }
+    }
+
+    /// Marks sent mutations in_flight and records the historyId the modify
+    /// returned as the retirement gate (spec §5 / architecture M3).
+    public func markInFlight(
+        mutationIDs: [Int64], expectedHistoryID: Int64, account: String
+    ) async throws {
+        guard !mutationIDs.isEmpty else { return }
+        try await writer.write { db in
+            for id in mutationIDs {
+                try db.execute(
+                    sql: """
+                        UPDATE mutation_queue SET state = 'in_flight', expected_history_id = ?
+                        WHERE account_email = ? AND id = ?
+                        """,
+                    arguments: [expectedHistoryID, account, id])
+            }
+        }
+    }
+
+    /// Retires in_flight deltas whose echo has landed (account cursor has
+    /// reached the modify's historyId). Retiring earlier — on 2xx — would drop
+    /// the overlay before the canonical write echoes back, flickering the row.
+    public func retireConfirmedMutations(account: String) async throws -> Int {
+        try await writer.write { db in
+            let cursor = try Int64.fetchOne(
+                db, sql: "SELECT history_cursor FROM accounts WHERE email = ?",
+                arguments: [account])
+            guard let cursor else { return 0 }
+            try db.execute(
+                sql: """
+                    DELETE FROM mutation_queue
+                    WHERE account_email = ? AND state = 'in_flight'
+                      AND expected_history_id IS NOT NULL AND expected_history_id <= ?
+                    """,
+                arguments: [account, cursor])
+            return db.changesCount
+        }
+    }
+
+    /// Terminal-failure removal — the flusher re-derives truth afterwards.
+    public func dropMutation(id: Int64, account: String) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: "DELETE FROM mutation_queue WHERE id = ? AND account_email = ?",
+                arguments: [id, account])
+        }
+    }
+}
+
+/// `?, ?, …` of length `count` for an IN clause.
+func databaseQuestionMarks(count: Int) -> String {
+    Array(repeating: "?", count: count).joined(separator: ", ")
 }
