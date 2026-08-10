@@ -2,9 +2,12 @@ import GRDB
 import Testing
 @testable import Store
 
-private func snap(_ id: String, thread: String = "t1", date: Int64, labels: [String], subject: String = "s") -> MessageSnapshot {
+private func snap(
+    _ id: String, thread: String = "t1", date: Int64, labels: [String], subject: String = "s",
+    fromLine: String = "ada@x.com"
+) -> MessageSnapshot {
     MessageSnapshot(id: id, threadID: thread, historyID: date, internalDate: date,
-        fromLine: "ada@x.com", toLine: "you@x.com", subject: subject, snippet: "sn", labelIDs: labels)
+        fromLine: fromLine, toLine: "you@x.com", subject: subject, snippet: "sn", labelIDs: labels)
 }
 
 /// The minimal slice of `thread_rollup` these tests care about. `inboxThreads`
@@ -17,6 +20,7 @@ private struct RollupSnapshot {
     let lastMessageID: String?
     let unread: Bool
     let inInbox: Bool
+    let fromSummary: String
 }
 
 private func rollupRow(_ db: HudsonDatabase, account: String, thread: String) async throws -> RollupSnapshot? {
@@ -24,14 +28,15 @@ private func rollupRow(_ db: HudsonDatabase, account: String, thread: String) as
         guard let row = try Row.fetchOne(
             conn,
             sql: """
-                SELECT message_count, last_message_at, last_message_id, unread, in_inbox
+                SELECT message_count, last_message_at, last_message_id, unread, in_inbox, from_summary
                 FROM thread_rollup WHERE account_email = ? AND thread_id = ?
                 """,
             arguments: [account, thread]
         ) else { return nil }
         return RollupSnapshot(
             messageCount: row["message_count"], lastMessageAt: row["last_message_at"],
-            lastMessageID: row["last_message_id"], unread: row["unread"], inInbox: row["in_inbox"])
+            lastMessageID: row["last_message_id"], unread: row["unread"], inInbox: row["in_inbox"],
+            fromSummary: row["from_summary"])
     }
 }
 
@@ -192,9 +197,11 @@ private final class StatementCounter: @unchecked Sendable {
     //     `maintainRollup`'s O(1) OR-merge path and never call
     //     `recomputeThreadFlags`/`recomputeThreadRollup` at all, and (Task 3)
     //     `FTSIndex.stubIndex`'s seq lookup/allocate + delete-then-reinsert
-    //     is a fixed handful of statements too — measured at ~26
-    //     statements/message: the ~10 from thread+message+label+rollup
-    //     maintenance, plus FTS's seq SELECT+INSERT, a no-op DELETE (no
+    //     is a fixed handful of statements too — measured at ~28
+    //     statements/message: the ~11 from thread+message+label+rollup
+    //     maintenance (Task 9b adds one indexed `from_summary` point
+    //     lookup per insert — see `ThreadRollup.maintainRollup`), plus
+    //     FTS's seq SELECT+INSERT, a no-op DELETE (no
     //     prior row on a fresh insert), and one INSERT that SQLite
     //     internally amplifies across `fts_messages`'s several shadow
     //     tables — it carries three configured prefix indexes
@@ -215,4 +222,115 @@ private final class StatementCounter: @unchecked Sendable {
     //     guard 1 stayed green (still ~10 statements/message) while this
     //     one went from well under a second to ~6.8s.
     #expect(elapsed < .seconds(5))
+}
+
+// MARK: - Task 9b: from_summary (sender display names, append-dedup)
+
+@Test func senderDisplayNameExtractsDisplayNameOrLocalPart() {
+    // `Display Name <email>` → the display name, quotes stripped.
+    #expect(ThreadRollup.senderDisplayName(fromLine: "Ada Lovelace <ada@example.com>") == "Ada Lovelace")
+    #expect(ThreadRollup.senderDisplayName(fromLine: "\"Ada Lovelace\" <ada@example.com>") == "Ada Lovelace")
+    // Bare email → the local-part.
+    #expect(ThreadRollup.senderDisplayName(fromLine: "ada@example.com") == "ada")
+    // Angle brackets with no display name → falls back to the email's local-part.
+    #expect(ThreadRollup.senderDisplayName(fromLine: " <ada@example.com>") == "ada")
+    // No "@" at all (still angle-bracketed) → the bracketed text verbatim.
+    #expect(ThreadRollup.senderDisplayName(fromLine: "<not-an-email>") == "not-an-email")
+    // Empty input → empty output.
+    #expect(ThreadRollup.senderDisplayName(fromLine: "") == "")
+    #expect(ThreadRollup.senderDisplayName(fromLine: "   ") == "")
+}
+
+@Test func senderDisplayNameNeverCrashesOnMalformedInput() {
+    // `from_line` comes straight from sender-controlled mail headers —
+    // this must degrade gracefully (some string back, or "") rather than
+    // crash/throw, no matter how it's mangled.
+    let malformed = [
+        "<>", ">ada@example.com<", "<<<>>>", "@", "@@@", "\"unterminated",
+        "Ada <ada@", "<ada@example.com", "ada@example.com>", "<>Ada Lovelace<>",
+    ]
+    for line in malformed {
+        _ = ThreadRollup.senderDisplayName(fromLine: line)
+    }
+}
+
+@Test func freshThreadFromSummaryIsSenderDisplayName() async throws {
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.fromSummary == "Ada Lovelace")
+}
+
+@Test func secondMessageFromDifferentSenderAppendsDeduped() async throws {
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    _ = try await db.applySnapshot(
+        snap("m2", date: 2, labels: ["INBOX"], fromLine: "Bob <bob@example.com>"), account: "x")
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.fromSummary == "Ada Lovelace, Bob")
+}
+
+@Test func secondMessageFromSameSenderDoesNotDuplicate() async throws {
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    _ = try await db.applySnapshot(
+        snap("m2", date: 2, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.fromSummary == "Ada Lovelace")
+}
+
+@Test func fromSummaryCapsAtMostRecentDistinctSenders() async throws {
+    // A 4th distinct sender pushes the from_summary past its cap of 3 —
+    // the OLDEST distinct name (Ada) is dropped, keeping the most
+    // recently-seen distinct senders.
+    let db = try HudsonDatabase.inMemory()
+    let senders = [
+        "Ada <ada@x.com>", "Bob <bob@x.com>", "Cara <cara@x.com>", "Dee <dee@x.com>",
+    ]
+    for (i, fromLine) in senders.enumerated() {
+        _ = try await db.applySnapshot(
+            snap("m\(i)", date: Int64(i), labels: ["INBOX"], fromLine: fromLine), account: "x")
+    }
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.fromSummary == "Bob, Cara, Dee")
+}
+
+@Test func updateToExistingMessageLeavesFromSummaryUnchanged() async throws {
+    // A same-message UPDATE (wasInsert == false) never adds a new sender —
+    // only a genuinely new message can (see `maintainRollup`'s doc comment).
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Someone Else <else@example.com>"), account: "x")
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.fromSummary == "Ada Lovelace")
+}
+
+@Test func recomputeAfterDeleteRebuildsFromSummaryFromSurvivors() async throws {
+    // `recomputeThreadRollup` (the full, authoritative rebuild used after a
+    // `.deleted` event) must drop a sender whose only message was deleted —
+    // `maintainRollup`'s append-only upsert can never express a removal.
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", thread: "t2", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"),
+        account: "x")
+    _ = try await db.applySnapshot(
+        snap("m2", thread: "t2", date: 2, labels: ["INBOX"], fromLine: "Bob <bob@example.com>"),
+        account: "x")
+    #expect(try await rollupRow(db, account: "x", thread: "t2")?.fromSummary == "Ada Lovelace, Bob")
+
+    _ = try await db.applyHistoryChanges([HistoryChange(kind: .deleted(id: "m2"))], account: "x")
+    #expect(try await rollupRow(db, account: "x", thread: "t2")?.fromSummary == "Ada Lovelace")
+}
+
+@Test func inboxThreadsReturnsPopulatedFromSummary() async throws {
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX"], fromLine: "Ada Lovelace <ada@example.com>"), account: "x")
+    let rows = try await db.inboxThreads(account: "x", split: nil, limit: 10)
+    #expect(rows.first?.fromSummary == "Ada Lovelace")
 }

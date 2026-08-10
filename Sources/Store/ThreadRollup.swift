@@ -1,3 +1,4 @@
+import Foundation
 import GRDB
 
 /// Incremental (O(1)) maintenance of `thread_rollup` — the sole surface the
@@ -79,13 +80,36 @@ enum ThreadRollup {
         let split = SplitInbox.computeSplit(
             fromLine: snapshot.fromLine, listID: nil, categoryLabels: snapshot.labelIDs, rules: rules)
 
+        // `from_summary`: append-dedup, computed in Swift (not pure SQL —
+        // dedup against a variable-length ", "-joined list isn't a clean
+        // SQL expression). Only on a genuinely NEW message (`wasInsert`)
+        // does a sender ever get ADDED — see `appendSenderDisplayName`'s
+        // doc comment for why this stays O(1). The read below is a single
+        // indexed point lookup by this row's OWN primary key
+        // (`account_email`, `thread_id`) — not a scan of the thread's
+        // messages or of other threads, so it doesn't cost more as the
+        // thread grows and doesn't reintroduce the O(N²) this file guards
+        // against. On an UPDATE (`!wasInsert`) this is skipped entirely:
+        // the SQL below's `CASE WHEN :was_insert` keeps the existing
+        // `thread_rollup.from_summary` untouched, so `fromSummary` here is
+        // an unused placeholder for that path.
+        let displayName = senderDisplayName(fromLine: snapshot.fromLine)
+        var fromSummary = displayName
+        if wasInsert {
+            let existing = try String.fetchOne(
+                db,
+                sql: "SELECT from_summary FROM thread_rollup WHERE account_email = ? AND thread_id = ?",
+                arguments: [account, snapshot.threadID]) ?? ""
+            fromSummary = appendSenderDisplayName(displayName, to: existing)
+        }
+
         try db.execute(
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     split_key, category, message_count, unread, in_inbox, has_attachment)
+                     from_summary, split_key, category, message_count, unread, in_inbox, has_attachment)
                 VALUES (:account, :thread, :date, :msgID, :subject, :snippet,
-                        :split_key, :category, :delta, :unread, :inbox, 0)
+                        :from_summary, :split_key, :category, :delta, :unread, :inbox, 0)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = MAX(
                         IFNULL(thread_rollup.last_message_at, excluded.last_message_at), excluded.last_message_at),
@@ -104,6 +128,7 @@ enum ThreadRollup {
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
                             IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.snippet ELSE thread_rollup.snippet END,
+                    from_summary = CASE WHEN :was_insert THEN :from_summary ELSE thread_rollup.from_summary END,
                     split_key = CASE
                         WHEN (excluded.last_message_at, excluded.last_message_id) >= (
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
@@ -128,7 +153,7 @@ enum ThreadRollup {
             arguments: [
                 "account": account, "thread": snapshot.threadID, "date": snapshot.internalDate,
                 "msgID": snapshot.id, "subject": snapshot.subject, "snippet": snapshot.snippet,
-                "split_key": split.splitKey, "category": split.category,
+                "from_summary": fromSummary, "split_key": split.splitKey, "category": split.category,
                 "delta": countDelta, "unread": isUnread, "inbox": isInInbox, "was_insert": wasInsert,
             ])
     }
@@ -180,6 +205,17 @@ enum ThreadRollup {
     /// alongside `subject`/`snippet`/`last_message_id`, not just carried
     /// over. `split_rules` is fetched once here (this runs per deletion,
     /// not per message — no batching concern like the insert/update path).
+    ///
+    /// `from_summary` is likewise fully rebuilt here — this is the
+    /// AUTHORITATIVE rebuild, unlike `maintainRollup`'s append-only upsert
+    /// (which can add a sender but can never express a removal): a deleted
+    /// message may have been a sender's only message in the thread, so its
+    /// name must be able to drop out of the summary. Rebuilt from the
+    /// survivors' DISTINCT `senderDisplayName`s, oldest → newest (the order
+    /// senders first joined the thread), same cap/overflow rule as
+    /// `appendSenderDisplayName` (drop the oldest names first). Already an
+    /// O(thread) scan like the rest of this function — this adds a fixed
+    /// constant, not a new order of growth.
     static func recomputeThreadRollup(threadID: String, account: String, db: Database) throws {
         let count = try Int.fetchOne(
             db,
@@ -221,6 +257,29 @@ enum ThreadRollup {
         let inInbox = try effectiveLabelPresentInThread(
             label: "INBOX", threadID: threadID, account: account, db: db)
 
+        // `from_summary` rebuild — see this function's doc comment. Oldest
+        // → newest so distinct names are collected in join order, then
+        // capped from the front (drop the oldest) to match
+        // `appendSenderDisplayName`'s overflow rule.
+        let survivorFromLines = try String.fetchAll(
+            db,
+            sql: """
+                SELECT from_line FROM messages
+                WHERE account_email = ? AND thread_id = ?
+                ORDER BY internal_date ASC, id ASC
+                """,
+            arguments: [account, threadID])
+        var distinctSenderNames: [String] = []
+        for line in survivorFromLines {
+            let name = senderDisplayName(fromLine: line)
+            guard !name.isEmpty, !distinctSenderNames.contains(name) else { continue }
+            distinctSenderNames.append(name)
+        }
+        if distinctSenderNames.count > fromSummaryCap {
+            distinctSenderNames.removeFirst(distinctSenderNames.count - fromSummaryCap)
+        }
+        let fromSummary = distinctSenderNames.joined(separator: ", ")
+
         // Canonical labels only (not overlay) — matches `maintainRollup`'s
         // split/category derivation, which is likewise never overlay-aware.
         let labelIDs = try String.fetchAll(
@@ -234,13 +293,14 @@ enum ThreadRollup {
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     split_key, category, message_count, unread, in_inbox, has_attachment)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     from_summary, split_key, category, message_count, unread, in_inbox, has_attachment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = excluded.last_message_at,
                     last_message_id = excluded.last_message_id,
                     subject = excluded.subject,
                     snippet = excluded.snippet,
+                    from_summary = excluded.from_summary,
                     split_key = excluded.split_key,
                     category = excluded.category,
                     message_count = excluded.message_count,
@@ -249,7 +309,7 @@ enum ThreadRollup {
                     has_attachment = excluded.has_attachment
                 """,
             arguments: [
-                account, threadID, lastMessageAt, lastMessageID, subject, snippet,
+                account, threadID, lastMessageAt, lastMessageID, subject, snippet, fromSummary,
                 split.splitKey, split.category, count, unread, inInbox, hasAttachment,
             ])
     }
@@ -363,5 +423,77 @@ enum ThreadRollup {
                 WHERE account_email = ? AND thread_id = ? AND last_message_id = ?
                 """,
             arguments: [hasAttachment, account, threadID, messageID])
+    }
+
+    // MARK: - from_summary (Task 9b: sender display names, append-dedup)
+
+    /// Max distinct sender names kept in `from_summary` — bounds both the
+    /// column's length and (via the membership check in
+    /// `appendSenderDisplayName`) the per-message dedup cost, independent
+    /// of thread size. 3 matches a Superhuman-style compact preview (e.g.
+    /// "Ada, Bob, You") — enough to name a thread's recent participants
+    /// without the column growing unbounded on a huge thread.
+    static let fromSummaryCap = 3
+
+    /// Appends `displayName` to `existing` (a `", "`-joined list) unless
+    /// already present, keeping at most `fromSummaryCap` distinct names —
+    /// on overflow the OLDEST name is dropped, so the string always
+    /// reflects the most recently-seen distinct senders. A bounded string
+    /// op — split/contains/join over at most `fromSummaryCap + 1` short
+    /// names — independent of thread size, which is what keeps
+    /// `maintainRollup`'s insert path O(1) instead of scanning the
+    /// thread's other messages to find its distinct senders.
+    static func appendSenderDisplayName(_ displayName: String, to existing: String) -> String {
+        guard !displayName.isEmpty else { return existing }
+        guard !existing.isEmpty else { return displayName }
+        var names = existing.components(separatedBy: ", ")
+        guard !names.contains(displayName) else { return existing }
+        names.append(displayName)
+        if names.count > fromSummaryCap {
+            names.removeFirst(names.count - fromSummaryCap)
+        }
+        return names.joined(separator: ", ")
+    }
+
+    /// Extracts a compact, human-readable sender label from an RFC 5322
+    /// `From` header value for `from_summary`: the display name if the
+    /// header has a `Display Name <email>` form (surrounding double-quotes
+    /// stripped, whitespace trimmed), else the email's local-part (`ada`
+    /// from `ada@example.com`), else the raw value trimmed as-is.
+    ///
+    /// Pure and total — `from_line` is untrusted (sender-controlled mail
+    /// headers reach this via `MessageSnapshot.fromLine`/`messages.from_line`),
+    /// so this never throws or crashes on malformed input; worst case it
+    /// echoes back a fragment of the raw string. Callers needing a
+    /// display-safe string for terminal output still sanitize separately
+    /// (Task 9's CLI print path) — this only decides WHICH substring to
+    /// keep, not how to render it safely.
+    static func senderDisplayName(fromLine: String) -> String {
+        let trimmed = fromLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        if let open = trimmed.firstIndex(of: "<"), let close = trimmed.lastIndex(of: ">"), open < close {
+            let namePart = trimmed[trimmed.startIndex..<open].trimmingCharacters(in: .whitespacesAndNewlines)
+            let unquotedName = unquoted(namePart)
+            if !unquotedName.isEmpty { return unquotedName }
+            let email = trimmed[trimmed.index(after: open)..<close]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return localPart(of: email)
+        }
+        return localPart(of: trimmed)
+    }
+
+    /// Strips one layer of matching double-quotes (an RFC 5322
+    /// quoted-string display name, e.g. `"Ada Lovelace"`), if present.
+    private static func unquoted(_ s: String) -> String {
+        guard s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") else { return s }
+        return String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// `ada` from `ada@example.com`; the whole string unchanged if there's
+    /// no `@`.
+    private static func localPart(of email: String) -> String {
+        guard let at = email.firstIndex(of: "@") else { return email }
+        return String(email[email.startIndex..<at])
     }
 }
