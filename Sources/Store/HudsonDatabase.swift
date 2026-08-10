@@ -9,10 +9,18 @@ public struct HudsonDatabase: Sendable {
     public let writer: any DatabaseWriter
 
     /// Opens (creating if needed) the store at `url` and migrates to the
-    /// current schema. The parent directory is created if missing.
+    /// current schema. The parent directory is created if missing, and is
+    /// excluded from Time Machine (spec §3.3: the data dir is excluded from
+    /// backup by default). Best-effort: a backup-exclusion failure must not
+    /// block opening the store, so it's `try?` — defense-in-depth, not a
+    /// hard requirement.
     public static func open(at url: URL) throws -> HudsonDatabase {
+        var dirURL = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            at: dirURL, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? dirURL.setResourceValues(values)
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
         let pool = try DatabasePool(path: url.path, configuration: configuration)
