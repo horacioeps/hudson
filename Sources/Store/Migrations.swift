@@ -73,5 +73,27 @@ let migrator: DatabaseMigrator = {
         }
     }
 
+    migrator.registerMigration("v2") { db in
+        try db.create(table: "mutation_queue") { t in
+            t.autoIncrementedPrimaryKey("id")
+            t.column("account_email", .text).notNull()
+            t.column("message_id", .text).notNull()
+            t.column("label_id", .text).notNull()
+            t.column("op", .text).notNull()               // 'add' | 'remove'
+            t.column("state", .text).notNull().defaults(to: "pending")  // 'pending' | 'in_flight'
+            t.column("enqueued_at", .integer).notNull()   // ms since epoch
+            t.column("expected_history_id", .integer)     // set once in_flight; retirement gate
+        }
+        // At most one live delta per (account, message, label): a later opposite
+        // op supersedes rather than stacks (Task 2 handles the replace).
+        try db.create(
+            index: "mutation_queue_unique_live",
+            on: "mutation_queue", columns: ["account_email", "message_id", "label_id"],
+            unique: true)
+        try db.create(
+            index: "mutation_queue_drain",
+            on: "mutation_queue", columns: ["account_email", "state", "id"])
+    }
+
     return migrator
 }()
