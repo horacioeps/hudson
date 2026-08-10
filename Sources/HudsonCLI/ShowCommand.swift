@@ -22,9 +22,13 @@ struct ShowCommand: AsyncParsableCommand {
                 throw ExitCode.failure
             }
             let row = fetched.row
-            print("From:    \(Sanitizer.terminalSafe(row.fromLine))")
-            print("To:      \(Sanitizer.terminalSafe(row.toLine))")
-            print("Subject: \(Sanitizer.terminalSafe(row.subject))")
+            // Single-line for the header fields: an embedded newline in From/To/Subject
+            // must not be able to forge fake header-looking lines under the real block
+            // (same class of fix the brief mandated for `list`'s rows). The body below
+            // keeps the default, multi-line-preserving variant.
+            print("From:    \(Sanitizer.terminalSafe(row.fromLine, singleLine: true))")
+            print("To:      \(Sanitizer.terminalSafe(row.toLine, singleLine: true))")
+            print("Subject: \(Sanitizer.terminalSafe(row.subject, singleLine: true))")
             print("Labels:  \(row.labelIDs.joined(separator: ", "))")
             print()
             if let text = fetched.plainText {
