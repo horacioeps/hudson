@@ -1522,12 +1522,19 @@ import Foundation
 
 /// Owns one account's token lifecycle: hands out a valid access token,
 /// refreshing through `OAuthClient` and persisting via `TokenStore` when
-/// needed. An actor so concurrent callers can't trigger duplicate refreshes.
+/// needed. Actor isolation alone does not stop concurrent callers from
+/// racing separate `OAuthClient.refresh` calls — `await oauth.refresh`
+/// suspends, so another call can observe the same expired token before the
+/// first refresh lands. Instead, an in-flight refresh is tracked in
+/// `refreshTask`; concurrent callers that arrive while one is running all
+/// await that same task rather than starting their own.
 public actor AccountSession {
     private let account: String
     private let oauth: OAuthClient
     private let store: any TokenStore
     private let now: @Sendable () -> Date
+    /// The currently in-flight refresh, if any — shared by concurrent callers.
+    private var refreshTask: Task<String, Error>?
 
     public init(
         account: String,
@@ -1561,11 +1568,22 @@ public actor AccountSession {
         return try await refreshAndPersist(tokens)
     }
 
+    /// Coalesces concurrent refreshes: the check for `refreshTask` and the
+    /// assignment that follows happen with no `await` between them, so no
+    /// other actor-isolated call can slip in and start a duplicate refresh.
     private func refreshAndPersist(_ tokens: TokenSet) async throws -> String {
-        let refreshed = try await oauth.refresh(tokens)
-        try store.saveTokens(refreshed, account: account)
-        Log.auth.info("Refreshed access token.")
-        return refreshed.accessToken
+        if let inFlight = refreshTask {
+            return try await inFlight.value
+        }
+        let task = Task<String, Error> {
+            let refreshed = try await self.oauth.refresh(tokens)
+            try self.store.saveTokens(refreshed, account: self.account)
+            Log.auth.info("Refreshed access token.")
+            return refreshed.accessToken
+        }
+        refreshTask = task
+        defer { refreshTask = nil }
+        return try await task.value
     }
 }
 ```
@@ -1630,13 +1648,18 @@ public struct GmailClient: Sendable {
 
     private func get<Response: Decodable>(_ path: String, cost: Int) async throws -> Response {
         try await quota.acquire(cost: cost)
-        var hasRetriedAuth = false
+        var hasRetriedAuth = false      // gates the auth-retry arm: only ever one
+        var needsForceRefresh = false   // consumed at use, so exactly ONE force refresh
 
         for attempt in 1...Self.maxAttempts {
             var request = URLRequest(url: Self.baseURL.appending(path: path))
-            let token = hasRetriedAuth
-                ? try await session.forceRefresh()
-                : try await session.validAccessToken()
+            let token: String
+            if needsForceRefresh {
+                needsForceRefresh = false
+                token = try await session.forceRefresh()
+            } else {
+                token = try await session.validAccessToken()
+            }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await transport.send(request)
@@ -1658,7 +1681,8 @@ public struct GmailClient: Sendable {
             case .server:
                 try await sleep(pow(2, Double(attempt)))
             case .auth where !hasRetriedAuth:
-                hasRetriedAuth = true  // retry once with a force-refreshed token
+                hasRetriedAuth = true      // never a second auth retry
+                needsForceRefresh = true   // next attempt force-refreshes, once
             case .auth, .network, .invalidRequest:
                 throw error
             }
