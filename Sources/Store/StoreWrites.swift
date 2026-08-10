@@ -1,5 +1,11 @@
 import Foundation
 import GRDB
+import OSLog
+
+/// Store-layer log, scoped here since Store imports neither GmailKit (home of
+/// the shared `Log` enum) nor networking. Content-free per spec §9.1: never
+/// logs message ids or content, only that an apply error was contained.
+private let storeLog = Logger(subsystem: "com.hudson.core", category: "store")
 
 extension HudsonDatabase {
     /// Writes a snapshot through the §4.2 version guard. Inside one
@@ -30,6 +36,10 @@ extension HudsonDatabase {
                 } catch {
                     try db.execute(sql: "ROLLBACK TO s")
                     try db.execute(sql: "RELEASE s")
+                    // Never silent: a genuine bad-data error during the ~6h
+                    // backfill must be visible, even though it's contained to
+                    // this one message. No id/content logged (spec §9.1).
+                    storeLog.warning("applySnapshots: skipped a message on apply error")
                 }
             }
             return applied
