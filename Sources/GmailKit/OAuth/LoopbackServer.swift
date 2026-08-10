@@ -5,15 +5,45 @@ import Network
 /// all interfaces — spec §6.2) on an OS-assigned ephemeral port, waits for
 /// Google's `/callback` redirect, hands the user a tiny confirmation page,
 /// and resolves with the authorization code.
+///
+/// Each instance is one-shot: `start()` and `waitForCallback(...)` may each
+/// be called exactly once. Create a fresh `LoopbackServer` per sign-in
+/// attempt.
 public actor LoopbackServer {
+    /// Lifecycle of the single callback this instance ever resolves. There
+    /// is exactly one path to `.finished`, and the continuation inside
+    /// `.waiting` is resumed at most once — from `resolve(_:)`, which is the
+    /// only place that touches it.
+    ///
+    /// `.delivered` exists because the HTTP callback can race
+    /// `waitForCallback`'s registration: the browser may hit `/callback`
+    /// before the caller's next line of Swift runs `waitForCallback`. When
+    /// that happens the outcome is buffered here instead of being dropped,
+    /// and handed back the moment the wait registers.
+    private enum Wait {
+        case idle
+        case waiting(CheckedContinuation<String, Error>)
+        case delivered(Result<String, GmailError>)
+        case finished
+    }
+
     private var listener: NWListener?
-    private var callbackContinuation: CheckedContinuation<String, Error>?
+    private var hasStarted = false
+    private var hasWaited = false
+    private var wait: Wait = .idle
     private var expectedState = ""
 
     public init() {}
 
     /// Starts listening; returns the bound port for building the redirect URI.
+    /// Throws if called more than once on the same instance.
     public func start() async throws -> UInt16 {
+        guard !hasStarted else {
+            throw GmailError.auth(
+                "LoopbackServer.start() was already called; use a fresh instance per sign-in attempt.")
+        }
+        hasStarted = true
+
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
         let listener = try NWListener(using: parameters)
@@ -29,11 +59,20 @@ public actor LoopbackServer {
                 switch state {
                 case .ready:
                     listener.stateUpdateHandler = nil
-                    continuation.resume(returning: listener.port?.rawValue ?? 0)
+                    if let port = listener.port?.rawValue {
+                        continuation.resume(returning: port)
+                    } else {
+                        continuation.resume(throwing: GmailError.network(
+                            "The local OAuth listener became ready without a bound port."))
+                    }
                 case .failed(let error):
                     listener.stateUpdateHandler = nil
                     continuation.resume(throwing: GmailError.network(
                         "Could not open the local OAuth listener: \(error)"))
+                case .cancelled:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: GmailError.network(
+                        "The local OAuth listener was cancelled before it became ready."))
                 default:
                     break
                 }
@@ -44,38 +83,85 @@ public actor LoopbackServer {
 
     /// Suspends until Google redirects the browser back, then returns the
     /// authorization code. Verifies `state` (CSRF guard, spec §6.2).
+    /// Throws `GmailError.auth` on state mismatch, user denial, a missing
+    /// code, timeout, external cancellation, or `stop()` being called
+    /// mid-wait. Throws if called more than once on the same instance.
     public func waitForCallback(
         expectedState: String, timeout: TimeInterval = 300
     ) async throws -> String {
+        guard !hasWaited else {
+            throw GmailError.auth(
+                "LoopbackServer.waitForCallback() was already called; use a fresh instance per sign-in attempt.")
+        }
+        hasWaited = true
         self.expectedState = expectedState
-        return try await withThrowingTaskGroup(of: String.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    Task { await self.storeContinuation(continuation) }
+
+        // The callback may already have arrived (and been buffered) before
+        // we got here — resolve immediately rather than registering a wait
+        // nothing will ever satisfy.
+        if case .delivered(let result) = wait {
+            wait = .finished
+            return try result.get()
+        }
+
+        let timeoutTask = Task {
+            // This closure is created inside an actor-isolated method, so it
+            // inherits that isolation: after the sleep resumes we're back on
+            // this actor's executor already, and `resolve` (also isolated)
+            // can be called directly.
+            try? await Task.sleep(for: .seconds(timeout))
+            if !Task.isCancelled {
+                resolve(.failure(.auth("Timed out waiting for the browser sign-in to finish.")))
+            }
+        }
+        defer { timeoutTask.cancel() }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                // Runs synchronously, still on this actor's executor, so
+                // this is the true, race-free registration point.
+                switch wait {
+                case .delivered(let result):
+                    wait = .finished
+                    continuation.resume(with: result)
+                case .idle:
+                    wait = .waiting(continuation)
+                case .waiting, .finished:
+                    continuation.resume(throwing: GmailError.auth(
+                        "LoopbackServer.waitForCallback() was already called; use a fresh instance per sign-in attempt."))
                 }
             }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeout))
-                throw GmailError.auth("Timed out waiting for the browser sign-in to finish.")
-            }
-            defer { group.cancelAll() }
-            guard let code = try await group.next() else {
-                throw GmailError.auth("OAuth callback wait ended unexpectedly.")
-            }
-            return code
+        } onCancel: {
+            Task { await self.resolve(.failure(.auth("Sign-in wait was cancelled."))) }
         }
     }
 
+    /// Stops the listener. If a call to `waitForCallback` is still pending,
+    /// it is resumed with `GmailError.auth` rather than left suspended.
     public func stop() {
         listener?.cancel()
         listener = nil
+        resolve(.failure(.auth("Sign-in cancelled.")))
+    }
+
+    // MARK: - Wait resolution
+
+    /// Resumes the pending wait at most once. If nothing is waiting yet,
+    /// the result is buffered as `.delivered` for `waitForCallback` to pick
+    /// up when it registers. Idempotent once `.finished`.
+    private func resolve(_ result: Result<String, GmailError>) {
+        switch wait {
+        case .idle:
+            wait = .delivered(result)
+        case .waiting(let continuation):
+            wait = .finished
+            continuation.resume(with: result)
+        case .delivered, .finished:
+            break
+        }
     }
 
     // MARK: - Request handling
-
-    private func storeContinuation(_ continuation: CheckedContinuation<String, Error>) {
-        callbackContinuation = continuation
-    }
 
     private nonisolated func receiveRequest(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { data, _, _, _ in
@@ -108,18 +194,16 @@ public actor LoopbackServer {
         }
 
         switch outcome {
-        case .success(let code):
+        case .success:
             respond(on: connection,
                     body: "<h1>Hudson is connected.</h1><p>You can close this tab.</p>",
                     status: "200 OK")
-            callbackContinuation?.resume(returning: code)
-        case .failure(let error):
+        case .failure:
             respond(on: connection,
                     body: "<h1>Sign-in failed.</h1><p>Return to the terminal for details.</p>",
                     status: "200 OK")
-            callbackContinuation?.resume(throwing: error)
         }
-        callbackContinuation = nil
+        resolve(outcome)
     }
 
     private nonisolated func respond(on connection: NWConnection, body: String, status: String) {

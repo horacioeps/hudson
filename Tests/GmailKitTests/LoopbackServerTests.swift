@@ -12,7 +12,7 @@ import Testing
     let (body, _) = try await URLSession.shared.data(from: url)
 
     #expect(try await code == "the-code")
-    #expect(String(decoding: body, as: UTF8.self).contains("Hudson"))
+    #expect(String(decoding: body, as: UTF8.self).contains("Hudson is connected"))
     await server.stop()
 }
 
@@ -41,6 +41,74 @@ import Testing
 
     await #expect(throws: GmailError.auth("Google reported: access_denied")) {
         _ = try await codeTask.value
+    }
+    await server.stop()
+}
+
+@Test func timesOutWhenNoCallbackArrives() async throws {
+    // Regression test for the deadlock defect: `waitForCallback` must
+    // actually throw when the timeout elapses, not hang forever waiting
+    // on a continuation that nothing will ever resume.
+    let server = LoopbackServer()
+    _ = try await server.start()
+
+    await #expect(throws: GmailError.self) {
+        _ = try await server.waitForCallback(expectedState: "s", timeout: 0.2)
+    }
+    await server.stop()
+}
+
+@Test func missingCodeSurfacesAuthError() async throws {
+    let server = LoopbackServer()
+    let port = try await server.start()
+
+    let codeTask = Task { try await server.waitForCallback(expectedState: "s", timeout: 10) }
+    let url = URL(string: "http://127.0.0.1:\(port)/callback?state=s")!
+    _ = try await URLSession.shared.data(from: url)
+
+    await #expect(throws: GmailError.auth("Callback carried no authorization code.")) {
+        _ = try await codeTask.value
+    }
+    await server.stop()
+}
+
+@Test func stopMidWaitResumesWaiterWithError() async throws {
+    // `stop()` must never leak a pending continuation: whoever is inside
+    // `waitForCallback` has to be resumed (with an error), not left
+    // suspended forever. This holds regardless of whether `stop()` wins
+    // the race against `waitForCallback` registering its wait, because
+    // the server buffers whichever side arrives first.
+    let server = LoopbackServer()
+    _ = try await server.start()
+
+    let codeTask = Task { try await server.waitForCallback(expectedState: "s", timeout: 10) }
+    await server.stop()
+
+    await #expect(throws: GmailError.self) {
+        _ = try await codeTask.value
+    }
+}
+
+@Test func startThrowsWhenCalledTwice() async throws {
+    let server = LoopbackServer()
+    _ = try await server.start()
+
+    await #expect(throws: GmailError.self) {
+        _ = try await server.start()
+    }
+    await server.stop()
+}
+
+@Test func waitForCallbackThrowsWhenCalledAgainAfterFinishing() async throws {
+    let server = LoopbackServer()
+    _ = try await server.start()
+
+    // Sequential, not concurrent, so this is deterministic: let the first
+    // wait finish (via timeout) before attempting the second call.
+    _ = try? await server.waitForCallback(expectedState: "s", timeout: 0.1)
+
+    await #expect(throws: GmailError.self) {
+        _ = try await server.waitForCallback(expectedState: "s", timeout: 10)
     }
     await server.stop()
 }
