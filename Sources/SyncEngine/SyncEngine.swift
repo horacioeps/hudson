@@ -178,20 +178,23 @@ public actor SyncEngine {
         for _ in 0..<maxPages {
             let page = try await api.listMessages(
                 pageToken: record.backfillPageToken, maxResults: pageSize)
-            var added = 0
+            var snapshots: [MessageSnapshot] = []
             for ref in page.messages ?? [] {
                 do {
                     let message = try await api.getMessage(id: ref.id, format: "metadata")
                     guard let snapshot = SnapshotMapping.snapshot(from: message) else { continue }
-                    if try await database.applySnapshot(snapshot, account: account) == .applied {
-                        added += 1
-                    }
+                    snapshots.append(snapshot)
                 } catch let error as GmailError {
                     // One bad message must not abort the pass — the page token
                     // still needs to persist so backfill keeps advancing.
                     logSkippedMessage(error, phase: "backfill")
                 }
             }
+            // One commit per page instead of per message: the load-bearing
+            // control against the SwiftUI ValueObservation storm during the
+            // ~6h backfill (architecture M3). Each message is still guarded
+            // by its own SAVEPOINT inside `applySnapshots`.
+            let added = try await database.applySnapshots(snapshots, account: account)
             report.backfilledThisPass += added
             let finished = page.nextPageToken == nil
             try await database.updateBackfill(

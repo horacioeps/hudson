@@ -12,6 +12,30 @@ extension HudsonDatabase {
         }
     }
 
+    /// Applies a page of snapshots in ONE transaction, each guarded by a
+    /// SAVEPOINT so a single failing/stale row rolls back only itself. Cutting
+    /// commits from per-message to per-page is the load-bearing control against
+    /// the SwiftUI ValueObservation storm during the ~6h backfill (architecture M3).
+    public func applySnapshots(
+        _ snapshots: [MessageSnapshot], account: String
+    ) async throws -> Int {
+        try await writer.write { db in
+            var applied = 0
+            for snapshot in snapshots {
+                do {
+                    try db.execute(sql: "SAVEPOINT s")
+                    let outcome = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+                    try db.execute(sql: "RELEASE s")
+                    if outcome == .applied { applied += 1 }
+                } catch {
+                    try db.execute(sql: "ROLLBACK TO s")
+                    try db.execute(sql: "RELEASE s")
+                }
+            }
+            return applied
+        }
+    }
+
     /// Applies history changes in order and advances the cursor — all in ONE
     /// transaction, so a crash resumes cleanly from the stored cursor (§4.3).
     /// Returns ids of label events targeting unknown, non-tombstoned
