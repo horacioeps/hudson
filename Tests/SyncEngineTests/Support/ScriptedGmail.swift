@@ -80,3 +80,23 @@ func testMessage(
         """
     return try! JSONDecoder().decode(GmailMessage.self, from: Data(json.utf8))
 }
+
+/// Builds a full-format GmailMessage carrying a text/plain body, for
+/// hydration tests. `internalDate` is milliseconds since epoch, as a string
+/// (Gmail's wire format).
+func testMessageWithBody(
+    id: String, threadID: String = "t1", historyID: String, internalDate: String,
+    labels: [String] = ["INBOX"], subject: String = "s", plainText: String
+) -> GmailMessage {
+    let encodedBody = Data(plainText.utf8).base64EncodedString()
+    let json = """
+        {"id": "\(id)", "threadId": "\(threadID)", "historyId": "\(historyID)",
+         "internalDate": "\(internalDate)", "labelIds": \(labels.map { "\"\($0)\"" }),
+         "snippet": "sn",
+         "payload": {"mimeType": "text/plain", "body": {"data": "\(encodedBody)"},
+            "headers": [
+            {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"},
+            {"name": "Subject", "value": "\(subject)"}]}}
+        """
+    return try! JSONDecoder().decode(GmailMessage.self, from: Data(json.utf8))
+}

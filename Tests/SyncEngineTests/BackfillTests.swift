@@ -58,11 +58,41 @@ private func makeWorld(
     let page = MessageListPage(
         messages: [MessageRef(id: "m1", threadId: "t1")], nextPageToken: nil,
         resultSizeEstimate: 1)
-    let (_, _, engine) = try await makeWorld(
+    let (gmail, _, engine) = try await makeWorld(
         pages: [page], messages: ["m1": testMessage(id: "m1", historyID: "90")])
     async let a = engine.syncOnce()
     async let b = engine.syncOnce()
     let (ra, rb) = try await (a, b)
     // Exactly one pass did work; the other returned the empty coalesced report.
     #expect([ra.backfilledThisPass, rb.backfilledThisPass].sorted() == [0, 1])
+    // Prove coalescing, not just a lucky count: the coalesced call never
+    // touched the API at all — exactly one profile call, one list call.
+    let calls = await gmail.calls
+    #expect(calls.filter { $0 == "profile" }.count == 1)
+    #expect(calls.filter { $0 == "list:start" }.count == 1)
+}
+
+@Test func backfillSkipsMessageThat404sAndStillAdvances() async throws {
+    // "m2" is deliberately absent from `messages` — ScriptedGmail.getMessage
+    // throws a 404 for unknown ids, modeling a message deleted between list
+    // and get.
+    let page = MessageListPage(
+        messages: [
+            MessageRef(id: "m1", threadId: "t1"), MessageRef(id: "m2", threadId: "t1"),
+            MessageRef(id: "m3", threadId: "t1"),
+        ], nextPageToken: nil, resultSizeEstimate: 3)
+    let messages = [
+        "m1": testMessage(id: "m1", historyID: "90"),
+        "m3": testMessage(id: "m3", historyID: "92"),
+    ]
+    let (_, database, engine) = try await makeWorld(pages: [page], messages: messages)
+
+    let report = try await engine.syncOnce()
+    // The 404 on m2 didn't abort the pass: m1 and m3 still applied, and the
+    // page still completed (token persisted, state advanced).
+    #expect(report.backfilledThisPass == 2)
+    #expect(report.backfillComplete)
+    let account = try #require(try await database.primaryAccount())
+    #expect(account.backfillState == "complete")
+    #expect(try await database.recentMessages(account: "x", limit: 10).count == 2)
 }

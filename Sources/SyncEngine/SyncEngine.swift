@@ -78,8 +78,14 @@ public actor SyncEngine {
         }
         guard record.historyCursor == nil else { return }
         let profile = try await api.getProfile()
-        _ = try await database.applyHistory(
-            [], newCursor: Int64(profile.historyId) ?? 0, account: account)
+        // A silently-seeded 0 would make Task 10's incremental sync believe
+        // history starts at the very beginning — load-bearing, so fail loudly
+        // instead of guessing.
+        guard let cursor = Int64(profile.historyId) else {
+            throw GmailError.invalidRequest(
+                status: 0, message: "profile.historyId is not a parsable integer")
+        }
+        _ = try await database.applyHistory([], newCursor: cursor, account: account)
     }
 
     // MARK: - History (M2: applied via Store; expiry fallback restarts backfill)
@@ -101,10 +107,16 @@ public actor SyncEngine {
                 pageToken: record.backfillPageToken, maxResults: pageSize)
             var added = 0
             for ref in page.messages ?? [] {
-                let message = try await api.getMessage(id: ref.id, format: "metadata")
-                guard let snapshot = SnapshotMapping.snapshot(from: message) else { continue }
-                if try await database.applySnapshot(snapshot, account: account) == .applied {
-                    added += 1
+                do {
+                    let message = try await api.getMessage(id: ref.id, format: "metadata")
+                    guard let snapshot = SnapshotMapping.snapshot(from: message) else { continue }
+                    if try await database.applySnapshot(snapshot, account: account) == .applied {
+                        added += 1
+                    }
+                } catch let error as GmailError {
+                    // One bad message must not abort the pass — the page token
+                    // still needs to persist so backfill keeps advancing.
+                    logSkippedBackfillMessage(error)
                 }
             }
             report.backfilledThisPass += added
@@ -119,6 +131,30 @@ public actor SyncEngine {
                 return
             }
             record = try await requireAccount()
+        }
+    }
+
+    /// A message that vanished between `messages.list` and `messages.get`
+    /// (404) is expected and silent — it's simply gone, nothing to persist.
+    /// No standalone Store API tombstones a single id without also advancing
+    /// the history cursor (that coupling belongs to `applyHistory`, not
+    /// backfill), so we just skip rather than misuse it here. Any other
+    /// GmailError also skips the message (never id/content, spec §9.1) so one
+    /// bad message can't stall the whole page.
+    private func logSkippedBackfillMessage(_ error: GmailError) {
+        switch error {
+        case .invalidRequest(let status, _) where status == 404:
+            return
+        case .invalidRequest(let status, _):
+            Log.sync.warning("backfill getMessage skipped: invalidRequest status=\(status, privacy: .public)")
+        case .server(let status):
+            Log.sync.warning("backfill getMessage skipped: server status=\(status, privacy: .public)")
+        case .rateLimited:
+            Log.sync.warning("backfill getMessage skipped: rateLimited")
+        case .network:
+            Log.sync.warning("backfill getMessage skipped: network")
+        case .auth:
+            Log.sync.warning("backfill getMessage skipped: auth")
         }
     }
 
