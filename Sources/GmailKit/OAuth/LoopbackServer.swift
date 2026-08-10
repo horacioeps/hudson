@@ -33,6 +33,7 @@ public actor LoopbackServer {
     private var wait: Wait = .idle
     private var expectedState = ""
 
+    /// Initializes a loopback server for handling one OAuth redirect callback.
     public init() {}
 
     /// Starts listening; returns the bound port for building the redirect URI.

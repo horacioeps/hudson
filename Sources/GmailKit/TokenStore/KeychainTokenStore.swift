@@ -9,6 +9,7 @@ public struct KeychainTokenStore: TokenStore {
     /// Keychain `kSecAttrService` for every Hudson item.
     public static let service = "com.hudson.gmail"
 
+    /// Initializes a token store backed by the macOS keychain.
     public init() {}
 
     public func saveTokens(_ tokens: TokenSet, account: String) throws {

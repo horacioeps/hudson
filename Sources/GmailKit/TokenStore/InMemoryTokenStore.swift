@@ -5,6 +5,7 @@ public final class InMemoryTokenStore: TokenStore {
     private struct Entry { var tokens: TokenSet?; var clientSecret: String? }
     private let entries = Mutex<[String: Entry]>([:])
 
+    /// Initializes a thread-safe in-memory token store for testing.
     public init() {}
 
     public func saveTokens(_ tokens: TokenSet, account: String) throws {

@@ -9,6 +9,7 @@ public protocol HTTPTransport: Sendable {
 
 /// The production transport: a thin, stateless wrapper over `URLSession`.
 public struct URLSessionTransport: HTTPTransport {
+    /// Initializes the production HTTP transport using the shared URLSession.
     public init() {}
 
     public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {

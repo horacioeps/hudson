@@ -12,6 +12,7 @@ public struct GmailClient: Sendable {
     private let quota: QuotaBucket
     private let sleep: @Sendable (TimeInterval) async throws -> Void
 
+    /// Initializes a Gmail API client with session, transport, quota tracking, and optional sleep.
     public init(
         session: AccountSession,
         transport: any HTTPTransport,

@@ -16,6 +16,7 @@ public actor AccountSession {
     /// The currently in-flight refresh, if any — shared by concurrent callers.
     private var refreshTask: Task<String, Error>?
 
+    /// Initializes a token session managing refresh and persistence for an account.
     public init(
         account: String,
         oauth: OAuthClient,

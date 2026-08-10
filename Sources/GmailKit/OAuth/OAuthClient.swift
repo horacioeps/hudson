@@ -8,6 +8,7 @@ public struct OAuthCredentials: Sendable {
     public let clientID: String
     public let clientSecret: String
 
+    /// Initializes OAuth credentials with the client ID and secret from Google Cloud.
     public init(clientID: String, clientSecret: String) {
         self.clientID = clientID
         self.clientSecret = clientSecret
@@ -24,6 +25,7 @@ public struct OAuthClient: Sendable {
     private let transport: any HTTPTransport
     private let now: @Sendable () -> Date
 
+    /// Initializes the OAuth client with credentials, a transport layer, and an optional time provider.
     public init(
         credentials: OAuthCredentials,
         transport: any HTTPTransport,

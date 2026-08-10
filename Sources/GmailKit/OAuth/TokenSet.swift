@@ -7,6 +7,7 @@ public struct TokenSet: Codable, Equatable, Sendable {
     public let refreshToken: String
     public let expiresAt: Date
 
+    /// Initializes a token set from access token, refresh token, and expiration time.
     public init(accessToken: String, refreshToken: String, expiresAt: Date) {
         self.accessToken = accessToken
         self.refreshToken = refreshToken

@@ -9,6 +9,7 @@ public struct PKCE: Sendable {
     /// SHA-256(verifier), base64url-encoded — sent with the authorization URL.
     public let challenge: String
 
+    /// Generates a new PKCE pair with a random verifier and its S256 challenge.
     public init() {
         var bytes = [UInt8](repeating: 0, count: 64)
         for index in bytes.indices { bytes[index] = UInt8.random(in: .min ... .max) }

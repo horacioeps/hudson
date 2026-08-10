@@ -6,6 +6,7 @@ public struct Profile: Decodable, Equatable, Sendable {
     public let threadsTotal: Int
     public let historyId: String
 
+    /// Initializes a profile from a `users.getProfile` response.
     public init(emailAddress: String, messagesTotal: Int, threadsTotal: Int, historyId: String) {
         self.emailAddress = emailAddress
         self.messagesTotal = messagesTotal

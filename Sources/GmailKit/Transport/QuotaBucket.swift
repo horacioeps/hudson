@@ -21,6 +21,7 @@ public actor QuotaBucket {
     /// Spends inside the current 60s window, oldest first.
     private var spends: [(date: Date, cost: Int)] = []
 
+    /// Initializes a quota bucket with per-minute unit limit and optional time/sleep providers.
     public init(
         unitsPerMinute: Int = 5_500,
         now: @escaping @Sendable () -> Date = { Date() },
