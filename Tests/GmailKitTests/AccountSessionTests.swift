@@ -41,3 +41,27 @@ private let credentials = OAuthCredentials(clientID: "id", clientSecret: "secret
         _ = try await session.validAccessToken()
     }
 }
+
+@Test func concurrentExpiredTokenRequestsShareASingleRefresh() async throws {
+    // Only one stubbed response: if concurrent callers each raced their own
+    // OAuthClient.refresh instead of sharing one in-flight task, the second
+    // request would find no response left and fail.
+    let store = InMemoryTokenStore()
+    try store.saveTokens(
+        TokenSet(accessToken: "stale", refreshToken: "rt", expiresAt: .distantPast),
+        account: "a@example.com")
+    let refreshResponse = #"{"access_token": "renewed", "expires_in": 3599, "token_type": "Bearer"}"#
+    let transport = MockTransport(responses: [(Data(refreshResponse.utf8), 200)])
+    let session = AccountSession(
+        account: "a@example.com",
+        oauth: OAuthClient(credentials: credentials, transport: transport),
+        store: store)
+
+    async let first = session.validAccessToken()
+    async let second = session.validAccessToken()
+    let (firstToken, secondToken) = try await (first, second)
+
+    #expect(firstToken == "renewed")
+    #expect(secondToken == "renewed")
+    #expect(await transport.recordedRequests().count == 1)
+}
