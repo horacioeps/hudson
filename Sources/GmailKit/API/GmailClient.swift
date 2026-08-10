@@ -46,22 +46,26 @@ public struct GmailClient: Sendable {
     }
 
     /// POST returning a decoded body (e.g. messages.modify → Message).
+    /// `quotaClass` defaults to `.background`, the lane every pre-M3 caller
+    /// belongs to; interactive callers (triage's modify/batchModify) pass
+    /// `.interactive` explicitly.
     func post<Body: Encodable, Response: Decodable>(
-        template: String, path: String, body: Body, cost: Int
+        template: String, path: String, body: Body, cost: Int, class quotaClass: QuotaClass = .background
     ) async throws -> Response {
         let (data, _) = try await perform(
-            method: "POST", template: template, path: path, body: body, cost: cost)
+            method: "POST", template: template, path: path, body: body, cost: cost, class: quotaClass)
         return try JSONDecoder().decode(Response.self, from: data)
     }
 
     /// POST with no meaningful response body — succeeds on 200 or 204
     /// (batchModify returns 204 with an empty body). The `get`/`post` decode
     /// path would throw trying to JSON-decode that empty body; this path
-    /// must not.
+    /// must not. `quotaClass` defaults to `.background` — see `post` above.
     func postVoid<Body: Encodable>(
-        template: String, path: String, body: Body, cost: Int
+        template: String, path: String, body: Body, cost: Int, class quotaClass: QuotaClass = .background
     ) async throws {
-        _ = try await perform(method: "POST", template: template, path: path, body: body, cost: cost)
+        _ = try await perform(
+            method: "POST", template: template, path: path, body: body, cost: cost, class: quotaClass)
     }
 
     /// Sentinel body type for GET's `performNoBody` — GET requests never
@@ -87,11 +91,14 @@ public struct GmailClient: Sendable {
     /// status 200 or 204, or throws. Callers that require a body (`get`,
     /// `post`) are responsible for handling an unexpected 204 themselves
     /// (JSON-decoding empty data throws there, which is what we want).
+    /// `quotaClass` defaults to `.background`; `get` (and thus
+    /// `performNoBody`) never overrides it — only `post`/`postVoid` callers
+    /// that need the interactive lane (triage's modify/batchModify) do.
     private func perform<Body: Encodable>(
         method: String, template: String, path: String, query: [URLQueryItem] = [],
-        body: Body?, cost: Int
+        body: Body?, cost: Int, class quotaClass: QuotaClass = .background
     ) async throws -> (Data, HTTPURLResponse) {
-        try await quota.acquire(cost: cost)
+        try await quota.acquire(cost: cost, class: quotaClass)
         // `hasRetriedAuth` never resets — it gates the ONE-force-refresh rule.
         // `needsForceRefresh` is consumed on next use so only the attempt right
         // after an auth failure force-refreshes; later attempts (429/5xx) go
