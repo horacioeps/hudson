@@ -9,7 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Secret scan (no Google credentials in the repo, ever — spec §6.1)
         run: |
-          ! grep -rE "GOCSPX-[A-Za-z0-9_-]{10,}|BEGIN( RSA)? PRIVATE KEY" \
-              --exclude-dir=.git --exclude=ci.yml .
+          ! grep -rE "GOCSPX-[A-Za-z0-9_-]{10,}|BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY|[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com|ya29\.[A-Za-z0-9_-]{20,}" \
+              --exclude-dir=.git --exclude-dir=.build --exclude=ci.yml .
       - run: swift --version
       - run: swift test
