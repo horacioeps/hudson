@@ -33,8 +33,16 @@ public enum GmailError: Error, Equatable {
     }
 
     private static func bodyIndicatesRateLimit(_ data: Data) -> Bool {
-        guard let body = String(data: data, encoding: .utf8) else { return false }
-        return body.contains("rateLimitExceeded") || body.contains("userRateLimitExceeded")
+        struct Envelope: Decodable {
+            struct Inner: Decodable {
+                struct Item: Decodable { let reason: String? }
+                let errors: [Item]?
+            }
+            let error: Inner?
+        }
+        let reasons = (try? JSONDecoder().decode(Envelope.self, from: data))?
+            .error?.errors?.compactMap(\.reason) ?? []
+        return reasons.contains("rateLimitExceeded") || reasons.contains("userRateLimitExceeded")
     }
 
     private static func googleErrorMessage(in data: Data) -> String {

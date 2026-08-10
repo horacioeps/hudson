@@ -29,12 +29,15 @@ public struct GmailClient: Sendable {
 
     /// The account's profile — also M2's source for the initial history cursor.
     public func getProfile() async throws -> Profile {
-        try await get("users/me/profile", cost: GmailQuotaCost.getProfile)
+        try await get(template: "users/me/profile", path: "users/me/profile", cost: GmailQuotaCost.getProfile)
     }
 
     // MARK: - Request core
 
-    private func get<Response: Decodable>(_ path: String, cost: Int) async throws -> Response {
+    /// template is what gets logged (never the actual path — ids in paths would violate spec §9.1); path is what gets requested.
+    private func get<Response: Decodable>(
+        template: String, path: String, query: [URLQueryItem] = [], cost: Int
+    ) async throws -> Response {
         try await quota.acquire(cost: cost)
         // `hasRetriedAuth` never resets — it gates the ONE-force-refresh rule.
         // `needsForceRefresh` is consumed on next use so only the attempt right
@@ -44,7 +47,10 @@ public struct GmailClient: Sendable {
         var needsForceRefresh = false
 
         for attempt in 1...Self.maxAttempts {
-            var request = URLRequest(url: Self.baseURL.appending(path: path))
+            var urlComponents = URLComponents(url: Self.baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+            urlComponents?.queryItems = query.isEmpty ? nil : query
+            let url = urlComponents?.url ?? Self.baseURL.appending(path: path)
+            var request = URLRequest(url: url)
             let token: String
             if needsForceRefresh {
                 needsForceRefresh = false
@@ -55,7 +61,7 @@ public struct GmailClient: Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await transport.send(request)
-            Log.transport.info("GET \(path, privacy: .public) -> \(response.statusCode)")
+            Log.transport.info("GET \(template, privacy: .public) -> \(response.statusCode)")
 
             if response.statusCode == 200 {
                 return try JSONDecoder().decode(Response.self, from: data)
