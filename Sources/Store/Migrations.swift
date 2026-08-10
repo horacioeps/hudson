@@ -39,6 +39,64 @@ func runQueryLayerBulkBuild(_ db: Database) throws {
         """)
 }
 
+/// The one-time backfill run by migration `v5`: rebuilds every EXISTING
+/// `thread_rollup` row via the real `ThreadRollup.recomputeThreadRollup`
+/// (Task 9b's follow-up). `runQueryLayerBulkBuild` above writes
+/// `from_summary` as a literal `''` (it predates sender display names
+/// existing at all), and nothing thereafter ever revisits a thread that
+/// gets no further activity — so an M2/M3 install migrating through v3
+/// gets a full inbox with every sender blank, which can persist forever
+/// for a static thread. Exactly the situation `v4`
+/// (`v4BackfillsHasAttachmentFromEachThreadsNewestMessage`) already fixed
+/// for `has_attachment`, but done here via the authoritative Swift
+/// recompute instead of a SQL approximation — so it also self-corrects
+/// `split_key`/`category`/`message_count`/`unread`/`in_inbox`/the
+/// newest-message fields for any existing row the raw-SQL bulk build (or
+/// an older, pre-fix `maintainRollup`) got subtly wrong, not just
+/// `from_summary`.
+///
+/// `SELECT DISTINCT account_email, thread_id FROM thread_rollup` only
+/// visits rows that already exist — on a fresh install `thread_rollup` is
+/// empty (v3's bulk build ran over an empty `messages` table), so this is
+/// a no-op there, same shape as v4's backfill. `recomputeThreadRollup`
+/// only ever drops a rollup row when its thread has NO surviving messages
+/// — impossible here for consistent data, since a `thread_rollup` row
+/// only ever exists alongside at least one `messages` row for that
+/// thread; nothing in this backfill touches `messages`, so every row
+/// visited here keeps its message(s) and is rebuilt in place, never
+/// dropped.
+///
+/// Split rules are loaded ONCE per account (not once per thread) via a
+/// small cache — mirrors `applySnapshots`/`applyHistoryChanges`'s
+/// per-batch rules loading in `StoreWrites.swift`. This is a one-time
+/// migration cost (O(total messages) across the whole install, run once,
+/// ever), not a per-message runtime path, so it isn't asymptotically
+/// load-bearing the way `maintainRollup`'s O(1) is — but there's no
+/// reason to re-query an account's rules once per thread when an account
+/// typically has many. Extracted to a named function (matching
+/// `runQueryLayerBulkBuild`'s rationale above) so `QueryLayerMigrationTests`
+/// exercises the exact code the migration runs.
+func runFromSummaryBackfill(_ db: Database) throws {
+    let threads = try Row.fetchAll(
+        db, sql: "SELECT DISTINCT account_email, thread_id FROM thread_rollup")
+    guard !threads.isEmpty else { return }
+
+    var rulesByAccount: [String: [SplitRule]] = [:]
+    for row in threads {
+        let account: String = row["account_email"]
+        let threadID: String = row["thread_id"]
+        let rules: [SplitRule]
+        if let cached = rulesByAccount[account] {
+            rules = cached
+        } else {
+            rules = try SplitInbox.fetchRules(account: account, db: db)
+            rulesByAccount[account] = rules
+        }
+        try ThreadRollup.recomputeThreadRollup(
+            threadID: threadID, account: account, db: db, rules: rules)
+    }
+}
+
 /// Schema history. Migrations are append-only: never edit a registered
 /// migration after it ships — add a new one.
 let migrator: DatabaseMigrator = {
@@ -297,6 +355,17 @@ let migrator: DatabaseMigrator = {
                   AND m.id = thread_rollup.last_message_id
             ), 0)
             """)
+    }
+
+    migrator.registerMigration("v5") { db in
+        // Task 9b follow-up: backfills `thread_rollup.from_summary` (and
+        // self-corrects every other rollup column alongside it) for
+        // installs that already have `thread_rollup` rows predating sender
+        // display names — the identical situation v4 just fixed for
+        // `has_attachment`. See `runFromSummaryBackfill`'s doc comment for
+        // the full rationale (no-op on a fresh install, why nothing is
+        // wrongly dropped, why this is safe as a one-time migration cost).
+        try runFromSummaryBackfill(db)
     }
 
     return migrator

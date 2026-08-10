@@ -203,8 +203,15 @@ enum ThreadRollup {
     /// matching `maintainRollup`) labels — a deletion can change who the
     /// newest message is, so its split/category must be recomputed
     /// alongside `subject`/`snippet`/`last_message_id`, not just carried
-    /// over. `split_rules` is fetched once here (this runs per deletion,
-    /// not per message — no batching concern like the insert/update path).
+    /// over. `rules` defaults to `nil`, which fetches the account's
+    /// `split_rules` once right here — fine for this function's normal
+    /// callers (`.deleted`/`deleteVanishedMessage`), which run per
+    /// deletion, not per message, so there's no batching concern like the
+    /// insert/update path. A caller iterating many threads for the SAME
+    /// account in one pass (the v5 migration backfill, `Migrations.swift`'s
+    /// `runFromSummaryBackfill`) can instead fetch rules once and pass them
+    /// through here, the same `splitRules`-threading pattern
+    /// `applySnapshotInTransaction`/`maintainRollup` already use.
     ///
     /// `from_summary` is likewise fully rebuilt here — this is the
     /// AUTHORITATIVE rebuild, unlike `maintainRollup`'s append-only upsert
@@ -216,7 +223,9 @@ enum ThreadRollup {
     /// `appendSenderDisplayName` (drop the oldest names first). Already an
     /// O(thread) scan like the rest of this function — this adds a fixed
     /// constant, not a new order of growth.
-    static func recomputeThreadRollup(threadID: String, account: String, db: Database) throws {
+    static func recomputeThreadRollup(
+        threadID: String, account: String, db: Database, rules: [SplitRule]? = nil
+    ) throws {
         let count = try Int.fetchOne(
             db,
             sql: "SELECT COUNT(*) FROM messages WHERE account_email = ? AND thread_id = ?",
@@ -285,9 +294,9 @@ enum ThreadRollup {
         let labelIDs = try String.fetchAll(
             db, sql: "SELECT label_id FROM message_labels WHERE account_email = ? AND message_id = ?",
             arguments: [account, lastMessageID])
-        let rules = try SplitInbox.fetchRules(account: account, db: db)
+        let resolvedRules = try rules ?? SplitInbox.fetchRules(account: account, db: db)
         let split = SplitInbox.computeSplit(
-            fromLine: fromLine, listID: nil, categoryLabels: labelIDs, rules: rules)
+            fromLine: fromLine, listID: nil, categoryLabels: labelIDs, rules: resolvedRules)
 
         try db.execute(
             sql: """

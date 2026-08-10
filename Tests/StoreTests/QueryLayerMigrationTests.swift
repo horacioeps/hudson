@@ -159,3 +159,129 @@ import Testing
     }
     #expect(hits.count == 1)
 }
+
+// MARK: - v5: from_summary backfill for pre-existing thread_rollup rows (Task 9b follow-up)
+
+@Test func v5AddedAsAMigrationAfterV4() throws {
+    // `HudsonDatabase.inMemory()` running to completion without throwing
+    // already proves v5 registered and ran cleanly — this just names that
+    // expectation explicitly.
+    _ = try HudsonDatabase.inMemory()
+}
+
+@Test func v5FromSummaryBackfillIsANoOpOnAFreshDatabase() throws {
+    // Construction already runs the full migrator (v1...v5) over empty
+    // tables — v3's bulk build inserts nothing, so v5 has no thread_rollup
+    // rows to visit either. Confirms that explicitly rather than just
+    // relying on "construction didn't throw".
+    let database = try HudsonDatabase.inMemory()
+    let count = try database.writer.read { db in
+        try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM thread_rollup")!
+    }
+    #expect(count == 0)
+}
+
+@Test func v5BackfillsFromSummaryForExistingThreadRollupRows() throws {
+    // Simulates an upgrading install: thread_rollup already has a row (v3's
+    // bulk build, or any pre-Task-9b incremental maintenance) with
+    // from_summary stuck at the column's default '' — v5's backfill must
+    // rebuild it from the thread's actual surviving senders, not just
+    // leave it blank forever.
+    let database = try HudsonDatabase.inMemory()
+    try database.writer.write { db in
+        try db.execute(sql: "INSERT INTO accounts (email, client_id, consented_at) VALUES ('a@x.com','c',0)")
+        try db.execute(sql: "INSERT INTO threads (account_email, id, last_message_at) VALUES ('a@x.com','t1',200)")
+        try db.execute(sql: """
+            INSERT INTO messages (account_email, id, thread_id, history_id, internal_date, from_line, to_line, subject, snippet)
+            VALUES ('a@x.com','m1','t1',1,100,'Ada Lovelace <ada@x.com>','you@x.com','s','sn')
+            """)
+        try db.execute(sql: """
+            INSERT INTO messages (account_email, id, thread_id, history_id, internal_date, from_line, to_line, subject, snippet)
+            VALUES ('a@x.com','m2','t1',2,200,'Bob <bob@x.com>','you@x.com','s2','sn2')
+            """)
+        try db.execute(sql: "INSERT INTO labels (account_email, id, name) VALUES ('a@x.com','INBOX','Inbox')")
+        try db.execute(sql: "INSERT INTO message_labels (account_email, message_id, label_id) VALUES ('a@x.com','m1','INBOX')")
+        try db.execute(sql: "INSERT INTO message_labels (account_email, message_id, label_id) VALUES ('a@x.com','m2','INBOX')")
+
+        // Pre-v5 state: a thread_rollup row already exists (v3's bulk
+        // build ran, or incremental maintenance kept it current) but
+        // from_summary is stuck at ''.
+        try db.execute(sql: "DELETE FROM thread_rollup")
+        try db.execute(sql: """
+            INSERT INTO thread_rollup
+                (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
+                 from_summary, message_count, unread, in_inbox)
+            VALUES ('a@x.com','t1',200,'m2','s2','sn2','',2,0,1)
+            """)
+
+        try runFromSummaryBackfill(db)
+    }
+    let row = try database.writer.read { db in
+        try Row.fetchOne(db, sql: "SELECT * FROM thread_rollup WHERE thread_id='t1'")!
+    }
+    #expect(row["from_summary"] as String == "Ada Lovelace, Bob")
+    // The recompute must not otherwise disturb a row whose thread still
+    // has surviving messages — no drop, no double-count.
+    #expect(row["message_count"] as Int == 2)
+    #expect(row["last_message_id"] as String == "m2")
+}
+
+@Test func v5CachesSplitRulesPerAccountNotAcrossAccounts() throws {
+    // Two different accounts, each with its own split rule for the SAME
+    // sender domain, routed to a DIFFERENT split name — confirms the
+    // backfill's per-account rules cache doesn't leak one account's rules
+    // onto another account's recompute.
+    let database = try HudsonDatabase.inMemory()
+    try database.writer.write { db in
+        for account in ["a@x.com", "b@x.com"] {
+            try db.execute(
+                sql: "INSERT INTO accounts (email, client_id, consented_at) VALUES (?, 'c', 0)",
+                arguments: [account])
+            try db.execute(
+                sql: "INSERT INTO threads (account_email, id, last_message_at) VALUES (?, 't1', 100)",
+                arguments: [account])
+            try db.execute(
+                sql: """
+                    INSERT INTO messages (account_email, id, thread_id, history_id, internal_date, from_line, to_line, subject, snippet)
+                    VALUES (?, 'm1', 't1', 1, 100, 'Ada Lovelace <ada@newsletter.com>', 'you@x.com', 's', 'sn')
+                    """,
+                arguments: [account])
+            try db.execute(
+                sql: "INSERT INTO labels (account_email, id, name) VALUES (?, 'INBOX', 'Inbox')",
+                arguments: [account])
+            try db.execute(
+                sql: "INSERT INTO message_labels (account_email, message_id, label_id) VALUES (?, 'm1', 'INBOX')",
+                arguments: [account])
+        }
+        try db.execute(sql: """
+            INSERT INTO split_rules (account_email, ordinal, predicate_kind, predicate_value, split_name)
+            VALUES ('a@x.com', 1, 'domain', 'newsletter.com', 'NewsA')
+            """)
+        try db.execute(sql: """
+            INSERT INTO split_rules (account_email, ordinal, predicate_kind, predicate_value, split_name)
+            VALUES ('b@x.com', 1, 'domain', 'newsletter.com', 'NewsB')
+            """)
+        try db.execute(sql: "DELETE FROM thread_rollup")
+        for account in ["a@x.com", "b@x.com"] {
+            try db.execute(
+                sql: """
+                    INSERT INTO thread_rollup
+                        (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
+                         from_summary, split_key, message_count, unread, in_inbox)
+                    VALUES (?, 't1', 100, 'm1', 's', 'sn', '', 'primary', 1, 0, 1)
+                    """,
+                arguments: [account])
+        }
+        try runFromSummaryBackfill(db)
+    }
+    let splitA = try database.writer.read { db in
+        try String.fetchOne(
+            db, sql: "SELECT split_key FROM thread_rollup WHERE account_email='a@x.com' AND thread_id='t1'")
+    }
+    let splitB = try database.writer.read { db in
+        try String.fetchOne(
+            db, sql: "SELECT split_key FROM thread_rollup WHERE account_email='b@x.com' AND thread_id='t1'")
+    }
+    #expect(splitA == "NewsA")
+    #expect(splitB == "NewsB")
+}
