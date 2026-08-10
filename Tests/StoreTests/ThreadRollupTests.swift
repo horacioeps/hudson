@@ -190,10 +190,18 @@ private final class StatementCounter: @unchecked Sendable {
     //     loop over other messages in the thread). All N applies here are
     //     INSERTs (distinct ids), so every one should take
     //     `maintainRollup`'s O(1) OR-merge path and never call
-    //     `recomputeThreadFlags`/`recomputeThreadRollup` at all — measured
-    //     at ~10 statements/message (tombstone/staleness/exists checks,
-    //     thread+message upserts, one label replace, one rollup upsert).
-    #expect(counter.count < messageCount * 20)
+    //     `recomputeThreadFlags`/`recomputeThreadRollup` at all, and (Task 3)
+    //     `FTSIndex.stubIndex`'s seq lookup/allocate + delete-then-reinsert
+    //     is a fixed handful of statements too — measured at ~26
+    //     statements/message: the ~10 from thread+message+label+rollup
+    //     maintenance, plus FTS's seq SELECT+INSERT, a no-op DELETE (no
+    //     prior row on a fresh insert), and one INSERT that SQLite
+    //     internally amplifies across `fts_messages`'s several shadow
+    //     tables — it carries three configured prefix indexes
+    //     (`prefix='2 3 4'`), each maintaining its own b-tree. Still O(1)
+    //     per message (confirmed by guard 2's wall-clock bound below
+    //     staying flat), just a higher constant than before FTS existed.
+    #expect(counter.count < messageCount * 35)
     //  2. Wall-clock — catches a regression that keeps a FIXED statement
     //     count per message but makes each statement scan the whole
     //     thread (e.g. calling the full-rebuild `recomputeThreadRollup`

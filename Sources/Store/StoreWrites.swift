@@ -133,6 +133,7 @@ extension HudsonDatabase {
                     try db.execute(
                         sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                         arguments: [account, id])
+                    try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
                     if let threadID {
                         try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
                     }
@@ -229,7 +230,9 @@ extension HudsonDatabase {
     /// the `.deleted` branch of `applyHistory`: tombstone then delete, in ONE
     /// transaction, so the row leaves `messageIDsNeedingBodies`'s work-list
     /// instead of 404ing forever. `message_bodies`/`message_labels` rows
-    /// cascade via their foreign keys. Also mirrors `.deleted`'s rollup
+    /// cascade via their foreign keys; `fts_messages`/`message_seq` do not
+    /// (a plain FTS5 table has no FK/cascade machinery), so `FTSIndex.deleteIndex`
+    /// removes those explicitly. Also mirrors `.deleted`'s rollup
     /// handling: thread_id captured before the delete, then the ONE
     /// affected thread's rollup row is fully rebuilt (or dropped) via
     /// `ThreadRollup.recomputeThreadRollup` — a deletion can't be folded
@@ -246,6 +249,7 @@ extension HudsonDatabase {
             try db.execute(
                 sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                 arguments: [account, id])
+            try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
             if let threadID {
                 try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
             }
@@ -332,6 +336,7 @@ extension HudsonDatabase {
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
         try ThreadRollup.maintainRollup(
             afterApplying: snapshot, wasInsert: wasInsert, account: account, db: db)
+        try FTSIndex.stubIndex(snapshot, account: account, db: db)
         return (.applied, wasInsert)
     }
 

@@ -2,7 +2,11 @@ import Foundation
 import GRDB
 
 extension HudsonDatabase {
-    /// Stores a sanitized body and flags the message hydrated — one transaction.
+    /// Stores a sanitized body, flags the message hydrated, and reindexes the
+    /// message's FTS row WITH the new body — all in one transaction. Also the
+    /// path a `Sanitizer.version` bump re-derives through: `messageIDsNeedingBodies`
+    /// picks up outdated-version rows, hydration re-sanitizes, and this call
+    /// both overwrites `message_bodies` and refreshes `fts_messages` to match.
     public func saveBody(messageID: String, account: String, body: SanitizedBody) async throws {
         let cids = String(decoding: try JSONEncoder().encode(body.cidReferences), as: UTF8.self)
         let urls = String(decoding: try JSONEncoder().encode(body.remoteURLs), as: UTF8.self)
@@ -26,6 +30,8 @@ extension HudsonDatabase {
             try db.execute(
                 sql: "UPDATE messages SET has_body = 1 WHERE account_email = ? AND id = ?",
                 arguments: [account, messageID])
+            try FTSIndex.reindexBody(
+                messageID: messageID, account: account, plainText: body.plainText, db: db)
         }
     }
 
