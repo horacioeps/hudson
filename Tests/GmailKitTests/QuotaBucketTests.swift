@@ -20,14 +20,24 @@ private final class VirtualClock: @unchecked Sendable {
 
 @Test func underCapacityNeverSleeps() async throws {
     let clock = VirtualClock()
-    let bucket = QuotaBucket(unitsPerMinute: 100, now: { clock.now }, sleep: { clock.sleep($0) })
+    // `interactiveReserve: 0` — these legacy (pre-M3) tests predate the
+    // priority-lane concept and exercise plain `acquire(cost:)`
+    // (`.background`), so they need the full `unitsPerMinute` usable by
+    // that lane, same as before M3. The default `interactiveReserve`
+    // (1,000) is sized for the production default `unitsPerMinute`
+    // (5,500); left at that default here it would swallow this whole
+    // 100-unit test window and make every `.background` acquire
+    // unadmittable.
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 0,
+                              now: { clock.now }, sleep: { clock.sleep($0) })
     for _ in 0..<5 { try await bucket.acquire(cost: 20) }  // exactly 100 units
     #expect(clock.totalSlept == 0)
 }
 
 @Test func overCapacityWaitsForWindowToRoll() async throws {
     let clock = VirtualClock()
-    let bucket = QuotaBucket(unitsPerMinute: 100, now: { clock.now }, sleep: { clock.sleep($0) })
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 0,  // see underCapacityNeverSleeps
+                              now: { clock.now }, sleep: { clock.sleep($0) })
     for _ in 0..<5 { try await bucket.acquire(cost: 20) }
     try await bucket.acquire(cost: 20)  // 101st+ unit must wait ~60s for the window
     #expect(clock.totalSlept >= 59 && clock.totalSlept <= 61)
@@ -79,7 +89,8 @@ private final class VirtualClock: @unchecked Sendable {
     // by the real ~200ms gap between the two drain cycles, not by
     // unspecified scheduler behavior.
     let bigIsWaiting = OneShotSignal()
-    let bucket = QuotaBucket(unitsPerMinute: 100, now: { clock.now }, sleep: { seconds in
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 0,  // see underCapacityNeverSleeps
+                              now: { clock.now }, sleep: { seconds in
         await bigIsWaiting.fire()
         try? await Task.sleep(for: .milliseconds(200))
         clock.sleep(seconds)
@@ -109,7 +120,8 @@ private final class VirtualClock: @unchecked Sendable {
 @Test func fifoStillRejectsOversizedCost() async throws {
     let clock = VirtualClock()
     let waiterIsQueued = OneShotSignal()
-    let bucket = QuotaBucket(unitsPerMinute: 100, now: { clock.now }, sleep: { seconds in
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 0,  // see underCapacityNeverSleeps
+                              now: { clock.now }, sleep: { seconds in
         await waiterIsQueued.fire()
         clock.sleep(seconds)
     })
