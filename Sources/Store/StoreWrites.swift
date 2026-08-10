@@ -41,6 +41,13 @@ extension HudsonDatabase {
     ) async throws -> Int {
         try await writer.write { db in
             var applied = 0
+            // Split rules are loaded ONCE for the whole batch (not
+            // re-queried per message) and threaded through
+            // `applySnapshotInTransaction` → `ThreadRollup.maintainRollup` —
+            // this is the actual backfill/re-list hot path (one commit per
+            // page of many messages), so this is where a per-message rules
+            // re-query would matter.
+            let splitRules = try SplitInbox.fetchRules(account: account, db: db)
             // Batch-deduped, not per-message: an UPDATE's rollup flags can
             // only be correctly lowered by a bounded per-thread recompute
             // (see `applySnapshot`), but running that recompute inside the
@@ -56,7 +63,8 @@ extension HudsonDatabase {
             for snapshot in snapshots {
                 do {
                     try db.execute(sql: "SAVEPOINT s")
-                    let result = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+                    let result = try Self.applySnapshotInTransaction(
+                        snapshot, account: account, db: db, splitRules: splitRules)
                     try db.execute(sql: "RELEASE s")
                     if result.outcome == .applied {
                         applied += 1
@@ -102,6 +110,9 @@ extension HudsonDatabase {
     ) async throws -> [String] {
         try await writer.write { db in
             var unknownIDs: [String] = []
+            // Loaded once per page, same rationale as `applySnapshots` —
+            // shared by every `.added` change below.
+            let splitRules = try SplitInbox.fetchRules(account: account, db: db)
             // Same batch-dedup as `applySnapshots` — see its comment. Only
             // `.added` updates (wasInsert == false) go in this set; `.added`
             // inserts take `maintainRollup`'s O(1) OR-merge path and never
@@ -112,7 +123,8 @@ extension HudsonDatabase {
             for change in changes {
                 switch change.kind {
                 case .added(let snapshot):
-                    let result = try Self.applySnapshotInTransaction(snapshot, account: account, db: db)
+                    let result = try Self.applySnapshotInTransaction(
+                        snapshot, account: account, db: db, splitRules: splitRules)
                     if result.outcome == .applied && !result.wasInsert {
                         updatedThreadIDs.insert(snapshot.threadID)
                     }
@@ -281,8 +293,18 @@ extension HudsonDatabase {
     /// insert-only OR-merge can't do (see `ThreadRollup.maintainRollup`).
     /// `wasInsert` is meaningless (`false`) for `.tombstoned`/`.stale`,
     /// which never reach the upsert.
+    ///
+    /// `splitRules` lets a batch caller (`applySnapshots`,
+    /// `applyHistoryChanges`) load the account's `split_rules` ONCE and
+    /// pass the same array to every message in the batch, instead of each
+    /// message re-querying it — see `ThreadRollup.maintainRollup`'s doc
+    /// comment. `nil` (the default, used by the single-message
+    /// `applySnapshot`) fetches them once here instead — still exactly one
+    /// small indexed read for that one message, not a re-query "per
+    /// message in a loop".
     static func applySnapshotInTransaction(
-        _ snapshot: MessageSnapshot, account: String, db: Database
+        _ snapshot: MessageSnapshot, account: String, db: Database,
+        splitRules: [SplitRule]? = nil
     ) throws -> (outcome: SnapshotOutcome, wasInsert: Bool) {
         let tombstoned = try Bool.fetchOne(
             db,
@@ -334,8 +356,9 @@ extension HudsonDatabase {
                 snapshot.subject, snapshot.snippet,
             ])
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
+        let rules = try splitRules ?? SplitInbox.fetchRules(account: account, db: db)
         try ThreadRollup.maintainRollup(
-            afterApplying: snapshot, wasInsert: wasInsert, account: account, db: db)
+            afterApplying: snapshot, wasInsert: wasInsert, account: account, db: db, rules: rules)
         try FTSIndex.stubIndex(snapshot, account: account, db: db)
         return (.applied, wasInsert)
     }

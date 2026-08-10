@@ -53,19 +53,39 @@ enum ThreadRollup {
     ///   only a genuinely NEW newest message (insert) gets to reset the
     ///   flag to "unknown, pending hydration"; an update never touches it.
     ///   Fix round 1 (reviewer-caught Critical).
+    /// - `split_key`/`category` (Task 7) ARE fully derivable from a bare
+    ///   `MessageSnapshot` (its `fromLine`/`labelIDs`, via
+    ///   `SplitInbox.computeSplit`) — unlike `has_attachment`, so they need
+    ///   no `:was_insert` gate and instead follow the SAME tied-or-newer
+    ///   rule as `subject`/`snippet`: whichever applied snapshot is the
+    ///   thread's current newest (insert OR update) determines the
+    ///   rollup's split/category, so a routine re-apply of the newest
+    ///   message (label change, resync) keeps them correctly in sync with
+    ///   its current label set.
+    ///
+    ///   `rules` is the account's ordered `split_rules`, loaded ONCE by the
+    ///   caller (`StoreWrites`'s batch entry points load it once per batch
+    ///   and thread it through; single-message callers load it once per
+    ///   call) — never re-queried per message inside a loop here.
     static func maintainRollup(
-        afterApplying snapshot: MessageSnapshot, wasInsert: Bool, account: String, db: Database
+        afterApplying snapshot: MessageSnapshot, wasInsert: Bool, account: String, db: Database,
+        rules: [SplitRule]
     ) throws {
         let isUnread = snapshot.labelIDs.contains("UNREAD")
         let isInInbox = snapshot.labelIDs.contains("INBOX")
         let countDelta = wasInsert ? 1 : 0
+        // `listID` is always nil here — see `SplitInbox.computeSplit`'s doc
+        // comment: `MessageSnapshot` doesn't carry `List-Id` yet.
+        let split = SplitInbox.computeSplit(
+            fromLine: snapshot.fromLine, listID: nil, categoryLabels: snapshot.labelIDs, rules: rules)
 
         try db.execute(
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     message_count, unread, in_inbox, has_attachment)
-                VALUES (:account, :thread, :date, :msgID, :subject, :snippet, :delta, :unread, :inbox, 0)
+                     split_key, category, message_count, unread, in_inbox, has_attachment)
+                VALUES (:account, :thread, :date, :msgID, :subject, :snippet,
+                        :split_key, :category, :delta, :unread, :inbox, 0)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = MAX(
                         IFNULL(thread_rollup.last_message_at, excluded.last_message_at), excluded.last_message_at),
@@ -84,6 +104,16 @@ enum ThreadRollup {
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
                             IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.snippet ELSE thread_rollup.snippet END,
+                    split_key = CASE
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
+                        THEN excluded.split_key ELSE thread_rollup.split_key END,
+                    category = CASE
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
+                        THEN excluded.category ELSE thread_rollup.category END,
                     has_attachment = CASE
                         WHEN :was_insert AND (excluded.last_message_at, excluded.last_message_id) >= (
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
@@ -98,6 +128,7 @@ enum ThreadRollup {
             arguments: [
                 "account": account, "thread": snapshot.threadID, "date": snapshot.internalDate,
                 "msgID": snapshot.id, "subject": snapshot.subject, "snippet": snapshot.snippet,
+                "split_key": split.splitKey, "category": split.category,
                 "delta": countDelta, "unread": isUnread, "inbox": isInInbox, "was_insert": wasInsert,
             ])
     }
@@ -141,6 +172,14 @@ enum ThreadRollup {
     /// survivors. Still bounded to the ONE thread's own messages throughout
     /// (the same indexed `thread_id` scan `recomputeThreadFlags` and the
     /// v3 bulk build use) — never touches other threads.
+    ///
+    /// `split_key`/`category` (Task 7) are re-derived here too, from the
+    /// surviving newest message's `from_line` and (canonical, non-overlay —
+    /// matching `maintainRollup`) labels — a deletion can change who the
+    /// newest message is, so its split/category must be recomputed
+    /// alongside `subject`/`snippet`/`last_message_id`, not just carried
+    /// over. `split_rules` is fetched once here (this runs per deletion,
+    /// not per message — no batching concern like the insert/update path).
     static func recomputeThreadRollup(threadID: String, account: String, db: Database) throws {
         let count = try Int.fetchOne(
             db,
@@ -159,7 +198,7 @@ enum ThreadRollup {
         guard let newest = try Row.fetchOne(
             db,
             sql: """
-                SELECT id, subject, snippet, internal_date, has_attachment FROM messages
+                SELECT id, subject, snippet, internal_date, has_attachment, from_line FROM messages
                 WHERE account_email = ? AND thread_id = ?
                 ORDER BY internal_date DESC, id DESC LIMIT 1
                 """,
@@ -175,23 +214,35 @@ enum ThreadRollup {
         // this rebuild, so it's read straight from the row rather than
         // reset to "unknown".
         let hasAttachment: Bool = newest["has_attachment"]
+        let fromLine: String = newest["from_line"]
 
         let unread = try effectiveLabelPresentInThread(
             label: "UNREAD", threadID: threadID, account: account, db: db)
         let inInbox = try effectiveLabelPresentInThread(
             label: "INBOX", threadID: threadID, account: account, db: db)
 
+        // Canonical labels only (not overlay) — matches `maintainRollup`'s
+        // split/category derivation, which is likewise never overlay-aware.
+        let labelIDs = try String.fetchAll(
+            db, sql: "SELECT label_id FROM message_labels WHERE account_email = ? AND message_id = ?",
+            arguments: [account, lastMessageID])
+        let rules = try SplitInbox.fetchRules(account: account, db: db)
+        let split = SplitInbox.computeSplit(
+            fromLine: fromLine, listID: nil, categoryLabels: labelIDs, rules: rules)
+
         try db.execute(
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     message_count, unread, in_inbox, has_attachment)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     split_key, category, message_count, unread, in_inbox, has_attachment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = excluded.last_message_at,
                     last_message_id = excluded.last_message_id,
                     subject = excluded.subject,
                     snippet = excluded.snippet,
+                    split_key = excluded.split_key,
+                    category = excluded.category,
                     message_count = excluded.message_count,
                     unread = excluded.unread,
                     in_inbox = excluded.in_inbox,
@@ -199,7 +250,7 @@ enum ThreadRollup {
                 """,
             arguments: [
                 account, threadID, lastMessageAt, lastMessageID, subject, snippet,
-                count, unread, inInbox, hasAttachment,
+                split.splitKey, split.category, count, unread, inInbox, hasAttachment,
             ])
     }
 
