@@ -46,15 +46,25 @@ extension HudsonDatabase {
         }
     }
 
-    /// Applies history changes in order and advances the cursor — all in ONE
-    /// transaction, so a crash resumes cleanly from the stored cursor (§4.3).
+    /// Applies history changes in order, in ONE transaction, WITHOUT
+    /// touching the stored cursor. Multi-page pollers (spec §4.3) must call
+    /// this per page and commit the cursor exactly once, via `advanceCursor`,
+    /// after the last page — Gmail reports the *current mailbox* historyId
+    /// on every page (not "as of this page"), so committing it per page
+    /// would jump the cursor to its final value while later pages are still
+    /// unapplied; a crash between pages would then silently lose them (the
+    /// M2-review-deferred crash-window bug this split exists to fix). A
+    /// crash before the caller's `advanceCursor` leaves the cursor at its
+    /// old value, so the next pass's re-poll simply re-applies from there —
+    /// safe because of the §4.2 version guard.
+    ///
     /// Returns ids of label events targeting unknown, non-tombstoned
     /// messages: these must be hydrated by the caller — a `.labels` event
     /// alone can't materialize a message row (no thread/subject/snippet/etc.),
     /// so without hydration the message would stay permanently missing from
     /// the store rather than merely converging slower (spec §4.1).
-    public func applyHistory(
-        _ changes: [HistoryChange], newCursor: Int64, account: String
+    public func applyHistoryChanges(
+        _ changes: [HistoryChange], account: String
     ) async throws -> [String] {
         try await writer.write { db in
             var unknownIDs: [String] = []
@@ -97,19 +107,49 @@ extension HudsonDatabase {
                     try Self.replaceLabels(labelIDs, messageID: id, account: account, db: db)
                 }
             }
-            try db.execute(
-                sql: "UPDATE accounts SET history_cursor = ? WHERE email = ?",
-                arguments: [newCursor, account])
-            // §4.3 requires the cursor advance to be atomic with the applied
-            // changes — if there's no accounts row to update, fail loudly
-            // rather than silently reporting success with a stale cursor.
-            guard db.changesCount == 1 else {
-                throw DatabaseError(
-                    resultCode: .SQLITE_ERROR,
-                    message: "applyHistory: no accounts row for '\(account)' — cursor not advanced")
-            }
             return unknownIDs
         }
+    }
+
+    /// Advances the stored history cursor — forward-only (`WHERE
+    /// history_cursor IS NULL OR history_cursor < newCursor`), so
+    /// re-applying an older or equal page after a crash-triggered re-poll
+    /// (see `applyHistoryChanges`) can never regress the cursor. §4.3
+    /// requires a missing accounts row to fail loudly rather than silently
+    /// report success with a stale cursor; the forward-only guard rejecting
+    /// an update because the cursor is already caught up is a legitimate
+    /// no-op, not that failure, so the two are told apart explicitly.
+    public func advanceCursor(to newCursor: Int64, account: String) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE accounts SET history_cursor = ?
+                    WHERE email = ? AND (history_cursor IS NULL OR history_cursor < ?)
+                    """,
+                arguments: [newCursor, account, newCursor])
+            guard db.changesCount == 0 else { return }
+            let exists = try Bool.fetchOne(
+                db, sql: "SELECT EXISTS(SELECT 1 FROM accounts WHERE email = ?)",
+                arguments: [account]) ?? false
+            guard exists else {
+                throw DatabaseError(
+                    resultCode: .SQLITE_ERROR,
+                    message: "advanceCursor: no accounts row for '\(account)' — cursor not advanced")
+            }
+        }
+    }
+
+    /// Applies one page of history changes and advances the cursor to it —
+    /// a thin composition of `applyHistoryChanges` + `advanceCursor` for
+    /// callers that don't paginate (`SyncEngine.ensureCursor`, the
+    /// 404-expiry re-list). Multi-page pollers must call the two pieces
+    /// separately instead — see `applyHistoryChanges`'s doc comment.
+    public func applyHistory(
+        _ changes: [HistoryChange], newCursor: Int64, account: String
+    ) async throws -> [String] {
+        let unknownIDs = try await applyHistoryChanges(changes, account: account)
+        try await advanceCursor(to: newCursor, account: account)
+        return unknownIDs
     }
 
     /// Removes a message that provably no longer exists server-side (a
