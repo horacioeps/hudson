@@ -39,6 +39,10 @@ struct Runtime {
     let account: AccountRecord
     let client: GmailClient
     let engine: Engine
+    /// Drains the local `mutation_queue` to Gmail (Task 9). Triage commands
+    /// enqueue via `LocalRuntime` for the instant local effect, then call
+    /// `flusher.flushOnce()` here for the best-effort network send.
+    let flusher: MutationFlusher
 
     /// Opens the store, migrates legacy accounts.json if present, and builds
     /// the client stack for the primary account.
@@ -63,6 +67,8 @@ struct Runtime {
             session: session, transport: URLSessionTransport(), quota: QuotaBucket())
         let engine = Engine(
             api: client, database: database, account: account.email)
-        return Runtime(database: database, account: account, client: client, engine: engine)
+        let flusher = MutationFlusher(api: client, database: database, account: account.email)
+        return Runtime(
+            database: database, account: account, client: client, engine: engine, flusher: flusher)
     }
 }

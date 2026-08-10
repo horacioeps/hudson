@@ -6,6 +6,10 @@ struct HudsonCommand: AsyncParsableCommand {
         commandName: "hudson",
         abstract: "A fast, open-source Gmail client for the Mac.",
         subcommands: [AuthCommand.self, ProfileCommand.self,
-                      SyncCommand.self, ListCommand.self, ShowCommand.self]
+                      SyncCommand.self, ListCommand.self, ShowCommand.self,
+                      ArchiveCommand.self, UnarchiveCommand.self,
+                      StarCommand.self, UnstarCommand.self,
+                      ReadCommand.self, UnreadCommand.self,
+                      LabelCommand.self, PendingCommand.self, UndoCommand.self]
     )
 }
