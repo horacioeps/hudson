@@ -35,6 +35,21 @@ struct AuthCommand: AsyncParsableCommand {
         let clientID = ConsoleInput.line(prompt: "Paste your OAuth Client ID:")
         let clientSecret = ConsoleInput.secret(prompt: "Paste your OAuth Client Secret (hidden):")
 
+        do {
+            try await connect(clientID: clientID, clientSecret: clientSecret)
+        } catch let error as GmailError {
+            // Routed through the clean stderr printer instead of letting
+            // ArgumentParser's default handler debug-print (and mangle) it —
+            // see GmailErrorReporting.swift.
+            throw reportAndFail(error)
+        }
+    }
+
+    /// The browser round-trip and persistence, once credentials are in hand.
+    /// Isolated from `run()` so every `GmailError` this can throw — the
+    /// loopback listener, the token exchange, the profile fetch, the
+    /// Keychain writes — funnels through the one catch site above.
+    private func connect(clientID: String, clientSecret: String) async throws {
         // Browser flow: loopback listener → system browser → code → tokens.
         let credentials = OAuthCredentials(clientID: clientID, clientSecret: clientSecret)
         let oauth = OAuthClient(credentials: credentials, transport: URLSessionTransport())
@@ -50,6 +65,12 @@ struct AuthCommand: AsyncParsableCommand {
         print("\nOpening your browser to sign in with Google…")
         print("(Google will show “Google hasn’t verified this app” — that’s expected for a")
         print("personal OAuth client. Click Advanced → “Go to <your app>” to continue.)\n")
+        // Printed unconditionally — /usr/bin/open can fail silently (no
+        // default browser, SSH session with no display, sandboxed
+        // environment), and this is the only way a headless user completes
+        // the flow.
+        print("If your browser didn't open, paste this URL into it:")
+        print(url.absoluteString + "\n")
         openInBrowser(url)
 
         let code = try await server.waitForCallback(expectedState: state)
