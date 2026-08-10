@@ -32,10 +32,13 @@ public struct MessageHeaderField: Decodable, Sendable {
     public let value: String
 }
 
-/// The body carried by a MIME part (base64url in `data`).
+/// The body carried by a MIME part (base64url in `data`). `attachmentId` is
+/// present only when Gmail addresses this part's bytes separately (large
+/// attachments); small ones are inlined directly into `data` with no id.
 public struct MessagePartBody: Decodable, Sendable {
     public let data: String?
     public let size: Int?
+    public let attachmentId: String?
 }
 
 /// One node of the MIME part tree.
@@ -97,6 +100,28 @@ extension GmailMessage {
             .replacingOccurrences(of: "_", with: "/")
         while base64.count % 4 != 0 { base64.append("=") }
         return Data(base64Encoded: base64)
+    }
+
+    /// Depth-first walk collecting every part that carries a downloadable
+    /// attachment: a non-empty `filename` AND a `body.attachmentId`. Gmail
+    /// inlines small attachments directly into `body.data` with no
+    /// `attachmentId` — those aren't lazily downloadable by id, so they're
+    /// excluded here (mirrors `extractContent`'s note that attachment bytes
+    /// themselves are ignored in M2; this only records the metadata).
+    public func attachments() -> [(attachmentID: String, filename: String, mimeType: String, size: Int)] {
+        var found: [(attachmentID: String, filename: String, mimeType: String, size: Int)] = []
+        func walk(_ part: MessagePart?) {
+            guard let part else { return }
+            if let filename = part.filename, !filename.isEmpty,
+                let attachmentID = part.body?.attachmentId {
+                found.append((
+                    attachmentID: attachmentID, filename: filename,
+                    mimeType: part.mimeType ?? "", size: part.body?.size ?? 0))
+            }
+            for child in part.parts ?? [] { walk(child) }
+        }
+        walk(payload)
+        return found
     }
 }
 
