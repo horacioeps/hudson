@@ -44,7 +44,12 @@ private final class VirtualClock: @unchecked Sendable {
 }
 
 @Test func oversizedCostIsRejected() async {
-    let bucket = QuotaBucket(unitsPerMinute: 100)
+    // `interactiveReserve: 0` — without it, the default (1,000) collapses
+    // the background ceiling to 0 against this 100-unit window, and the
+    // throw below would be caused by that collapse rather than by the
+    // `101 > 100` units boundary this test is actually about (see
+    // underCapacityNeverSleeps).
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 0)
     await #expect(throws: GmailError.self) {
         try await bucket.acquire(cost: 101)  // can never fit; must throw, not hang
     }

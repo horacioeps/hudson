@@ -104,6 +104,39 @@ private actor OneShotSignal {
     #expect(order.values.first == "fg")
 }
 
+@Test func interactiveFastPathBypassesSleepingBackgroundDrain() async throws {
+    let clock = VirtualClock()
+    // Regression test for a priority inversion found in review: an
+    // interactive acquire that fits *right now* was still being made to
+    // wait behind an already-queued background waiter's drain() sleep,
+    // because the old fast-path gate was `waiters.isEmpty` regardless of
+    // class — exactly the scenario the reserve exists to prevent. Proves
+    // the fix by asserting the interactive acquire below records *zero*
+    // additional sleep on the virtual clock: if it had gone through
+    // drain() at all (queued behind bg, waiting on the same window-roll
+    // sleep), `clock.totalSlept` would have advanced by the ~60s wait
+    // drain() computes for the background waiter.
+    let bgIsWaiting = OneShotSignal()
+    let bucket = QuotaBucket(unitsPerMinute: 100, interactiveReserve: 40,
+                             now: { clock.now }, sleep: { seconds in
+        await bgIsWaiting.fire()
+        try? await Task.sleep(for: .milliseconds(200))  // keeps drain() genuinely still asleep below
+        clock.sleep(seconds)
+    })
+    try await bucket.acquire(cost: 55, class: .background)  // window at 55/100; background ceiling is 60
+    async let bg: Void = { _ = try? await bucket.acquire(cost: 50, class: .background) }()  // 55+50>60: queues, drain sleeps
+    await bgIsWaiting.wait()  // deterministic: the background waiter is genuinely queued and drain() is asleep on it
+
+    let sleptBeforeInteractive = clock.totalSlept
+    try await bucket.acquire(cost: 15, class: .interactive)  // 55+15<=100: must be granted right now, not after drain wakes
+    // No new Waiter was ever created for this call — it can't have gone
+    // through drain()'s sleep, since drain() is still ~200ms of real time
+    // away from even reconsidering the window, let alone granting `bg`.
+    #expect(clock.totalSlept == sleptBeforeInteractive)
+
+    _ = await bg  // let the queued background waiter resolve so teardown doesn't hang
+}
+
 @Test func cancelledWaiterThrowsPromptly() async throws {
     let clock = VirtualClock()
     // Deviates from the brief in two ways, both needed to avoid a flaky/

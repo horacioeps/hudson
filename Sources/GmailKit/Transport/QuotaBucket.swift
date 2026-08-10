@@ -108,10 +108,21 @@ public actor QuotaBucket {
     /// Waits until `cost` units fit in the rolling window for `quotaClass`,
     /// then records them. Service order is strict FIFO within a lane, and
     /// every queued `.interactive` waiter is served before any
-    /// `.background` waiter: a request only takes the fast (no-wait) path
-    /// when the whole waiter queue — both lanes — is empty, so it can never
-    /// cut ahead of an already-queued acquirer even if it would otherwise
-    /// fit immediately.
+    /// `.background` waiter.
+    ///
+    /// The fast (no-wait) path differs by lane, and that difference is the
+    /// whole point of the reserve: `.background` only takes it when the
+    /// entire queue — both lanes — is empty, so it can never cut ahead of
+    /// an already-queued acquirer. `.interactive` takes it whenever no
+    /// *other* `.interactive` waiter is already queued ahead of it, even
+    /// if `.background` waiters are queued and drain() is currently asleep
+    /// waiting on one of them — a fitting interactive request is granted
+    /// immediately rather than sitting until drain() next wakes (up to the
+    /// ~60s window-roll delay a saturated background lane can incur).
+    /// That's what "a saturated background lane can never make a
+    /// foreground triage action queue behind it" means in practice.
+    /// Interactive-behind-interactive FIFO is preserved: this only fires
+    /// when no interactive waiter is already ahead of it.
     ///
     /// If the calling task is cancelled while this call is queued, the
     /// waiter is removed and this throws `CancellationError` promptly
@@ -132,7 +143,12 @@ public actor QuotaBucket {
         // cancellation that arrives *after* the waiter is queued.
         try Task.checkCancellation()
         pruneExpiredSpends()
-        if waiters.isEmpty && fits(cost: cost, class: quotaClass) {
+        if canTakeFastPath(for: quotaClass) && fits(cost: cost, class: quotaClass) {
+            // Fully synchronous grant, exactly like the pre-existing fast
+            // path: no `Waiter` is ever created for this acquirer, so
+            // there's nothing for `drain()` or `cancelWaiter(id:)` to ever
+            // find or double-resume — this can't reintroduce a resume-once
+            // hazard, only change *when* a request bypasses the queue.
             spends.append((now(), cost))
             return
         }
@@ -219,6 +235,21 @@ public actor QuotaBucket {
             }
         }
         isDraining = false
+    }
+
+    /// Whether an `acquire(cost:class:)` call for `quotaClass` may bypass
+    /// the queue entirely (subject to also passing `fits(cost:class:)`).
+    /// `.background` requires the whole queue empty, so it never cuts
+    /// ahead of anything already waiting. `.interactive` only requires no
+    /// *other* `.interactive` waiter already queued ahead of it — queued
+    /// `.background` waiters don't block it, since interactive is strictly
+    /// higher priority and this is precisely how a saturated background
+    /// lane is kept from delaying foreground triage.
+    private func canTakeFastPath(for quotaClass: QuotaClass) -> Bool {
+        switch quotaClass {
+        case .interactive: return !waiters.contains(where: { $0.quotaClass == .interactive })
+        case .background: return waiters.isEmpty
+        }
     }
 
     /// Index (into `waiters`) of the waiter `drain()` should attempt next:
