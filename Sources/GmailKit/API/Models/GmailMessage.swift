@@ -4,6 +4,12 @@ import Foundation
 public struct MessageRef: Decodable, Sendable {
     public let id: String
     public let threadId: String
+
+    /// Initializes a message reference.
+    public init(id: String, threadId: String) {
+        self.id = id
+        self.threadId = threadId
+    }
 }
 
 /// One page of `messages.list`.
@@ -11,6 +17,13 @@ public struct MessageListPage: Decodable, Sendable {
     public let messages: [MessageRef]?
     public let nextPageToken: String?
     public let resultSizeEstimate: Int?
+
+    /// Initializes a message list page.
+    public init(messages: [MessageRef]?, nextPageToken: String?, resultSizeEstimate: Int?) {
+        self.messages = messages
+        self.nextPageToken = nextPageToken
+        self.resultSizeEstimate = resultSizeEstimate
+    }
 }
 
 /// A header field inside a message payload.

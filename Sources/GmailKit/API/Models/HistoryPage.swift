@@ -17,4 +17,11 @@ public struct HistoryPage: Decodable, Sendable {
     public let history: [HistoryRecord]?
     public let nextPageToken: String?
     public let historyId: String?
+
+    /// Initializes a history page.
+    public init(history: [HistoryRecord]?, nextPageToken: String?, historyId: String?) {
+        self.history = history
+        self.nextPageToken = nextPageToken
+        self.historyId = historyId
+    }
 }
