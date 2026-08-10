@@ -93,6 +93,16 @@ private final class SplitRulesQueryCounter: @unchecked Sendable {
     #expect(result.splitKey == "Newsletters")
 }
 
+@Test func computeSplitListIDRuleMatchesCaseInsensitively() {
+    // Minor fix: listid matching is now case-insensitive, consistent with
+    // sender/domain — dormant until List-Id extraction exists, but the
+    // predicate itself must behave consistently once it does.
+    let rules = [SplitRule(ordinal: 0, kind: .listid, value: "list.example.com", splitName: "Newsletters")]
+    let result = SplitInbox.computeSplit(
+        fromLine: "ada@x.com", listID: "List.Example.COM", categoryLabels: [], rules: rules)
+    #expect(result.splitKey == "Newsletters")
+}
+
 @Test func computeSplitListIDRuleNeverMatchesWhenListIDIsNil() {
     // Documented limitation: MessageSnapshot doesn't carry List-Id today.
     let rules = [SplitRule(ordinal: 0, kind: .listid, value: "list.example.com", splitName: "Newsletters")]
@@ -233,4 +243,56 @@ private final class SplitRulesQueryCounter: @unchecked Sendable {
             snap("m3", date: 3, labels: []),
         ], account: "x")
     #expect(counter.count == 1)  // one rules SELECT for the whole batch, not one per message
+}
+
+// MARK: - Fix round 1: .labels-only events refresh split/category too
+
+@Test func labelsEventRefreshesSplitKeyWhenNewestMessageIsRecategorized() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX", "CATEGORY_PROMOTIONS"]), account: "x")
+    #expect(try await rollup(db, account: "x", thread: "t1")?.splitKey == "promotions")
+
+    // Gmail (the user dragging between tabs, or the classifier revising
+    // already-delivered mail) re-categorizes the message via a pure
+    // `.labels` event — no full snapshot ever re-touches this single-
+    // message thread again, so before this fix the rollup stayed stuck at
+    // "promotions" forever.
+    _ = try await db.applyHistory(
+        [HistoryChange(kind: .labels(id: "m1", historyID: 5, labelIDs: ["INBOX", "CATEGORY_UPDATES"]))],
+        newCursor: 5, account: "x")
+
+    let row = try #require(try await rollup(db, account: "x", thread: "t1"))
+    #expect(row.category == "updates")
+    #expect(row.splitKey == "updates")
+}
+
+@Test func batchOfLabelsEventsOnTheSameThreadDedupsSplitRefreshToOnce() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        snap("m1", date: 1, labels: ["INBOX", "CATEGORY_PROMOTIONS"]), account: "x")
+
+    let counter = SplitRulesQueryCounter()
+    try await db.writer.write { conn in
+        conn.trace { event in
+            if case .statement(let statement) = event,
+                statement.sql.contains("id, from_line FROM messages") {
+                counter.increment()
+            }
+        }
+    }
+    // Two `.labels` events, BOTH touching the same message/thread, in ONE
+    // batch — the split refresh must not redo the newest-message lookup
+    // once per event.
+    _ = try await db.applyHistoryChanges(
+        [
+            HistoryChange(kind: .labels(id: "m1", historyID: 5, labelIDs: ["INBOX", "CATEGORY_UPDATES"])),
+            HistoryChange(kind: .labels(id: "m1", historyID: 6, labelIDs: ["INBOX", "CATEGORY_SOCIAL"])),
+        ], account: "x")
+    #expect(counter.count == 1)  // ONE split-refresh lookup for the thread, not two
+    let row = try #require(try await rollup(db, account: "x", thread: "t1"))
+    #expect(row.category == "social")  // still correctly reflects the LATEST label state
+    #expect(row.splitKey == "social")
 }

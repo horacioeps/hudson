@@ -116,10 +116,17 @@ extension HudsonDatabase {
             // Same batch-dedup as `applySnapshots` — see its comment. Only
             // `.added` updates (wasInsert == false) go in this set; `.added`
             // inserts take `maintainRollup`'s O(1) OR-merge path and never
-            // need a recompute, and `.labels` events recompute immediately
-            // per-event below (they don't touch count/subject/snippet, so
-            // there's nothing to dedup there).
+            // need a recompute, and `.labels` events' unread/in_inbox
+            // recompute immediately per-event below (cheap and idempotent,
+            // so there's nothing to dedup there — see `recomputeThreadFlags`).
             var updatedThreadIDs = Set<String>()
+            // `.labels` events' split/category refresh IS deduped, unlike
+            // unread/in_inbox above: a thread with several `.labels` events
+            // in one batch (all touching the same thread) would otherwise
+            // redo the newest-message split lookup once per event instead
+            // of once for the batch. Collected here, applied once per
+            // unique thread after the loop — see `recomputeThreadSplit`.
+            var splitRefreshThreadIDs = Set<String>()
             for change in changes {
                 switch change.kind {
                 case .added(let snapshot):
@@ -186,11 +193,16 @@ extension HudsonDatabase {
                     // makes the drop visible.
                     if let threadID: String = messageRow?["thread_id"] {
                         try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
+                        splitRefreshThreadIDs.insert(threadID)
                     }
                 }
             }
             for threadID in updatedThreadIDs {
                 try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
+            }
+            for threadID in splitRefreshThreadIDs {
+                try ThreadRollup.recomputeThreadSplit(
+                    threadID: threadID, account: account, rules: splitRules, db: db)
             }
             return unknownIDs
         }

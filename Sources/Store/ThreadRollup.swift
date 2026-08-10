@@ -254,6 +254,56 @@ enum ThreadRollup {
             ])
     }
 
+    /// Recomputes `split_key`/`category` for exactly ONE thread from its
+    /// CURRENT newest message. Needed because `maintainRollup`'s
+    /// tied-or-newer write only ever runs when a FULL `MessageSnapshot`
+    /// reaches it — a `.labels`-only history event (Gmail reporting a
+    /// `CATEGORY_*` move, e.g. the user dragging a message between tabs,
+    /// or the classifier revising already-delivered mail) never does, so
+    /// without this the rollup's split/category would silently stay
+    /// whatever they were the last time a full snapshot touched the
+    /// thread — for a single-message thread, potentially forever. Called
+    /// from `applyHistoryChanges`'s `.labels` branch, deduped once per
+    /// affected thread across the batch (mirrors the `.added`-update-path
+    /// recompute's dedup — see that function's comment).
+    ///
+    /// Bounded: ONE newest-message lookup (the same `(account_email,
+    /// thread_id, internal_date)`-indexed query `recomputeThreadRollup`
+    /// uses) plus that one message's own (canonical, non-overlay) labels —
+    /// never a scan of other threads or of this thread's other messages.
+    /// `rules` is the account's ordered `split_rules`, loaded ONCE per
+    /// batch by the caller — not re-fetched here.
+    static func recomputeThreadSplit(
+        threadID: String, account: String, rules: [SplitRule], db: Database
+    ) throws {
+        guard let newest = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT id, from_line FROM messages
+                WHERE account_email = ? AND thread_id = ?
+                ORDER BY internal_date DESC, id DESC LIMIT 1
+                """,
+            arguments: [account, threadID]
+        ) else { return }
+        let newestID: String = newest["id"]
+        let fromLine: String = newest["from_line"]
+        // Canonical labels only (not overlay) — matches `maintainRollup`/
+        // `recomputeThreadRollup`'s split derivation, which is likewise
+        // never overlay-aware.
+        let labelIDs = try String.fetchAll(
+            db,
+            sql: "SELECT label_id FROM message_labels WHERE account_email = ? AND message_id = ?",
+            arguments: [account, newestID])
+        let split = SplitInbox.computeSplit(
+            fromLine: fromLine, listID: nil, categoryLabels: labelIDs, rules: rules)
+        try db.execute(
+            sql: """
+                UPDATE thread_rollup SET split_key = ?, category = ?
+                WHERE account_email = ? AND thread_id = ?
+                """,
+            arguments: [split.splitKey, split.category, account, threadID])
+    }
+
     /// Whether any message in the ONE given thread effectively carries
     /// `label` — effective = (canonical ∪ pending adds) − pending removes,
     /// mirroring `StoreReads.messageRow`'s overlay composition. Scoped to

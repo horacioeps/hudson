@@ -117,8 +117,9 @@ enum SplitInbox {
     ///       address), case-insensitively.
     ///     - `.domain`: the domain portion of `fromLine`'s address equals
     ///       `value`, case-insensitively.
-    ///     - `.listid`: `listID == value`, exactly. `listID` is `nil` when
-    ///       unknown (see below) and a nil `listID` never matches.
+    ///     - `.listid`: `listID == value`, case-insensitively (consistent
+    ///       with `.sender`/`.domain`). `listID` is `nil` when unknown (see
+    ///       below) and a nil `listID` never matches.
     ///     - `.category`: the derived `category` (above) equals `value`.
     ///   If NO rule matches, `splitKey` falls back to `category` when
     ///   non-empty — so Gmail's own categories become split tabs for free —
@@ -148,7 +149,7 @@ enum SplitInbox {
             case .domain:
                 matched = !domain.isEmpty && domain == rule.value.lowercased()
             case .listid:
-                matched = listID != nil && listID == rule.value
+                matched = listID.map { $0.lowercased() == rule.value.lowercased() } ?? false
             case .category:
                 matched = !category.isEmpty && category == rule.value
             }
