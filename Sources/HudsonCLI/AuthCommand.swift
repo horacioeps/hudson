@@ -25,7 +25,8 @@ struct AuthCommand: AsyncParsableCommand {
 
                 Please publish the app first — apps left in “Testing” get refresh tokens
                 that expire every 7 days, which means re-connecting Hudson weekly.
-                (Google Cloud Console → APIs & Services → OAuth consent screen → Publish app.
+                (Google Auth Platform → Audience → Publishing status → Publish app:
+                https://console.cloud.google.com/auth/audience
                 Re-run `hudson auth` when done, or pass --allow-testing to proceed anyway.)
                 """)
                 return
@@ -100,13 +101,17 @@ struct AuthCommand: AsyncParsableCommand {
              (any name, e.g. “hudson-mail”)
           2. Enable the Gmail API:
              https://console.cloud.google.com/apis/library/gmail.googleapis.com
-          3. Configure the OAuth consent screen (APIs & Services → OAuth consent screen):
-             User type: External. App name/email: anything. Scopes: none needed here.
-          4. IMPORTANT — click “PUBLISH APP” so status reads “In production”.
+          3. Set up the consent screen (left sidebar: “Google Auth Platform”):
+             https://console.cloud.google.com/auth/overview
+             Audience: External. App name/email: anything. Scopes: none needed here.
+          4. IMPORTANT — on the “Audience” page, under Publishing status,
+             click “PUBLISH APP” so it reads “In production”:
+             https://console.cloud.google.com/auth/audience
              (Testing status = refresh tokens die every 7 days.)
              Google Workspace accounts may choose “Internal” instead — also fine.
-          5. Create credentials (APIs & Services → Credentials → Create credentials →
-             OAuth client ID): Application type “Desktop app”.
+          5. Create a client (Google Auth Platform → “Clients” → Create client):
+             https://console.cloud.google.com/auth/clients
+             Application type “Desktop app”.
           6. Copy the Client ID and Client Secret below.
              (For Desktop clients Google itself says the secret is not confidential —
              pasting it here is safe; Hudson stores it in your Keychain.)
