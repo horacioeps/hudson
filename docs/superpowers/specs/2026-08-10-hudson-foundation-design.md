@@ -253,8 +253,8 @@ TDD throughout (superpowers test-driven-development).
 
 Each gets its own implementation plan (superpowers writing-plans):
 
-- **M1 — Auth + GmailKit:** OAuth wizard (publish-status verification, client ID+secret), token store + CLI signing script, typed client, quota-aware transport. CLI: `auth`, `profile`.
-- **M2 — Store + backfill:** schema, migrations, versioned writes + tombstones, sanitizer pipeline, concurrent backfill/poll skeleton. CLI: `sync`, `list`, `show`.
+- **M1 — DONE:** OAuth wizard (publish-status verification, client ID+secret), token store + CLI signing script, typed client, quota-aware transport. CLI: `auth`, `profile`.
+- **M2 — DONE:** schema, migrations, versioned writes + tombstones, sanitizer pipeline, concurrent backfill/poll skeleton. CLI: `sync`, `list`, `show`.
 - **M3 — Mutations + incremental sync:** queue, overlay model, flusher, single-flight discipline, reconciliation path. CLI: `archive`, `star`, `read`.
 - **M4 — Query layer:** FTS5 search (+ server-merge during hydration, `--rebuild-index`) and split inbox (`split_rules`, category persistence test). CLI: `search`, `inbox --split`.
 - **M5 — Send:** MIME builder, dedup state machine, send, reply threading. CLI: `send`, `reply`.

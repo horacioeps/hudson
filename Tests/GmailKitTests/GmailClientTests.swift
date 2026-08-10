@@ -142,3 +142,14 @@ extension LockedBox where Value == [Double] {
     #expect(apiRequests[1].value(forHTTPHeaderField: "Authorization") == "Bearer refreshed-at")
     #expect(apiRequests[2].value(forHTTPHeaderField: "Authorization") == "Bearer refreshed-at")
 }
+
+@Test func queryParametersEncodeSpecialCharactersCorrectly() throws {
+    // Verify that "+" in query values is percent-encoded as "%2B" (not left raw),
+    // because Google's API parses raw "+" as spaces, breaking Gmail plus-addressing.
+    let encoded = [URLQueryItem(name: "q", value: "from:a+b@c.d e")]
+    let encodedQuery = try #require(GmailClient.encodedQuery(encoded))
+    // The key assertion: "+" appears only as "%2B", never as raw "+"
+    #expect(encodedQuery.contains("%2B"))  // "+" encoded as %2B
+    #expect(!encodedQuery.contains("a+b"))  // "+" not left raw in "a+b"
+    #expect(encodedQuery.contains("%20"))  // space encoded as %20
+}

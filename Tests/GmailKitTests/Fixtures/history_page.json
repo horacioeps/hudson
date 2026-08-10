@@ -1,0 +1,17 @@
+{
+  "historyId": "4720",
+  "history": [
+    {
+      "id": "4712",
+      "messagesAdded": [{"message": {"id": "18f0b", "threadId": "18f00", "historyId": "4712", "labelIds": ["INBOX"]}}]
+    },
+    {
+      "id": "4715",
+      "labelsRemoved": [{"message": {"id": "18f0a", "threadId": "18f00", "historyId": "4715", "labelIds": ["INBOX"]}}]
+    },
+    {
+      "id": "4718",
+      "messagesDeleted": [{"message": {"id": "18f09", "threadId": "18ef0", "historyId": "4718"}}]
+    }
+  ]
+}

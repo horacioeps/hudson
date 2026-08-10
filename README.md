@@ -5,8 +5,7 @@ your own API keys, no subscription, no server, no telemetry.
 
 > **Status:** pre-alpha. The headless core is being built milestone by
 > milestone ([spec](docs/superpowers/specs/2026-08-10-hudson-foundation-design.md));
-> the Mac app UI follows. Today you can authenticate and talk to Gmail from
-> the CLI.
+> the Mac app UI follows. Today you can authenticate, sync your mailbox into a local SQLite store, and read it back instantly from the CLI.
 
 ## Why
 
@@ -25,6 +24,9 @@ swift build
 ./Scripts/sign-cli.sh          # stable signing so the Keychain trusts rebuilds
 .build/debug/hudson auth       # ~5-minute guided Google OAuth setup
 .build/debug/hudson profile    # your live Gmail profile
+.build/debug/hudson sync       # download your mailbox into the local store
+.build/debug/hudson list       # newest messages, straight from SQLite
+.build/debug/hudson show <id>  # one message, sanitized, instant
 ```
 
 `hudson auth` walks you through creating your **own** free Google Cloud OAuth
