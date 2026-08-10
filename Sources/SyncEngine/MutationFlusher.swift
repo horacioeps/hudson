@@ -29,7 +29,11 @@ public struct FlushReport: Sendable, Equatable {
 ///    truth re-fetch (see `reconvergeMessage`). A transient failure (rate
 ///    limit / 5xx / network / auth) touches nothing — `claimPendingBatch` is
 ///    a read, not a claim-and-lock, so an un-sent row simply stays `pending`
-///    for the next pass.
+///    for the next pass. Crucially, a terminal failure on a COALESCED batch
+///    does not drop every member: one bad/stale id in a `batchModify` must
+///    not silently discard other messages' perfectly valid triage actions
+///    too, so those retry in isolation first (see `isolate`) — only the id
+///    that's actually bad gets dropped.
 /// 2. **Never double-sent.** `flushOnce()` is single-flight (`flushInFlight`
 ///    guard below, identical in shape to `SyncEngine.syncOnce`'s), so within
 ///    one flusher only one send of a given row is ever in the air. A crash
@@ -121,10 +125,21 @@ public actor MutationFlusher {
             do {
                 try await send(group, into: &report)
             } catch let error as GmailError where Self.isTerminal(error) {
-                // A 4xx that will never succeed on retry: the intent is
-                // dropped (never re-sent) and truth is re-fetched per
-                // message instead of guessing an inverse op locally.
-                try await reconverge(group, into: &report)
+                // A 4xx that will never succeed on retry. For a singleton
+                // this message's intent is dropped (never re-sent) and
+                // truth is re-fetched instead of guessing an inverse op
+                // locally. For a coalesced (>1 message) batch, a single
+                // bad/stale id must not take the WHOLE group down with it
+                // — see `isolate`'s doc comment — so those retry
+                // individually instead of dropping every member.
+                if group.members.count > 1 {
+                    if let isolationError = try await isolate(group, into: &report) {
+                        passError = isolationError
+                        break
+                    }
+                } else {
+                    try await reconverge(group, into: &report)
+                }
             } catch {
                 // Transient (rateLimited/server/network/auth) or an
                 // unexpected error: stop attempting further sends this pass
@@ -146,10 +161,26 @@ public actor MutationFlusher {
     /// One unit of work: every message here needs the exact same
     /// (addLabelIDs, removeLabelIDs) applied, so it batches together.
     private struct SendGroup {
-        let messageIDs: [String]
+        /// One message's share of the group — its id and the queue row ids
+        /// its part of this label change corresponds to. Kept per-member
+        /// (not flattened) so `isolate` can slice a single member back out
+        /// into its own singleton group after a terminal batch failure.
+        struct Member {
+            let messageID: String
+            let mutationIDs: [Int64]
+        }
+        let members: [Member]
         let addLabelIDs: [String]
         let removeLabelIDs: [String]
-        let mutationIDs: [Int64]
+
+        var messageIDs: [String] { members.map(\.messageID) }
+        var mutationIDs: [Int64] { members.flatMap(\.mutationIDs) }
+
+        /// This one member, alone, as its own group — same label change,
+        /// sent as a singleton `modify` instead of riding along in a batch.
+        func isolated(_ member: Member) -> SendGroup {
+            SendGroup(members: [member], addLabelIDs: addLabelIDs, removeLabelIDs: removeLabelIDs)
+        }
     }
 
     /// Combines each message's pending label deltas into one change (a
@@ -187,10 +218,10 @@ public actor MutationFlusher {
         }
 
         return keyOrder.map { key in
-            let messageIDs = messageIDsByKey[key]!
-            return SendGroup(
-                messageIDs: messageIDs, addLabelIDs: key.add, removeLabelIDs: key.remove,
-                mutationIDs: messageIDs.flatMap { perMessage[$0]!.ids })
+            let members = messageIDsByKey[key]!.map { messageID in
+                SendGroup.Member(messageID: messageID, mutationIDs: perMessage[messageID]!.ids)
+            }
+            return SendGroup(members: members, addLabelIDs: key.add, removeLabelIDs: key.remove)
         }
     }
 
@@ -211,8 +242,7 @@ public actor MutationFlusher {
             // getProfile instead (invariant #4 above).
             let profile = try await api.getProfile()
             guard let ceiling = Int64(profile.historyId) else {
-                throw GmailError.invalidRequest(
-                    status: 0, message: "getProfile returned a non-numeric historyId")
+                throw NonNumericHistoryIDError()
             }
             historyID = ceiling
         } else {
@@ -220,8 +250,7 @@ public actor MutationFlusher {
                 id: group.messageIDs[0], addLabelIDs: group.addLabelIDs,
                 removeLabelIDs: group.removeLabelIDs)
             guard let echoed = Int64(message.historyId) else {
-                throw GmailError.invalidRequest(
-                    status: 0, message: "modify returned a non-numeric historyId")
+                throw NonNumericHistoryIDError()
             }
             historyID = echoed
         }
@@ -229,6 +258,50 @@ public actor MutationFlusher {
             mutationIDs: group.mutationIDs, expectedHistoryID: historyID, account: account)
         report.flushed += group.mutationIDs.count
     }
+
+    // MARK: - Batch isolation retry
+
+    /// A terminal failure on a COALESCED (>1 message) batch must not drop
+    /// every member — Gmail can reject a `batchModify` for a reason
+    /// specific to just one member (e.g. one stale/deleted id), and the
+    /// other members' triage actions are perfectly valid. Dropping the
+    /// whole group would silently discard those valid actions — exactly the
+    /// failure this flusher exists to prevent. So instead: retry every
+    /// member as its own singleton `modify`. Each one then succeeds (marked
+    /// in_flight with its own historyId) or terminally fails on its own
+    /// (dropped + reconverged alone), same as any other singleton.
+    ///
+    /// Returns a transient error if one interrupts the retry, using the
+    /// same "stop this pass, leave what's left pending" contract as any
+    /// other group's send failure (see `flushOnce`) — everything already
+    /// resolved before that point (a member that succeeded, or one that was
+    /// terminally dropped+reconverged) stays durably committed; it's only
+    /// the members not yet reached that are left untouched for next pass.
+    private func isolate(_ group: SendGroup, into report: inout FlushReport) async throws -> Error? {
+        for member in group.members {
+            let singleton = group.isolated(member)
+            do {
+                try await send(singleton, into: &report)
+            } catch let error as GmailError where Self.isTerminal(error) {
+                try await reconverge(singleton, into: &report)
+            } catch {
+                return error
+            }
+        }
+        return nil
+    }
+
+    /// Thrown when a call Gmail reports as successful (2xx / 204) answers
+    /// with a non-numeric historyId. Deliberately NOT a `GmailError` — real
+    /// Gmail always returns a numeric historyId, so this only exists as a
+    /// defensive guard, and the underlying `modify`/`batchModify` call has
+    /// already SUCCEEDED by the time it can fire. Were this a `GmailError`
+    /// matching `isTerminal`, it would cause an already-applied mutation to
+    /// be dropped — the exact bug this type exists to avoid. Falling
+    /// through to `flushOnce`'s general "stop and leave pending" handling
+    /// instead means the next pass just tries again (inert per invariant
+    /// #2 — label add/remove is idempotent).
+    private struct NonNumericHistoryIDError: Error {}
 
     // MARK: - Terminal-failure reconvergence
 

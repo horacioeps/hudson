@@ -46,10 +46,19 @@ actor ScriptedGmail: GmailAPI {
     /// When set, listHistory throws this (e.g. 404 expiry) instead of serving.
     var historyError: GmailError?
     /// Scripted `modify` response — see `GmailMessageStub`. Defaults to
-    /// echoing the requested id with historyId "100" when unset.
+    /// echoing the requested id with historyId "100" when unset. Applies to
+    /// every id that doesn't have its own entry in `modifyResultsByID`.
     var modifyResult: GmailMessageStub?
     /// When set, `modify` throws this instead of serving `modifyResult`.
+    /// Applies to every id that doesn't have its own entry in
+    /// `modifyErrorsByID`.
     var modifyError: GmailError?
+    /// Per-id override of `modifyResult` — lets a test script one id's
+    /// `modify` to succeed while another's fails (isolation-retry tests).
+    var modifyResultsByID: [String: GmailMessageStub] = [:]
+    /// Per-id override of `modifyError` — checked before the blanket
+    /// `modifyError`.
+    var modifyErrorsByID: [String: GmailError] = [:]
     /// When set, `batchModify` throws this instead of succeeding (204).
     var batchModifyError: GmailError?
     private(set) var calls: [String] = []
@@ -112,8 +121,8 @@ actor ScriptedGmail: GmailAPI {
     func modify(id: String, addLabelIDs: [String], removeLabelIDs: [String]) async throws -> GmailMessage {
         calls.append("modify:\(id)")
         modifyCalls.append(ModifyCall(id: id, addLabelIDs: addLabelIDs, removeLabelIDs: removeLabelIDs))
-        if let modifyError { throw modifyError }
-        let stub = modifyResult ?? GmailMessageStub(id: id, historyId: "100")
+        if let error = modifyErrorsByID[id] ?? modifyError { throw error }
+        let stub = modifyResultsByID[id] ?? modifyResult ?? GmailMessageStub(id: id, historyId: "100")
         return testMessage(id: stub.id, historyID: stub.historyId)
     }
 
@@ -137,6 +146,10 @@ actor ScriptedGmail: GmailAPI {
     }
     func setModifyResult(_ stub: GmailMessageStub) { modifyResult = stub }
     func setModifyError(_ error: GmailError?) { modifyError = error }
+    /// Scripts `modify` for exactly one id — for tests that isolate a
+    /// coalesced batch's members and need each to answer independently.
+    func setModifyResult(_ stub: GmailMessageStub, forID id: String) { modifyResultsByID[id] = stub }
+    func setModifyError(_ error: GmailError?, forID id: String) { modifyErrorsByID[id] = error }
     func setBatchModifyError(_ error: GmailError?) { batchModifyError = error }
 }
 

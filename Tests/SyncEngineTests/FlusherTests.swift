@@ -80,6 +80,55 @@ import Testing
     #expect(try await db.pendingMutations(account: "x").isEmpty)
 }
 
+/// Invariant #1 (never lost), the specific failure a hard review flagged:
+/// a terminal failure on a COALESCED batch must not drop every member. If
+/// Gmail 400s a batchModify because one member id is stale/bad, the OTHER
+/// members' perfectly valid triage actions must still land, not be silently
+/// discarded along with the bad one.
+@Test func terminalBatchFailureIsolatesRetryPreservingValidMembers() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    try await db.writer.write { try $0.execute(sql: "UPDATE accounts SET history_cursor=100 WHERE email='x'") }
+    for id in ["m1", "m2", "m3"] {
+        _ = try await db.applySnapshot(MessageSnapshot(id: id, threadID: "t", historyID: 90,
+            internalDate: 1, fromLine: "f", toLine: "t", subject: "s", snippet: "sn", labelIDs: ["INBOX"]),
+            account: "x")
+        try await db.enqueueMutation(messageID: id, labelID: "INBOX", op: .remove, account: "x", now: 1)
+    }
+    let gmail = ScriptedGmail()
+    // The coalesced batch fails terminally — Gmail rejected the whole call
+    // (e.g. one stale/invalid id riding along with two valid ones).
+    await gmail.setBatchModifyError(GmailError.invalidRequest(status: 400, message: "bad request"))
+    // Isolated retry: m1 and m3 succeed on their own; m2 is genuinely bad.
+    await gmail.setModifyResult(GmailMessageStub(id: "m1", historyId: "140"), forID: "m1")
+    await gmail.setModifyError(GmailError.invalidRequest(status: 400, message: "bad label"), forID: "m2")
+    await gmail.setModifyResult(GmailMessageStub(id: "m3", historyId: "145"), forID: "m3")
+    // The re-fetch after m2's drop returns the true current message.
+    await gmail.setMessages(["m2": testMessage(id: "m2", historyID: 200, labels: ["INBOX"])])
+    let flusher = MutationFlusher(api: gmail, database: db, account: "x")
+
+    let report = try await flusher.flushOnce()
+
+    #expect(report.flushed == 2)  // m1 + m3, sent individually after isolation
+    #expect(report.dropped == 1)  // m2 only — never the whole batch
+
+    // One batch attempt, then exactly one modify per member.
+    let batchCalls = await gmail.batchModifyCalls
+    #expect(batchCalls.count == 1)
+    let modifyCalls = await gmail.modifyCalls
+    #expect(Set(modifyCalls.map(\.id)) == ["m1", "m2", "m3"])
+
+    let pending = try await db.pendingMutations(account: "x")
+    // m2's overlay is gone (dropped); m1's and m3's SURVIVE — not reverted.
+    #expect(Set(pending.map(\.messageID)) == ["m1", "m3"])
+    #expect(pending.allSatisfy { $0.state == "in_flight" })
+
+    // m2 converged to server truth (still INBOX) instead of being silently
+    // reverted or guessed.
+    let row2 = try #require(try await db.message(id: "m2", account: "x")).row
+    #expect(row2.labelIDs.contains("INBOX"))
+}
+
 /// Invariant #1 (never lost): a rate-limited/5xx/network failure must leave
 /// the mutation `pending` — neither marked in_flight (which would imply it
 /// was sent) nor dropped (which would discard real intent) — so the next
