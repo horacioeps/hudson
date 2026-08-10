@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import GmailKit
+import Store
 
 /// Smoke-test command: proves auth, refresh, quota, and the typed client work
 /// end-to-end against the real API.
@@ -11,12 +12,16 @@ struct ProfileCommand: AsyncParsableCommand {
     )
 
     func run() async throws {
-        // `consentedAt` is only known once `AccountsFile.primary()` succeeds;
+        // `consentedAt` is only known once the primary account is loaded;
         // it stays nil for failures before that (e.g. no account connected),
         // which `annotated` treats as "no Testing-status diagnostic applies".
         var consentedAt: Date?
         do {
-            let account = try AccountsFile.primary()
+            let database = try HudsonDatabase.open(at: HudsonPaths.databaseURL)
+            try await AccountsMigration.runIfNeeded(database: database)
+            guard let account = try await database.primaryAccount() else {
+                throw GmailError.auth("No account connected — run `hudson auth` first.")
+            }
             consentedAt = account.consentedAt
             let store = KeychainTokenStore()
             guard let clientSecret = try store.clientSecret(account: account.email) else {

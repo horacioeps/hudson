@@ -12,8 +12,7 @@ struct StoredAccount: Codable {
     var consentedAt: Date
 }
 
-/// JSON persistence for connected accounts at
-/// `~/Library/Application Support/Hudson/accounts.json`.
+/// LEGACY (M1): superseded by the accounts table; kept only so AccountsMigration can read old installs. Do not add new callers.
 enum AccountsFile {
     static var url: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

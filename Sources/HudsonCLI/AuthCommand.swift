@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import GmailKit
+import Store
 
 /// The BYO-OAuth guided setup (spec §6.1): walks the user through creating
 /// their own Google Cloud OAuth client, then runs the browser flow and
@@ -83,10 +84,10 @@ struct AuthCommand: AsyncParsableCommand {
         try store.saveTokens(tokens, account: profile.emailAddress)
         try store.saveClientSecret(clientSecret, account: profile.emailAddress)
 
-        var accounts = try AccountsFile.load().filter { $0.email != profile.emailAddress }
-        accounts.append(StoredAccount(
-            email: profile.emailAddress, clientID: clientID, consentedAt: Date()))
-        try AccountsFile.save(accounts)
+        let database = try HudsonDatabase.open(at: HudsonPaths.databaseURL)
+        try await AccountsMigration.runIfNeeded(database: database)
+        try await database.upsertAccount(
+            email: profile.emailAddress, clientID: clientID, consentedAt: Date())
 
         print("Connected \(profile.emailAddress) — \(profile.messagesTotal) messages.")
         print("Try: hudson profile")
