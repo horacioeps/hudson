@@ -65,3 +65,26 @@ private let credentials = OAuthCredentials(clientID: "test-client-id", clientSec
         _ = try await client.refresh(old)
     }
 }
+
+@Test func exchangeWithoutRefreshTokenTellsUserToRevokeAccess() async throws {
+    // Token response without refresh_token and no previousRefreshToken to fall back to
+    let response = #"{"access_token": "at", "expires_in": 3599, "token_type": "Bearer"}"#
+    let transport = MockTransport(responses: [(Data(response.utf8), 200)])
+    let client = OAuthClient(credentials: credentials, transport: transport)
+
+    var thrownError: GmailError? = nil
+    do {
+        _ = try await client.exchangeCode(
+            "auth-code", verifier: "verifier123", redirectURI: "http://127.0.0.1:49152/callback")
+    } catch let error as GmailError {
+        thrownError = error
+    }
+
+    guard case let .auth(message) = thrownError else {
+        #expect(Bool(false), "Expected GmailError.auth but got \(String(describing: thrownError))")
+        return
+    }
+
+    #expect(message.contains("myaccount.google.com/permissions"))
+    #expect(message.contains("hudson auth"))
+}
