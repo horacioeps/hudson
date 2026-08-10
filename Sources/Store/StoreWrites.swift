@@ -96,15 +96,27 @@ extension HudsonDatabase {
                         }
                         continue
                     }
-                    let stored = try Int64.fetchOne(
+                    // thread_id fetched alongside history_id (one query) so
+                    // the targeted rollup recompute below knows which
+                    // thread's row to touch without a second round trip.
+                    let messageRow = try Row.fetchOne(
                         db,
-                        sql: "SELECT history_id FROM messages WHERE account_email = ? AND id = ?",
-                        arguments: [account, id]) ?? 0
+                        sql: "SELECT history_id, thread_id FROM messages WHERE account_email = ? AND id = ?",
+                        arguments: [account, id])
+                    let stored: Int64 = messageRow?["history_id"] ?? 0
                     guard historyID >= stored else { continue }
                     try db.execute(
                         sql: "UPDATE messages SET history_id = ? WHERE account_email = ? AND id = ?",
                         arguments: [historyID, account, id])
                     try Self.replaceLabels(labelIDs, messageID: id, account: account, db: db)
+                    // A label-only event can LOWER unread/in_inbox (e.g. the
+                    // thread's last unread message just got marked read) —
+                    // maintainRollup's insert-time OR-merge can't do that, so
+                    // this targeted, bounded (one thread) recompute is what
+                    // makes the drop visible.
+                    if let threadID: String = messageRow?["thread_id"] {
+                        try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
+                    }
                 }
             }
             return unknownIDs
@@ -203,6 +215,15 @@ extension HudsonDatabase {
             return .stale
         }
 
+        // Determined BEFORE the upsert below (which would make every row
+        // "exist") — gates `ThreadRollup.maintainRollup`'s message_count
+        // increment: a re-applied update of a message we already have must
+        // not double-count.
+        let wasInsert = try !(Bool.fetchOne(
+            db,
+            sql: "SELECT EXISTS(SELECT 1 FROM messages WHERE account_email = ? AND id = ?)",
+            arguments: [account, snapshot.id]) ?? false)
+
         try db.execute(
             sql: """
                 INSERT INTO threads (account_email, id, last_message_at) VALUES (?, ?, ?)
@@ -231,6 +252,8 @@ extension HudsonDatabase {
                 snapshot.subject, snapshot.snippet,
             ])
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
+        try ThreadRollup.maintainRollup(
+            afterApplying: snapshot, wasInsert: wasInsert, account: account, db: db)
         return .applied
     }
 
