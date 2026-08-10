@@ -48,8 +48,15 @@ public struct GmailClient: Sendable {
 
         for attempt in 1...Self.maxAttempts {
             var urlComponents = URLComponents(url: Self.baseURL.appending(path: path), resolvingAgainstBaseURL: false)
-            urlComponents?.queryItems = query.isEmpty ? nil : query
-            let url = urlComponents?.url ?? Self.baseURL.appending(path: path)
+            if !query.isEmpty {
+                guard let encodedQuery = Self.encodedQuery(query) else {
+                    throw GmailError.invalidRequest(status: 0, message: "Failed to encode query parameters")
+                }
+                urlComponents?.percentEncodedQuery = encodedQuery
+            }
+            guard let url = urlComponents?.url else {
+                throw GmailError.invalidRequest(status: 0, message: "Failed to build request URL")
+            }
             var request = URLRequest(url: url)
             let token: String
             if needsForceRefresh {
@@ -86,5 +93,21 @@ public struct GmailClient: Sendable {
             }
         }
         throw GmailError.network("Retry loop exited unexpectedly.")
+    }
+
+    // MARK: - Query encoding
+
+    /// Encodes query items with proper percent-encoding. Crucially, "+" in values is encoded as "%2B"
+    /// (not left raw), because Google's API parses raw "+" as spaces, breaking Gmail plus-addressing.
+    static func encodedQuery(_ items: [URLQueryItem]) -> String? {
+        guard !items.isEmpty else { return nil }
+        let components = items.map { item -> String in
+            let allowedCharacters = CharacterSet.urlQueryAllowed
+                .subtracting(CharacterSet(charactersIn: "+&="))
+            let encodedValue = item.value?
+                .addingPercentEncoding(withAllowedCharacters: allowedCharacters) ?? ""
+            return "\(item.name)=\(encodedValue)"
+        }
+        return components.joined(separator: "&")
     }
 }
