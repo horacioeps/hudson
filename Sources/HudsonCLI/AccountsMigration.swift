@@ -10,23 +10,14 @@ enum HudsonPaths {
     }
 }
 
-/// One-time import of M1's accounts.json into the database. M1 wrote dates
-/// with JSONEncoder's DEFAULT strategy (seconds since the reference date, a
-/// bare Double) — decode with the default strategy, never .iso8601.
+/// One-time import of M1's accounts.json into the database.
+/// Thin wrapper around AccountsImport (in Store) with the standard file path.
 enum AccountsMigration {
+    /// Runs the legacy-file import if needed (file exists, table empty).
+    /// Atomic: either all accounts import or none, so crashes leave the table in a
+    /// clean state for retry.
     static func runIfNeeded(database: HudsonDatabase) async throws {
-        let legacyURL = AccountsFile.url
-        guard FileManager.default.fileExists(atPath: legacyURL.path) else { return }
-        guard try await database.primaryAccount() == nil else { return }
-
-        let legacy = try AccountsFile.load()
-        for account in legacy {
-            try await database.upsertAccount(
-                email: account.email, clientID: account.clientID,
-                consentedAt: account.consentedAt)
-        }
-        try FileManager.default.moveItem(
-            at: legacyURL,
-            to: legacyURL.deletingLastPathComponent().appending(path: "accounts.json.migrated"))
+        _ = try await AccountsImport.importLegacyFile(
+            at: AccountsFile.url, database: database)
     }
 }
