@@ -11,6 +11,31 @@ struct HistoryCall: Equatable {
     let pageToken: String?
 }
 
+/// One recorded `modify` call — lets flusher tests assert exactly which
+/// message and label delta was sent (and that a batchable set was NOT
+/// double-sent through the singleton path).
+struct ModifyCall: Equatable {
+    let id: String
+    let addLabelIDs: [String]
+    let removeLabelIDs: [String]
+}
+
+/// One recorded `batchModify` call — lets flusher tests assert coalescing
+/// (one call covering every message sharing a label delta, not N modifies).
+struct BatchModifyCall: Equatable {
+    let ids: [String]
+    let addLabelIDs: [String]
+    let removeLabelIDs: [String]
+}
+
+/// A scripted `modify` response — only `historyId` matters to the flusher
+/// (it's the retirement gate); everything else round-trips through
+/// `testMessage`'s placeholders.
+struct GmailMessageStub {
+    let id: String
+    let historyId: String
+}
+
 /// Scriptable in-memory Gmail for SyncEngine tests: serves canned list pages,
 /// messages, and history pages; records every call.
 actor ScriptedGmail: GmailAPI {
@@ -20,9 +45,20 @@ actor ScriptedGmail: GmailAPI {
     var historyPages: [HistoryPage]
     /// When set, listHistory throws this (e.g. 404 expiry) instead of serving.
     var historyError: GmailError?
+    /// Scripted `modify` response — see `GmailMessageStub`. Defaults to
+    /// echoing the requested id with historyId "100" when unset.
+    var modifyResult: GmailMessageStub?
+    /// When set, `modify` throws this instead of serving `modifyResult`.
+    var modifyError: GmailError?
+    /// When set, `batchModify` throws this instead of succeeding (204).
+    var batchModifyError: GmailError?
     private(set) var calls: [String] = []
     /// Every `listHistory` call, in order — see `HistoryCall`.
     private(set) var historyCalls: [HistoryCall] = []
+    /// Every `modify` call, in order — see `ModifyCall`.
+    private(set) var modifyCalls: [ModifyCall] = []
+    /// Every `batchModify` call, in order — see `BatchModifyCall`.
+    private(set) var batchModifyCalls: [BatchModifyCall] = []
 
     init(
         profile: Profile = Profile(
@@ -75,11 +111,17 @@ actor ScriptedGmail: GmailAPI {
 
     func modify(id: String, addLabelIDs: [String], removeLabelIDs: [String]) async throws -> GmailMessage {
         calls.append("modify:\(id)")
-        return testMessage(id: id, historyID: "100")
+        modifyCalls.append(ModifyCall(id: id, addLabelIDs: addLabelIDs, removeLabelIDs: removeLabelIDs))
+        if let modifyError { throw modifyError }
+        let stub = modifyResult ?? GmailMessageStub(id: id, historyId: "100")
+        return testMessage(id: stub.id, historyID: stub.historyId)
     }
 
     func batchModify(ids: [String], addLabelIDs: [String], removeLabelIDs: [String]) async throws {
         calls.append("batchModify:\(ids.count)")
+        batchModifyCalls.append(
+            BatchModifyCall(ids: ids, addLabelIDs: addLabelIDs, removeLabelIDs: removeLabelIDs))
+        if let batchModifyError { throw batchModifyError }
     }
 
     func setHistoryError(_ error: GmailError?) { historyError = error }
@@ -93,6 +135,9 @@ actor ScriptedGmail: GmailAPI {
             emailAddress: profile.emailAddress, messagesTotal: profile.messagesTotal,
             threadsTotal: profile.threadsTotal, historyId: id)
     }
+    func setModifyResult(_ stub: GmailMessageStub) { modifyResult = stub }
+    func setModifyError(_ error: GmailError?) { modifyError = error }
+    func setBatchModifyError(_ error: GmailError?) { batchModifyError = error }
 }
 
 /// Decodes a canned `history.list` page response for tests.
@@ -105,16 +150,32 @@ func testMessage(
     id: String, threadID: String = "t1", historyID: String, internalDate: String = "1000",
     labels: [String] = ["INBOX"], subject: String = "s"
 ) -> GmailMessage {
-    // Decodable structs: round-trip through JSON to construct.
+    // Decodable structs: round-trip through JSON to construct. Building the
+    // `labelIds` array manually (not via `\(labels)` string interpolation,
+    // whose Array<String>.description re-quotes each already-quoted element
+    // into literal `\"INBOX\"` text) keeps the round-trip lossless.
+    let labelIDsJSON = "[\(labels.map { "\"\($0)\"" }.joined(separator: ", "))]"
     let json = """
         {"id": "\(id)", "threadId": "\(threadID)", "historyId": "\(historyID)",
-         "internalDate": "\(internalDate)", "labelIds": \(labels.map { "\"\($0)\"" }),
+         "internalDate": "\(internalDate)", "labelIds": \(labelIDsJSON),
          "snippet": "sn",
          "payload": {"headers": [
             {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"},
             {"name": "Subject", "value": "\(subject)"}]}}
         """
     return try! JSONDecoder().decode(GmailMessage.self, from: Data(json.utf8))
+}
+
+/// `testMessage` overload accepting a numeric historyId directly — for call
+/// sites that already have a raw history version and would otherwise need a
+/// throwaway `String(...)` at every call.
+func testMessage(
+    id: String, threadID: String = "t1", historyID: Int, internalDate: String = "1000",
+    labels: [String] = ["INBOX"], subject: String = "s"
+) -> GmailMessage {
+    testMessage(
+        id: id, threadID: threadID, historyID: String(historyID), internalDate: internalDate,
+        labels: labels, subject: subject)
 }
 
 /// Builds a full-format GmailMessage carrying a text/plain body, for
@@ -125,9 +186,10 @@ func testMessageWithBody(
     labels: [String] = ["INBOX"], subject: String = "s", plainText: String
 ) -> GmailMessage {
     let encodedBody = Data(plainText.utf8).base64EncodedString()
+    let labelIDsJSON = "[\(labels.map { "\"\($0)\"" }.joined(separator: ", "))]"
     let json = """
         {"id": "\(id)", "threadId": "\(threadID)", "historyId": "\(historyID)",
-         "internalDate": "\(internalDate)", "labelIds": \(labels.map { "\"\($0)\"" }),
+         "internalDate": "\(internalDate)", "labelIds": \(labelIDsJSON),
          "snippet": "sn",
          "payload": {"mimeType": "text/plain", "body": {"data": "\(encodedBody)"},
             "headers": [
