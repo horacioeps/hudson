@@ -54,7 +54,7 @@ struct ProfileCommand: AsyncParsableCommand {
     }
 
     /// The spec-§6.1 heuristic: a dead grant within ~8 days of consent usually
-    /// means the OAuth app was left in "Testing" status. Pure for testability.
+    /// means the OAuth app was left in “Testing” status. Pure for testability.
     static func annotated(
         _ error: GmailError, consentedAt: Date, now: Date = Date()
     ) -> GmailError {
@@ -66,7 +66,7 @@ struct ProfileCommand: AsyncParsableCommand {
 
 
         Your grant died within a week of setup — the OAuth app is probably still in
-        "Testing" status, where refresh tokens expire every 7 days. Fix: Google Auth
+        “Testing” status, where refresh tokens expire every 7 days. Fix: Google Auth
         Platform → Audience → Publishing status → PUBLISH APP, then `hudson auth`.
         """)
     }
