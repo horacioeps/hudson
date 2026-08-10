@@ -21,7 +21,8 @@ public enum Sanitizer {
     /// back to stripping the HTML. Also inventories cid: and remote references
     /// so the future WKWebView renderer can block remote loads (spec §3.5).
     /// Uses lossy UTF-8 decode (U+FFFD for invalid bytes) to prevent evasion
-    /// via malformed input.
+    /// via malformed input. Collects all matches, then dedupes, then caps at 200
+    /// per category to prevent padding-based evasion attacks.
     public static func sanitize(html: Data?, plainText: String?) -> SanitizedBody {
         let htmlString = html.map { String(decoding: $0, as: UTF8.self) } ?? ""
         let text: String
@@ -30,13 +31,17 @@ public enum Sanitizer {
         } else {
             text = strippedText(fromHTML: htmlString)
         }
+        // Collect all matches (no early cap), then dedupe, then cap at 200
+        let cidMatches = matches(#"(?i)src\s*=\s*["']?cid:([^"'\s>]+)"#, in: htmlString)
+        let remoteMatches1 = matches(#"(?i)(?:src|href)\s*=\s*["']?(https?://[^"'\s>]+)"#, in: htmlString)
+        let remoteMatches2 = matches(#"(?i)url\(\s*["']?(https?://[^"')\s]+)"#, in: htmlString)
+
         return SanitizedBody(
             rawHTML: html,
             plainText: text,
             sanitizerVersion: version,
-            cidReferences: matches(#"(?i)src\s*=\s*["']?cid:([^"'\s>]+)"#, in: htmlString),
-            remoteURLs: deduped(matches(#"(?i)(?:src|href)\s*=\s*["']?(https?://[^"'\s>]+)"#, in: htmlString)
-                + matches(#"(?i)url\(\s*["']?(https?://[^"')\s]+)"#, in: htmlString)))
+            cidReferences: Array(deduped(cidMatches).prefix(200)),
+            remoteURLs: Array(deduped(remoteMatches1 + remoteMatches2).prefix(200)))
     }
 
     /// Strips C0/C1 control characters (keeping \n and \t), ANSI CSI/OSC
@@ -103,11 +108,12 @@ public enum Sanitizer {
         let range = NSRange(string.startIndex..., in: string)
         var results: [String] = []
         for match in regex.matches(in: string, range: range) {
-            if results.count >= 200 { break }
             if let range = Range(match.range(at: 1), in: string) {
                 let captured = String(string[range])
-                let truncated = captured.count > 2048 ? String(captured.prefix(2048)) : captured
-                results.append(truncated)
+                // Keep full value if under cap; drop over-long entries to avoid partial URLs
+                if captured.count <= 2048 {
+                    results.append(captured)
+                }
             }
         }
         return results

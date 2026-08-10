@@ -71,7 +71,7 @@ import Testing
 }
 
 // IMPORTANT 3: Unterminated script/style tags drop their body
-@Test func handleUnteminatedScriptTags() {
+@Test func handleUnterminatedScriptTags() {
     let html = "<div>keep</div><script>var x = fetch(...); alert('xss')<div>gone</div>"
     let body = Sanitizer.sanitize(html: Data(html.utf8), plainText: nil)
     #expect(body.plainText.contains("keep"))
@@ -161,4 +161,47 @@ import Testing
         body: Sanitizer.sanitize(html: nil, plainText: "v2 overwrites"))
     fetched = try #require(try await database.message(id: "m1", account: "x"))
     #expect(fetched.plainText == "v2 overwrites")
+}
+
+// IMPORTANT 6 (a): Collect all matches → dedupe → cap prevents padding evasion for remoteURLs
+@Test func remoteURLsPaddingEvasionPrevented() {
+    // 250 identical decoy URLs + 1 real tracker → both should appear (real one not pushed out)
+    var html = String(repeating: #"<img src="https://decoy.example/1">"#, count: 250)
+    html += #"<img src="https://real-tracker.example/pixel.gif">"#
+    let body = Sanitizer.sanitize(html: Data(html.utf8), plainText: nil)
+    // After dedup, should have 2 entries; real one should be present
+    #expect(body.remoteURLs.contains("https://real-tracker.example/pixel.gif"))
+    #expect(body.remoteURLs.count == 2)  // dedup + cap together
+}
+
+// IMPORTANT 6 (a): Same for cidReferences
+@Test func cidReferencesPaddingEvasionPrevented() {
+    // 250 identical decoy cids + 1 real ref → real one survives
+    var html = String(repeating: #"<img src="cid:decoy@example">"#, count: 250)
+    html += #"<img src="cid:real-attachment@example">"#
+    let body = Sanitizer.sanitize(html: Data(html.utf8), plainText: nil)
+    #expect(body.cidReferences.contains("real-attachment@example"))
+    #expect(body.cidReferences.count == 2)  // dedup + cap together
+}
+
+// IMPORTANT 6 (b): cidReferences dedupes identical values
+@Test func cidReferencesDeduplicates() {
+    let html = String(repeating: #"<img src="cid:attach@x">"#, count: 10)
+    let body = Sanitizer.sanitize(html: Data(html.utf8), plainText: nil)
+    #expect(body.cidReferences == ["attach@x"])
+}
+
+// IMPORTANT 6 (c): Combined remote URL cap is 200 (not 400 per pattern-group)
+@Test func remoteURLsCombinedCapIs200() {
+    // 120 unique src= refs + 100 unique url() refs = 220 total before cap → 200 after
+    var html = ""
+    for i in 0..<120 {
+        html += #"<img src="https://a.example/\#(i)">"#
+    }
+    for i in 0..<100 {
+        html += #"<div style="background: url(https://b.example/\#(i))"></div>"#
+    }
+    let body = Sanitizer.sanitize(html: Data(html.utf8), plainText: nil)
+    // After dedup + combined cap, should be exactly 200 (not 220)
+    #expect(body.remoteURLs.count == 200)
 }
