@@ -36,6 +36,37 @@ private func account(_ db: HudsonDatabase, cursor: Int64?) async throws {
     #expect(try await db.pendingMutations(account: "x").isEmpty)
 }
 
+@Test func opposingEnqueueAgainstInFlightRowOverlaysForwardInsteadOfDeleting() async throws {
+    // Regression for the M3 final-review Fix 1 lost update: archive (enqueue
+    // remove) → the flusher sends it and marks it in_flight (cursor hasn't
+    // caught up yet, so it can't retire) → unarchive (enqueue add) must NOT
+    // find the in_flight remove row, delete it, and return — that would
+    // silently lose the unarchive (nothing left in the queue to send it).
+    let db = try HudsonDatabase.inMemory()
+    try await account(db, cursor: 100)
+    try await db.enqueueMutation(messageID: "m1", labelID: "INBOX", op: .remove, account: "x", now: 1)
+    let claimed = try await db.claimPendingBatch(account: "x", limit: 10)
+    try await db.markInFlight(mutationIDs: claimed.map(\.id), expectedHistoryID: 140, account: "x")
+
+    // Opposite op arrives while the row is still in_flight (cursor at 100 < 140).
+    try await db.enqueueMutation(messageID: "m1", labelID: "INBOX", op: .add, account: "x", now: 2)
+
+    let pending = try await db.pendingMutations(account: "x")
+    #expect(pending.count == 1)  // NOT an empty queue — the unarchive must survive
+    let row = try #require(pending.first(where: { $0.messageID == "m1" }))
+    #expect(row.op == .add)
+    #expect(row.state == "pending")
+    #expect(row.expectedHistoryID == nil)
+
+    // Effective read shows INBOX present again (the overlay reflects the new intent).
+    let snap = MessageSnapshot(
+        id: "m1", threadID: "t", historyID: 1, internalDate: 1000,
+        fromLine: "f", toLine: "t", subject: "s", snippet: "sn", labelIDs: [])
+    _ = try await db.applySnapshot(snap, account: "x")
+    let effective = try #require(try await db.message(id: "m1", account: "x")).row
+    #expect(effective.labelIDs.contains("INBOX"))
+}
+
 @Test func retireReturnsZeroWhenCursorIsNull() async throws {
     let db = try HudsonDatabase.inMemory()
     try await account(db, cursor: nil)  // no cursor set yet

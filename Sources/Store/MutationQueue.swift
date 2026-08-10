@@ -17,7 +17,17 @@ public struct PendingMutation: Sendable, Equatable {
 extension HudsonDatabase {
     /// Enqueues a label delta as PENDING SERVER TRUTH-PRESERVING intent
     /// (spec §5): canonical tables are never written here. Opposite op to a
-    /// live delta cancels it (net no-op); same op is idempotent.
+    /// live `pending` delta cancels it (net no-op, nothing was ever sent);
+    /// same op is idempotent. An opposite op against an `in_flight` delta
+    /// (already sent to Gmail, echo not yet retired — Task 9) is NOT a
+    /// cancel: the row is overlaid forward to the new op and reset to
+    /// `pending` instead of deleted. Deleting it here would silently drop
+    /// the new intent (there is nothing left in the queue to send it), since
+    /// the already-in-flight send can't be recalled — a deterministic lost
+    /// update caught in the M3 final-review pass. Overlaying keeps the
+    /// unique index satisfied (same row, not a second insert) and the
+    /// effective-read overlay correct throughout: `messageRow` treats every
+    /// row here as live regardless of state.
     public func enqueueMutation(
         messageID: String, labelID: String, op: LabelOp, account: String, now: Int64
     ) async throws {
@@ -25,7 +35,7 @@ extension HudsonDatabase {
             let existing = try Row.fetchOne(
                 db,
                 sql: """
-                    SELECT id, op FROM mutation_queue
+                    SELECT id, op, state FROM mutation_queue
                     WHERE account_email = ? AND message_id = ? AND label_id = ?
                     """,
                 arguments: [account, messageID, labelID])
@@ -33,8 +43,22 @@ extension HudsonDatabase {
                 let existingOp: String = existing["op"]
                 if existingOp == op.rawValue { return }            // same op: idempotent
                 let id: Int64 = existing["id"]
+                let existingState: String = existing["state"]
+                if existingState == "in_flight" {
+                    // Sent, not yet retired — can't be recalled. Flip it to
+                    // the new op and re-arm it as pending; the flusher sends
+                    // the inverse normally once it's claimed.
+                    try db.execute(
+                        sql: """
+                            UPDATE mutation_queue
+                            SET op = ?, state = 'pending', expected_history_id = NULL, enqueued_at = ?
+                            WHERE id = ?
+                            """,
+                        arguments: [op.rawValue, now, id])
+                    return
+                }
                 try db.execute(
-                    sql: "DELETE FROM mutation_queue WHERE id = ?", arguments: [id])  // opposite: cancel
+                    sql: "DELETE FROM mutation_queue WHERE id = ?", arguments: [id])  // opposite, still pending: cancel
                 return
             }
             try db.execute(
