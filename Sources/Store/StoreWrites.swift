@@ -142,6 +142,8 @@ extension HudsonDatabase {
                     // (count must drop, and the deleted message may have
                     // been the thread's newest), so this calls the full
                     // per-thread rebuild rather than `maintainRollup`.
+                    // `AIArtifacts.purge` below (Task 8) purges any cached
+                    // AI artifact this message fed, in the same transaction.
                     let threadID = try String.fetchOne(
                         db,
                         sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
@@ -153,6 +155,7 @@ extension HudsonDatabase {
                         sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                         arguments: [account, id])
                     try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
+                    try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
                     if let threadID {
                         try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
                     }
@@ -260,7 +263,13 @@ extension HudsonDatabase {
     /// handling: thread_id captured before the delete, then the ONE
     /// affected thread's rollup row is fully rebuilt (or dropped) via
     /// `ThreadRollup.recomputeThreadRollup` — a deletion can't be folded
-    /// into `maintainRollup`'s incremental upsert.
+    /// into `maintainRollup`'s incremental upsert. Also mirrors `.deleted`'s
+    /// AI-artifact purge (Task 8): `AIArtifacts.purge` deletes any cached
+    /// artifact `id` fed, in this same transaction — a thread summary has no
+    /// FK cascade from one of its source messages (see
+    /// `ai_artifact_sources`'s schema comment in `Migrations.swift`), so
+    /// this is what keeps the cache from serving stale content built from a
+    /// message that no longer exists.
     public func deleteVanishedMessage(id: String, account: String) async throws {
         try await writer.write { db in
             let threadID = try String.fetchOne(
@@ -274,6 +283,7 @@ extension HudsonDatabase {
                 sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                 arguments: [account, id])
             try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
+            try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
             if let threadID {
                 try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
             }
