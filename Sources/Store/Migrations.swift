@@ -273,5 +273,31 @@ let migrator: DatabaseMigrator = {
         try runQueryLayerBulkBuild(db)
     }
 
+    migrator.registerMigration("v4") { db in
+        // Task 5: `inboxThreads` reads `thread_rollup` ONLY (zero join, zero
+        // aggregation) — so `has_attachment` has to live there too, not be
+        // joined from `messages` at read time. It mirrors `subject`/
+        // `snippet`'s existing semantics: the flag of the thread's CURRENT
+        // newest message, maintained incrementally by
+        // `ThreadRollup.maintainRollup`/`recomputeThreadRollup`/
+        // `maintainHasAttachment` from here on (see `ThreadRollup.swift`).
+        try db.alter(table: "thread_rollup") { t in
+            t.add(column: "has_attachment", .boolean).notNull().defaults(to: false)
+        }
+        // Backfill for installs that already populated `thread_rollup`
+        // before this column existed (v3's bulk build, or any incremental
+        // maintenance since) — pull the CURRENT newest message's own flag.
+        // A brand-new install has no rows here yet (v3's bulk build ran
+        // over an empty `messages` table), so this is a no-op there.
+        try db.execute(sql: """
+            UPDATE thread_rollup
+            SET has_attachment = IFNULL((
+                SELECT m.has_attachment FROM messages m
+                WHERE m.account_email = thread_rollup.account_email
+                  AND m.id = thread_rollup.last_message_id
+            ), 0)
+            """)
+    }
+
     return migrator
 }()

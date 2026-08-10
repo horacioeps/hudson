@@ -37,6 +37,14 @@ enum ThreadRollup {
     ///   bounded `recomputeThreadFlags` instead — called by
     ///   `applyHistoryChanges`'s `.labels` branch for every label-only
     ///   event, which is exactly where a flag needs to be able to fall.
+    /// - `has_attachment` (Task 5) mirrors `subject`/`snippet`: overwritten
+    ///   only when this snapshot is at least tied for newest, but always to
+    ///   `0` — a bare `MessageSnapshot` never carries attachment info (only
+    ///   `format: "full"` body hydration observes it, via `saveBody` →
+    ///   `maintainHasAttachment`). This deliberately resets the flag to
+    ///   "unknown" whenever a not-yet-hydrated message becomes the thread's
+    ///   newest, rather than leaking the PREVIOUS newest message's flag
+    ///   forward onto a message it no longer describes.
     static func maintainRollup(
         afterApplying snapshot: MessageSnapshot, wasInsert: Bool, account: String, db: Database
     ) throws {
@@ -48,8 +56,8 @@ enum ThreadRollup {
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     message_count, unread, in_inbox)
-                VALUES (:account, :thread, :date, :msgID, :subject, :snippet, :delta, :unread, :inbox)
+                     message_count, unread, in_inbox, has_attachment)
+                VALUES (:account, :thread, :date, :msgID, :subject, :snippet, :delta, :unread, :inbox, 0)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = MAX(
                         IFNULL(thread_rollup.last_message_at, excluded.last_message_at), excluded.last_message_at),
@@ -68,6 +76,11 @@ enum ThreadRollup {
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
                             IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.snippet ELSE thread_rollup.snippet END,
+                    has_attachment = CASE
+                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                            IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
+                            IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
+                        THEN excluded.has_attachment ELSE thread_rollup.has_attachment END,
                     message_count = thread_rollup.message_count + excluded.message_count,
                     unread = CASE WHEN :was_insert
                         THEN (thread_rollup.unread OR excluded.unread) ELSE thread_rollup.unread END,
@@ -138,7 +151,7 @@ enum ThreadRollup {
         guard let newest = try Row.fetchOne(
             db,
             sql: """
-                SELECT id, subject, snippet, internal_date FROM messages
+                SELECT id, subject, snippet, internal_date, has_attachment FROM messages
                 WHERE account_email = ? AND thread_id = ?
                 ORDER BY internal_date DESC, id DESC LIMIT 1
                 """,
@@ -148,6 +161,12 @@ enum ThreadRollup {
         let lastMessageID: String = newest["id"]
         let subject: String = newest["subject"]
         let snippet: String = newest["snippet"]
+        // Unlike `maintainRollup` (which never sees this field on a bare
+        // snapshot), the survivor's `has_attachment` is already known here
+        // — `messages.has_attachment` is set by hydration independently of
+        // this rebuild, so it's read straight from the row rather than
+        // reset to "unknown".
+        let hasAttachment: Bool = newest["has_attachment"]
 
         let unread = try effectiveLabelPresentInThread(
             label: "UNREAD", threadID: threadID, account: account, db: db)
@@ -158,8 +177,8 @@ enum ThreadRollup {
             sql: """
                 INSERT INTO thread_rollup
                     (account_email, thread_id, last_message_at, last_message_id, subject, snippet,
-                     message_count, unread, in_inbox)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     message_count, unread, in_inbox, has_attachment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_email, thread_id) DO UPDATE SET
                     last_message_at = excluded.last_message_at,
                     last_message_id = excluded.last_message_id,
@@ -167,11 +186,12 @@ enum ThreadRollup {
                     snippet = excluded.snippet,
                     message_count = excluded.message_count,
                     unread = excluded.unread,
-                    in_inbox = excluded.in_inbox
+                    in_inbox = excluded.in_inbox,
+                    has_attachment = excluded.has_attachment
                 """,
             arguments: [
                 account, threadID, lastMessageAt, lastMessageID, subject, snippet,
-                count, unread, inInbox,
+                count, unread, inInbox, hasAttachment,
             ])
     }
 
@@ -206,5 +226,33 @@ enum ThreadRollup {
                 )
                 """,
             arguments: ["account": account, "thread": threadID, "label": label]) ?? false
+    }
+
+    /// Refreshes `thread_rollup.has_attachment` from ONE message's own
+    /// flag — but only when that message is still the thread's current
+    /// newest (`last_message_id`); `has_attachment` mirrors "the last
+    /// message" (same semantics as `subject`/`snippet`), not an aggregate
+    /// across the thread. Called by `StoreBodies.saveBody` right after it
+    /// sets `messages.has_attachment`, since real hydration is the only
+    /// place the true value becomes known (`maintainRollup` never sees it
+    /// — see its doc comment). Hydration order is independent of arrival
+    /// order, so an older message finishing hydration after a newer one
+    /// has already arrived must not leak its flag onto a rollup row it's
+    /// no longer the newest of — the `last_message_id` equality guard is
+    /// what prevents that; a stale/superseded message's update is a
+    /// harmless no-op (zero rows match).
+    static func maintainHasAttachment(
+        messageID: String, hasAttachment: Bool, account: String, db: Database
+    ) throws {
+        guard let threadID = try String.fetchOne(
+            db, sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
+            arguments: [account, messageID]
+        ) else { return }
+        try db.execute(
+            sql: """
+                UPDATE thread_rollup SET has_attachment = ?
+                WHERE account_email = ? AND thread_id = ? AND last_message_id = ?
+                """,
+            arguments: [hasAttachment, account, threadID, messageID])
     }
 }

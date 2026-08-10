@@ -34,7 +34,9 @@ extension HudsonDatabase {
     /// gets) never calls `saveBody` and never sees a payload part tree, so a
     /// message only gains `has_attachment = 1` once its `format: "full"`
     /// body hydration runs. Until then it reads `has_attachment = 0` even if
-    /// the real message has an attachment.
+    /// the real message has an attachment. `ThreadRollup.maintainHasAttachment`
+    /// (Task 5) mirrors the same flag onto `thread_rollup` in the same
+    /// transaction, so `inboxThreads` picks it up with zero join.
     public func saveBody(
         messageID: String, account: String, body: SanitizedBody,
         attachments: [AttachmentMeta] = []
@@ -79,6 +81,11 @@ extension HudsonDatabase {
             try db.execute(
                 sql: "UPDATE messages SET has_attachment = ? WHERE account_email = ? AND id = ?",
                 arguments: [!attachments.isEmpty, account, messageID])
+            // Mirrors `messages.has_attachment` onto `thread_rollup` (Task
+            // 5, M4's zero-join inbox read) — a no-op unless `messageID` is
+            // still its thread's current newest message.
+            try ThreadRollup.maintainHasAttachment(
+                messageID: messageID, hasAttachment: !attachments.isEmpty, account: account, db: db)
             try FTSIndex.reindexBody(
                 messageID: messageID, account: account, plainText: body.plainText, db: db)
         }

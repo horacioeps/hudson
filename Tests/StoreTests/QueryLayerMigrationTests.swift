@@ -18,6 +18,58 @@ import Testing
     #expect(cols.contains("has_attachment"))
 }
 
+// MARK: - v4: has_attachment denormalized onto thread_rollup (Task 5)
+
+@Test func v4AddsHasAttachmentToThreadRollup() throws {
+    let database = try HudsonDatabase.inMemory()
+    let cols = try database.writer.read { db in
+        try Row.fetchAll(db, sql: "PRAGMA table_info(thread_rollup)").map { $0["name"] as String }
+    }
+    #expect(cols.contains("has_attachment"))
+}
+
+@Test func v4BackfillsHasAttachmentFromEachThreadsNewestMessage() throws {
+    // Simulates an upgrading install: v3's bulk build already populated
+    // `thread_rollup` (before `has_attachment` existed) from messages that
+    // already carry `has_attachment` — v4's backfill UPDATE must pick that
+    // up rather than leaving every pre-existing row stuck at the column's
+    // default `0`.
+    let database = try HudsonDatabase.inMemory()
+    try database.writer.write { db in
+        try db.execute(sql: "INSERT INTO accounts (email, client_id, consented_at) VALUES ('a@x.com','c',0)")
+        try db.execute(sql: "INSERT INTO threads (account_email, id, last_message_at) VALUES ('a@x.com','t1',100)")
+        try db.execute(sql: """
+            INSERT INTO messages (account_email, id, thread_id, history_id, internal_date, subject, snippet, has_attachment)
+            VALUES ('a@x.com','m1','t1',1,100,'s','sn',1)
+            """)
+        // thread_rollup row as v3's bulk build would have left it pre-v4
+        // (no has_attachment column at that point — simulated here by
+        // deleting and re-inserting without it).
+        try db.execute(sql: "DELETE FROM thread_rollup")
+        try db.execute(sql: """
+            INSERT INTO thread_rollup
+                (account_email, thread_id, last_message_at, last_message_id, message_count, unread, in_inbox)
+            VALUES ('a@x.com','t1',100,'m1',1,0,0)
+            """)
+        // Re-run v4's exact backfill statement (the migration itself only
+        // runs once, at `HudsonDatabase.inMemory()` construction time,
+        // over an empty `messages` table).
+        try db.execute(sql: """
+            UPDATE thread_rollup
+            SET has_attachment = IFNULL((
+                SELECT m.has_attachment FROM messages m
+                WHERE m.account_email = thread_rollup.account_email
+                  AND m.id = thread_rollup.last_message_id
+            ), 0)
+            """)
+    }
+    let hasAttachment = try database.writer.read { db in
+        try Bool.fetchOne(
+            db, sql: "SELECT has_attachment FROM thread_rollup WHERE thread_id = 't1'")
+    }
+    #expect(hasAttachment == true)
+}
+
 @Test func fts5TableAcceptsInsertAndMatch() throws {
     let database = try HudsonDatabase.inMemory()
     try database.writer.write { db in
