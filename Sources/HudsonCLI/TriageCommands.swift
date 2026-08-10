@@ -91,7 +91,11 @@ enum TriageRunner {
         } catch let error as GmailError {
             print("queued, will retry (\(error.cliMessage))")
         } catch {
-            print("queued, will retry (\(error))")
+            // Non-GmailError failures here are almost always a DatabaseError,
+            // whose description embeds raw SQL — never print it directly
+            // (Sanitizer discipline, spec §9.1); the type name is enough to
+            // diagnose without leaking query text.
+            print("queued, will retry (\(type(of: error)))")
         }
     }
 }
