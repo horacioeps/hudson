@@ -86,14 +86,15 @@ extension HudsonDatabase {
     ) async throws {
         guard !mutationIDs.isEmpty else { return }
         try await writer.write { db in
-            for id in mutationIDs {
-                try db.execute(
-                    sql: """
-                        UPDATE mutation_queue SET state = 'in_flight', expected_history_id = ?
-                        WHERE account_email = ? AND id = ?
-                        """,
-                    arguments: [expectedHistoryID, account, id])
-            }
+            let placeholders = databaseQuestionMarks(count: mutationIDs.count)
+            var args: StatementArguments = [expectedHistoryID, account]
+            args += StatementArguments(mutationIDs)
+            try db.execute(
+                sql: """
+                    UPDATE mutation_queue SET state = 'in_flight', expected_history_id = ?
+                    WHERE account_email = ? AND id IN (\(placeholders))
+                    """,
+                arguments: args)
         }
     }
 

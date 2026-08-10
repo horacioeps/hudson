@@ -35,3 +35,15 @@ private func account(_ db: HudsonDatabase, cursor: Int64?) async throws {
     try await db.dropMutation(id: id, account: "x")
     #expect(try await db.pendingMutations(account: "x").isEmpty)
 }
+
+@Test func retireReturnsZeroWhenCursorIsNull() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await account(db, cursor: nil)  // no cursor set yet
+    try await db.enqueueMutation(messageID: "m1", labelID: "INBOX", op: .remove, account: "x", now: 1)
+    let pending = try await db.claimPendingBatch(account: "x", limit: 10)
+    try await db.markInFlight(mutationIDs: pending.map(\.id), expectedHistoryID: 150, account: "x")
+
+    // Cursor is NULL → retire returns 0, does not throw.
+    #expect(try await db.retireConfirmedMutations(account: "x") == 0)
+    #expect(try await db.pendingMutations(account: "x").count == 1)
+}
