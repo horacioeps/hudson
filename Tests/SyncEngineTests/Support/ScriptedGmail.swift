@@ -73,6 +73,15 @@ actor ScriptedGmail: GmailAPI {
         return []
     }
 
+    func modify(id: String, addLabelIDs: [String], removeLabelIDs: [String]) async throws -> GmailMessage {
+        calls.append("modify:\(id)")
+        return testMessage(id: id, historyID: "100")
+    }
+
+    func batchModify(ids: [String], addLabelIDs: [String], removeLabelIDs: [String]) async throws {
+        calls.append("batchModify:\(ids.count)")
+    }
+
     func setHistoryError(_ error: GmailError?) { historyError = error }
 
     func setHistory(_ pages: [HistoryPage]) { historyPages = pages }

@@ -10,6 +10,8 @@ public protocol GmailAPI: Sendable {
     func getMessage(id: String, format: String) async throws -> GmailMessage
     func listHistory(startHistoryID: String, pageToken: String?) async throws -> HistoryPage
     func listLabels() async throws -> [GmailLabel]
+    func modify(id: String, addLabelIDs: [String], removeLabelIDs: [String]) async throws -> GmailMessage
+    func batchModify(ids: [String], addLabelIDs: [String], removeLabelIDs: [String]) async throws
 }
 
 extension GmailClient: GmailAPI {}
