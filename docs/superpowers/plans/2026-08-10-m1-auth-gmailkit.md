@@ -1630,13 +1630,18 @@ public struct GmailClient: Sendable {
 
     private func get<Response: Decodable>(_ path: String, cost: Int) async throws -> Response {
         try await quota.acquire(cost: cost)
-        var hasRetriedAuth = false
+        var hasRetriedAuth = false      // gates the auth-retry arm: only ever one
+        var needsForceRefresh = false   // consumed at use, so exactly ONE force refresh
 
         for attempt in 1...Self.maxAttempts {
             var request = URLRequest(url: Self.baseURL.appending(path: path))
-            let token = hasRetriedAuth
-                ? try await session.forceRefresh()
-                : try await session.validAccessToken()
+            let token: String
+            if needsForceRefresh {
+                needsForceRefresh = false
+                token = try await session.forceRefresh()
+            } else {
+                token = try await session.validAccessToken()
+            }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await transport.send(request)
@@ -1658,7 +1663,8 @@ public struct GmailClient: Sendable {
             case .server:
                 try await sleep(pow(2, Double(attempt)))
             case .auth where !hasRetriedAuth:
-                hasRetriedAuth = true  // retry once with a force-refreshed token
+                hasRetriedAuth = true      // never a second auth retry
+                needsForceRefresh = true   // next attempt force-refreshes, once
             case .auth, .network, .invalidRequest:
                 throw error
             }
