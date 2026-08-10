@@ -112,7 +112,12 @@ public actor SyncEngine {
         guard let cursor = try await requireAccount().historyCursor else { return 0 }
         var applied = 0
         var pageToken: String?
-        var start = String(cursor)
+        // Fixed for the whole pagination loop: a Gmail page token continues
+        // the listing it was created by, so pairing it with a startHistoryId
+        // that changed between pages is undefined. Only pageToken advances
+        // between pages; the per-page cursor is still committed to the store
+        // via applyHistory(newCursor: page.historyId) below.
+        let start = String(cursor)
         repeat {
             let page: HistoryPage
             do {
@@ -156,7 +161,6 @@ public actor SyncEngine {
                 }
             }
             pageToken = page.nextPageToken
-            start = String(newCursor)
         } while pageToken != nil
         return applied
     }

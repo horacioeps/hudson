@@ -2,6 +2,15 @@ import Foundation
 import GmailKit
 @testable import SyncEngine
 
+/// One recorded `listHistory` call — lets tests assert exactly what
+/// startHistoryID/pageToken pair each page of a multi-page poll was called
+/// with (regression coverage for the fix that keeps startHistoryID fixed
+/// across pagination; see HistoryTests).
+struct HistoryCall: Equatable {
+    let startHistoryID: String
+    let pageToken: String?
+}
+
 /// Scriptable in-memory Gmail for SyncEngine tests: serves canned list pages,
 /// messages, and history pages; records every call.
 actor ScriptedGmail: GmailAPI {
@@ -12,6 +21,8 @@ actor ScriptedGmail: GmailAPI {
     /// When set, listHistory throws this (e.g. 404 expiry) instead of serving.
     var historyError: GmailError?
     private(set) var calls: [String] = []
+    /// Every `listHistory` call, in order — see `HistoryCall`.
+    private(set) var historyCalls: [HistoryCall] = []
 
     init(
         profile: Profile = Profile(
@@ -49,6 +60,7 @@ actor ScriptedGmail: GmailAPI {
 
     func listHistory(startHistoryID: String, pageToken: String?) async throws -> HistoryPage {
         calls.append("history:\(startHistoryID)")
+        historyCalls.append(HistoryCall(startHistoryID: startHistoryID, pageToken: pageToken))
         if let historyError { throw historyError }
         guard !historyPages.isEmpty else {
             return HistoryPage(history: nil, nextPageToken: nil, historyId: startHistoryID)

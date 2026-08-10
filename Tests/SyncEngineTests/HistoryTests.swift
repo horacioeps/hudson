@@ -58,6 +58,50 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
     #expect(account.backfillState != "complete")  // re-list scheduled
 }
 
+@Test func startHistoryIDStaysFixedAcrossMultiPagePoll() async throws {
+    // Regression: pollHistory must NOT mutate its startHistoryID between
+    // pages of the same pass. Gmail page tokens continue the listing they
+    // were created by, so pairing "p2" with a startHistoryId that changed
+    // since page 1 is undefined — `start` must stay the pass's original
+    // cursor ("100" here) for every page.
+    let (gmail, database, engine) = try await makeSyncedWorld()
+    await gmail.setHistory([
+        historyPage("""
+            {"historyId": "110", "nextPageToken": "p2", "history": [
+              {"id": "105", "messagesAdded": [{"message":
+                {"id": "m1", "threadId": "t1", "historyId": "105",
+                 "internalDate": "1000", "labelIds": ["INBOX"], "snippet": "sn",
+                 "payload": {"headers": [{"name": "Subject", "value": "s"}]}}}]}
+            ]}
+            """),
+        historyPage("""
+            {"historyId": "120", "history": [
+              {"id": "118", "messagesAdded": [{"message":
+                {"id": "m2", "threadId": "t2", "historyId": "118",
+                 "internalDate": "2000", "labelIds": ["INBOX"], "snippet": "sn2",
+                 "payload": {"headers": [{"name": "Subject", "value": "s2"}]}}}]}
+            ]}
+            """),
+    ])
+    let report = try await engine.syncOnce()
+    #expect(report.eventsApplied == 2)
+
+    // makeSyncedWorld's own pass already made one listHistory call; this
+    // pass's two page calls are the last two recorded.
+    let calls = await gmail.historyCalls
+    let thisPassCalls = Array(calls.suffix(2))
+    #expect(thisPassCalls[0] == HistoryCall(startHistoryID: "100", pageToken: nil))
+    // The regression itself: page 2's call still carries the ORIGINAL cursor
+    // ("100"), not the mutated cursor ("110") page 1's applyHistory advanced
+    // the store to.
+    #expect(thisPassCalls[1] == HistoryCall(startHistoryID: "100", pageToken: "p2"))
+
+    // Per-page cursor commit still works: the store ends up on page 2's
+    // historyId, not the fixed `start`.
+    let account = try #require(try await database.primaryAccount())
+    #expect(account.historyCursor == 120)
+}
+
 @Test func hydrationGet404IsSkippedNotTreatedAsExpiry() async throws {
     // A message can vanish between a history event and our follow-up
     // hydration get for an unknown id — a normal race, not a sign the
