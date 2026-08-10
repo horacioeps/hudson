@@ -224,6 +224,88 @@ private final class StatementCounter: @unchecked Sendable {
     #expect(elapsed < .seconds(5))
 }
 
+// MARK: - Fix wave 2: batch-deduped .labels/.deleted rollup recomputes
+
+@Test func batchOfLabelEventsOnOneLargeThreadStaysBoundedNotQuadratic() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let messageCount = 1500
+    // Only the VERY LAST message (by internal_date, the end of the indexed
+    // scan `recomputeThreadFlags`'s EXISTS query walks) carries UNREAD/
+    // INBOX — every other message carries neither. This forces the
+    // per-thread EXISTS scan to walk (nearly) the whole thread to resolve
+    // on every call, so an inline per-event recompute (the pre-fix
+    // behavior) pays that near-full scan `eventCount` times.
+    var snapshots: [MessageSnapshot] = []
+    for i in 1...messageCount {
+        let labels = (i == messageCount) ? ["INBOX", "UNREAD"] : []
+        snapshots.append(snap("m\(i)", date: Int64(i), labels: labels))
+    }
+    _ = try await db.applySnapshots(snapshots, account: "x")
+
+    let eventCount = 400
+    // K `.labels` events, all touching the SAME thread (different early
+    // messages, each just re-affirming its already-empty label set at a
+    // higher historyID) — ONE batch, ONE `applyHistoryChanges` call.
+    let changes = (1...eventCount).map { i in
+        HistoryChange(kind: .labels(id: "m\(i)", historyID: Int64(i) + 10_000, labelIDs: []))
+    }
+
+    let counter = StatementCounter()
+    try await db.writer.write { conn in
+        conn.trace { _ in counter.increment() }
+    }
+    let start = ContinuousClock.now
+    _ = try await db.applyHistoryChanges(changes, account: "x")
+    let elapsed = start.duration(to: .now)
+
+    // Regression guard: per-event inline recompute (pre-fix) runs
+    // `recomputeThreadFlags` `eventCount` times, each a near-full-thread
+    // scan — O(eventCount * messageCount), which blows past both bounds
+    // below at this thread size. The fix defers to ONE recompute after the
+    // loop — O(messageCount + eventCount) total, well within both.
+    #expect(elapsed < .seconds(3))
+    #expect(counter.count < eventCount * 25)
+
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.unread == true)
+    #expect(row.inInbox == true)
+}
+
+@Test func batchOfDeleteEventsOnOneLargeThreadStaysBoundedNotQuadratic() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let messageCount = 1500
+    var snapshots: [MessageSnapshot] = []
+    for i in 1...messageCount {
+        snapshots.append(
+            snap("m\(i)", date: Int64(i), labels: ["INBOX"], fromLine: "sender\(i)@x.com"))
+    }
+    _ = try await db.applySnapshots(snapshots, account: "x")
+
+    let eventCount = 60
+    // Delete the oldest `eventCount` messages in ONE batch. Per-event
+    // inline recompute (pre-fix) runs the HEAVY full
+    // `recomputeThreadRollup` (survivor from_line fetch + Swift-side
+    // dedup over up to `messageCount` rows) once PER event — O(eventCount
+    // * messageCount). Distinct `fromLine`s per message (above) mean this
+    // Swift dedup loop can't short-circuit early. The fix defers to ONE
+    // rebuild after the loop — O(messageCount + eventCount).
+    let changes = (1...eventCount).map { i in HistoryChange(kind: .deleted(id: "m\(i)")) }
+
+    let counter = StatementCounter()
+    try await db.writer.write { conn in
+        conn.trace { _ in counter.increment() }
+    }
+    let start = ContinuousClock.now
+    _ = try await db.applyHistoryChanges(changes, account: "x")
+    let elapsed = start.duration(to: .now)
+
+    #expect(elapsed < .seconds(3))
+    #expect(counter.count < eventCount * 25)
+
+    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
+    #expect(row.messageCount == messageCount - eventCount)
+}
+
 // MARK: - Task 9b: from_summary (sender display names, append-dedup)
 
 @Test func senderDisplayNameExtractsDisplayNameOrLocalPart() {

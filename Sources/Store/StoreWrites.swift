@@ -113,13 +113,21 @@ extension HudsonDatabase {
             // Loaded once per page, same rationale as `applySnapshots` —
             // shared by every `.added` change below.
             let splitRules = try SplitInbox.fetchRules(account: account, db: db)
-            // Same batch-dedup as `applySnapshots` — see its comment. Only
-            // `.added` updates (wasInsert == false) go in this set; `.added`
-            // inserts take `maintainRollup`'s O(1) OR-merge path and never
-            // need a recompute, and `.labels` events' unread/in_inbox
-            // recompute immediately per-event below (cheap and idempotent,
-            // so there's nothing to dedup there — see `recomputeThreadFlags`).
-            var updatedThreadIDs = Set<String>()
+            // Same batch-dedup as `applySnapshots` — see its comment.
+            // `.added` updates (wasInsert == false) AND `.labels` events
+            // both need `recomputeThreadFlags` (unread/in_inbox can only be
+            // LOWERED by that bounded per-thread recompute — never by
+            // `maintainRollup`'s insert-only OR-merge), so they share this
+            // ONE set: `recomputeThreadFlags` is idempotent, so a thread
+            // touched by both still gets recomputed exactly once, post-loop,
+            // instead of once per `.labels` event (Fix wave 2 — a thread
+            // with K label events in one batch previously recomputed K
+            // times, each a bounded-but-real scan of that thread's M
+            // messages, i.e. O(K×M) for the batch; deferred+deduped here
+            // like `.added` already was). `.added` inserts take
+            // `maintainRollup`'s O(1) OR-merge path and never enter this
+            // set at all.
+            var flagsRecomputeThreadIDs = Set<String>()
             // `.labels` events' split/category refresh IS deduped, unlike
             // unread/in_inbox above: a thread with several `.labels` events
             // in one batch (all touching the same thread) would otherwise
@@ -127,23 +135,36 @@ extension HudsonDatabase {
             // of once for the batch. Collected here, applied once per
             // unique thread after the loop — see `recomputeThreadSplit`.
             var splitRefreshThreadIDs = Set<String>()
+            // `.deleted` events' rollup rebuild — kept in its OWN set,
+            // separate from `flagsRecomputeThreadIDs`/`splitRefreshThreadIDs`
+            // above, because `recomputeThreadRollup` is a strictly HEAVIER,
+            // superseding recompute (full survivor from_line fetch + Swift
+            // dedup, count/newest re-derivation — not just unread/in_inbox
+            // or split/category). Deferred and deduped for the identical
+            // reason: K deletes on one large thread previously ran this
+            // heavy rebuild K times inline — O(K×M) for the batch, and the
+            // heaviest of the three (this is the one that blocks triage
+            // inside the write transaction against the 5s busy timeout).
+            // Reconciled against the two lighter sets after the loop below.
+            var deletedThreadIDs = Set<String>()
             for change in changes {
                 switch change.kind {
                 case .added(let snapshot):
                     let result = try Self.applySnapshotInTransaction(
                         snapshot, account: account, db: db, splitRules: splitRules)
                     if result.outcome == .applied && !result.wasInsert {
-                        updatedThreadIDs.insert(snapshot.threadID)
+                        flagsRecomputeThreadIDs.insert(snapshot.threadID)
                     }
                 case .deleted(let id):
                     // thread_id fetched BEFORE the delete — needed to
                     // rebuild (or drop) that thread's rollup row afterward.
                     // A deletion isn't expressible as an incremental delta
                     // (count must drop, and the deleted message may have
-                    // been the thread's newest), so this calls the full
-                    // per-thread rebuild rather than `maintainRollup`.
-                    // `AIArtifacts.purge` below (Task 8) purges any cached
-                    // AI artifact this message fed, in the same transaction.
+                    // been the thread's newest), so this thread is queued
+                    // for the full per-thread rebuild post-loop rather than
+                    // `maintainRollup`. `AIArtifacts.purge` below (Task 8)
+                    // purges any cached AI artifact this message fed, in
+                    // the same transaction.
                     let threadID = try String.fetchOne(
                         db,
                         sql: "SELECT thread_id FROM messages WHERE account_email = ? AND id = ?",
@@ -157,7 +178,7 @@ extension HudsonDatabase {
                     try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
                     try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
                     if let threadID {
-                        try ThreadRollup.recomputeThreadRollup(threadID: threadID, account: account, db: db)
+                        deletedThreadIDs.insert(threadID)
                     }
                 case .labels(let id, let historyID, let labelIDs):
                     let exists = try Bool.fetchOne(
@@ -192,15 +213,36 @@ extension HudsonDatabase {
                     // A label-only event can LOWER unread/in_inbox (e.g. the
                     // thread's last unread message just got marked read) —
                     // maintainRollup's insert-time OR-merge can't do that, so
-                    // this targeted, bounded (one thread) recompute is what
-                    // makes the drop visible.
+                    // this thread is queued for a targeted, bounded (one
+                    // thread) recompute post-loop — see
+                    // `flagsRecomputeThreadIDs`'s doc comment above for why
+                    // this no longer runs inline here.
                     if let threadID: String = messageRow?["thread_id"] {
-                        try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
+                        flagsRecomputeThreadIDs.insert(threadID)
                         splitRefreshThreadIDs.insert(threadID)
                     }
                 }
             }
-            for threadID in updatedThreadIDs {
+            // `.deleted`'s full rebuild (queued in `deletedThreadIDs`)
+            // re-derives unread/in_inbox AND split_key/category from
+            // scratch, so it supersedes a flags-only or split-only
+            // recompute for the SAME thread — drop those threads from the
+            // two lighter sets so each thread gets exactly ONE authoritative
+            // post-loop recompute, never two. Safe regardless of event
+            // order within the batch: every message/label write above ran
+            // inline, in order, so by the time any of these post-loop
+            // recomputes run, all three see that thread's fully up-to-date
+            // messages/labels — only the ROLLUP recompute itself was
+            // deferred.
+            for threadID in deletedThreadIDs {
+                flagsRecomputeThreadIDs.remove(threadID)
+                splitRefreshThreadIDs.remove(threadID)
+            }
+            for threadID in deletedThreadIDs {
+                try ThreadRollup.recomputeThreadRollup(
+                    threadID: threadID, account: account, db: db, rules: splitRules)
+            }
+            for threadID in flagsRecomputeThreadIDs {
                 try ThreadRollup.recomputeThreadFlags(threadID: threadID, account: account, db: db)
             }
             for threadID in splitRefreshThreadIDs {
