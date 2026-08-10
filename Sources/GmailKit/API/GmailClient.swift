@@ -35,7 +35,9 @@ public struct GmailClient: Sendable {
     // MARK: - Request core
 
     /// template is what gets logged (never the actual path — ids in paths would violate spec §9.1); path is what gets requested.
-    private func get<Response: Decodable>(
+    /// `internal` (not `private`) so extensions in other files within GmailKit — e.g. `MessageEndpoints`, added
+    /// starting M2 — can add methods without touching this retry core, per the type's doc comment above.
+    func get<Response: Decodable>(
         template: String, path: String, query: [URLQueryItem] = [], cost: Int
     ) async throws -> Response {
         try await quota.acquire(cost: cost)

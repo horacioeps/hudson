@@ -1,0 +1,20 @@
+{
+  "id": "18f0a",
+  "threadId": "18f00",
+  "historyId": "4711",
+  "internalDate": "1754820000000",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "hello plain",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {"name": "From", "value": "Ada <ada@example.com>"},
+      {"name": "To", "value": "you@example.com"},
+      {"name": "Subject", "value": "Test message"}
+    ],
+    "parts": [
+      {"mimeType": "text/plain", "body": {"data": "aGVsbG8gcGxhaW4", "size": 11}},
+      {"mimeType": "text/html", "body": {"data": "PGI-aHRtbDwvYj4", "size": 11}}
+    ]
+  }
+}
