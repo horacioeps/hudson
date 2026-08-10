@@ -50,10 +50,24 @@ extension HudsonDatabase {
 
     static func messageRow(from raw: Row, account: String, db: Database) throws -> MessageRow {
         let id: String = raw["id"]
+        // Effective labels = (canonical ∪ pending adds) − pending removes.
         let labels = try String.fetchAll(
             db,
-            sql: "SELECT label_id FROM message_labels WHERE account_email = ? AND message_id = ? ORDER BY label_id",
-            arguments: [account, id])
+            sql: """
+                SELECT label_id FROM (
+                    SELECT label_id FROM message_labels
+                    WHERE account_email = :acct AND message_id = :mid
+                    UNION
+                    SELECT label_id FROM mutation_queue
+                    WHERE account_email = :acct AND message_id = :mid AND op = 'add'
+                ) AS present
+                WHERE label_id NOT IN (
+                    SELECT label_id FROM mutation_queue
+                    WHERE account_email = :acct AND message_id = :mid AND op = 'remove'
+                )
+                ORDER BY label_id
+                """,
+            arguments: ["acct": account, "mid": id])
         return MessageRow(
             id: id, threadID: raw["thread_id"], historyID: raw["history_id"],
             internalDate: raw["internal_date"], fromLine: raw["from_line"],
