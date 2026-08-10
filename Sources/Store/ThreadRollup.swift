@@ -37,14 +37,22 @@ enum ThreadRollup {
     ///   bounded `recomputeThreadFlags` instead — called by
     ///   `applyHistoryChanges`'s `.labels` branch for every label-only
     ///   event, which is exactly where a flag needs to be able to fall.
-    /// - `has_attachment` (Task 5) mirrors `subject`/`snippet`: overwritten
-    ///   only when this snapshot is at least tied for newest, but always to
-    ///   `0` — a bare `MessageSnapshot` never carries attachment info (only
-    ///   `format: "full"` body hydration observes it, via `saveBody` →
-    ///   `maintainHasAttachment`). This deliberately resets the flag to
-    ///   "unknown" whenever a not-yet-hydrated message becomes the thread's
-    ///   newest, rather than leaking the PREVIOUS newest message's flag
-    ///   forward onto a message it no longer describes.
+    /// - `has_attachment` (Task 5) is NOT snapshot-stable the way
+    ///   `subject`/`snippet` are — a bare `MessageSnapshot` never carries
+    ///   attachment info, so this path always writes a literal `0`
+    ///   (`excluded.has_attachment`) rather than the message's real value
+    ///   (only `format: "full"` body hydration knows that, via `saveBody`
+    ///   → `maintainHasAttachment`). That makes the tied-or-newer check
+    ///   `subject`/`snippet` use UNSAFE here on its own: re-applying an
+    ///   already-hydrated newest message as an UPDATE (a routine label
+    ///   change, a duplicate history event, a stale-historyId resync) ties
+    ///   on the newest-check and would silently blow the real `true` back
+    ///   to `0` with no self-heal (`messageIDsNeedingBodies` never
+    ///   re-selects an already-hydrated message). So — like `unread`/
+    ///   `in_inbox` below — this is additionally gated on `:was_insert`:
+    ///   only a genuinely NEW newest message (insert) gets to reset the
+    ///   flag to "unknown, pending hydration"; an update never touches it.
+    ///   Fix round 1 (reviewer-caught Critical).
     static func maintainRollup(
         afterApplying snapshot: MessageSnapshot, wasInsert: Bool, account: String, db: Database
     ) throws {
@@ -77,7 +85,7 @@ enum ThreadRollup {
                             IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.snippet ELSE thread_rollup.snippet END,
                     has_attachment = CASE
-                        WHEN (excluded.last_message_at, excluded.last_message_id) >= (
+                        WHEN :was_insert AND (excluded.last_message_at, excluded.last_message_id) >= (
                             IFNULL(thread_rollup.last_message_at, excluded.last_message_at),
                             IFNULL(thread_rollup.last_message_id, excluded.last_message_id))
                         THEN excluded.has_attachment ELSE thread_rollup.has_attachment END,

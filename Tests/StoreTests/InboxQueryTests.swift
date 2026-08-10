@@ -179,3 +179,31 @@ private func snap(
     _ = try await db.applySnapshot(snap("m2", thread: "t1", date: 200), account: "x")
     #expect(try await db.inboxThreads(account: "x", split: nil, limit: 10).first?.hasAttachment == false)
 }
+
+@Test func reapplyingTheSameHydratedNewestMessageAsAnUpdatePreservesHasAttachment() async throws {
+    // Regression for review fix round 1's Critical: `maintainRollup`'s
+    // `has_attachment` CASE originally fired on ANY tied-or-newer snapshot
+    // (the same unguarded check `subject`/`snippet` safely use, since
+    // those ARE snapshot-stable). But `maintainRollup` always writes a
+    // literal `has_attachment = 0` — a bare `MessageSnapshot` never
+    // carries the real value — so re-applying the SAME already-hydrated
+    // newest message as an UPDATE (`wasInsert == false`: a routine label
+    // change, a duplicate history event, or a stale-historyId resync)
+    // ties on the newest-check and silently blew the true `true` back to
+    // `false`, PERMANENTLY (no self-heal: `messageIDsNeedingBodies` never
+    // re-selects an already-hydrated message). A distinct-id (m1 -> m2)
+    // test — see the sibling test above — can't catch this: it has to be
+    // the SAME id, re-applied, that ties against itself.
+    let db = try HudsonDatabase.inMemory()
+    _ = try await db.applySnapshot(snap("m1", thread: "t1", date: 100), account: "x")
+    try await db.saveBody(
+        messageID: "m1", account: "x", body: Sanitizer.sanitize(html: nil, plainText: "hi"),
+        attachments: [AttachmentMeta(id: "A1", filename: "a.pdf", mimeType: "application/pdf", size: 10)])
+    #expect(try await db.inboxThreads(account: "x", split: nil, limit: 10).first?.hasAttachment == true)
+
+    // Re-apply the identical snapshot (same id, same date) — a routine
+    // label-change/duplicate-event/resync re-apply, wasInsert == false.
+    _ = try await db.applySnapshot(snap("m1", thread: "t1", date: 100), account: "x")
+
+    #expect(try await db.inboxThreads(account: "x", split: nil, limit: 10).first?.hasAttachment == true)
+}
