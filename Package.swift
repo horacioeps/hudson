@@ -23,6 +23,7 @@ let package = Package(
                 "GmailKit",
                 "Store",
                 "SyncEngine",
+                "AIKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -33,7 +34,7 @@ let package = Package(
         ),
         .target(name: "Store", dependencies: [.product(name: "GRDB", package: "GRDB.swift")]),
         .testTarget(name: "StoreTests", dependencies: ["Store"]),
-        .testTarget(name: "HudsonCLITests", dependencies: ["HudsonCLI"]),
+        .testTarget(name: "HudsonCLITests", dependencies: ["HudsonCLI", "AIKit"]),
         .target(name: "SyncEngine", dependencies: ["GmailKit", "Store"]),
         .testTarget(name: "SyncEngineTests", dependencies: ["SyncEngine"]),
         .target(
