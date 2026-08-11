@@ -62,7 +62,13 @@ import Testing
     try await Task.sleep(for: .milliseconds(50))
 
     model.openThread("t01")
-    try await Task.sleep(for: .milliseconds(50))
+
+    // `openThread` sets `selectedThreadID` synchronously but `ThreadModel`
+    // loads the thread asynchronously — poll for the subject to land rather
+    // than guessing a fixed sleep (the 50ms flake this replaces).
+    for _ in 0..<80 where model.thread.subject.isEmpty {
+        try await Task.sleep(for: .milliseconds(25))
+    }
 
     #expect(model.inbox.selectedThreadID == "t01")
     #expect(model.thread.subject == "Re: Dinner Friday?")
