@@ -33,10 +33,25 @@ public struct SSEEvent: Sendable, Equatable {
 /// spec, which is how a keepalive never surfaces as a bogus empty event.
 public enum SSEFraming {
     public static func frame(_ buffer: Data) -> (events: [SSEEvent], remainder: Data) {
+        // Strip \r bytes BEFORE decoding to String/Substring. Swift's
+        // String/Substring model "\r\n" as a SINGLE extended grapheme
+        // cluster (one `Character`), not two — so a `Substring` search for
+        // the two-LF blank-line separator ("\n\n") can never match text
+        // where a `\r` sits directly before a `\n` (i.e. any `\r\n\r\n` or
+        // `\r\n\n` separator): the `\r` fuses with the following `\n` into
+        // one Character, so two adjacent bare "\n" Characters never appear
+        // and the block silently never frames. Removing every `\r` byte on
+        // the raw buffer, before any grapheme-cluster-based text operation
+        // runs, sidesteps that entirely and makes this framer's claimed
+        // CR/LF tolerance real. SSE only ever emits `\r` immediately before
+        // `\n` (never as a standalone line terminator), so dropping the
+        // byte outright is equivalent to normalizing `\r\n` -> `\n` for all
+        // real provider/proxy traffic.
+        let normalized = strippingCarriageReturns(buffer)
         // SSE bodies from both providers are UTF-8 JSON, so decoding the
         // buffer once up front (rather than re-decoding per line) keeps this
         // a single linear pass over the text.
-        let text = String(decoding: buffer, as: UTF8.self)
+        let text = String(decoding: normalized, as: UTF8.self)
         var events: [SSEEvent] = []
         var rest = Substring(text)
         while let separatorRange = rest.range(of: "\n\n") {
@@ -49,19 +64,26 @@ public enum SSEFraming {
         return (events, Data(rest.utf8))
     }
 
+    /// Drops every `\r` (0x0D) byte from `buffer`. See the WHY-comment in
+    /// `frame(_:)` for why this must happen on raw bytes, before any
+    /// `String`/`Substring` view of the data exists.
+    private static func strippingCarriageReturns(_ buffer: Data) -> Data {
+        guard buffer.contains(0x0D) else { return buffer }
+        return Data(buffer.filter { $0 != 0x0D })
+    }
+
     /// Parses one blank-line-delimited block into an `SSEEvent`. Lines are
     /// `field: value`; fields Hudson's providers don't need (`id:`,
     /// `retry:`, ...) and comment lines (leading `:`) are ignored. A block
     /// with no `data:` line at all (pure comment/keepalive, or a stray blank
     /// block) parses to `nil` so it never dispatches.
+    ///
+    /// `block` has already had every `\r` byte stripped by `frame(_:)`
+    /// before this runs, so lines never carry a trailing `\r` here.
     private static func parse(block: Substring) -> SSEEvent? {
         var eventName: String?
         var dataLines: [Substring] = []
-        for rawLine in block.split(separator: "\n", omittingEmptySubsequences: false) {
-            // Tolerate a trailing \r per line in case a proxy rewrites \n to
-            // \r\n for individual lines while the blank-line separator
-            // itself stays \n\n.
-            let line = rawLine.hasSuffix("\r") ? rawLine.dropLast() : rawLine
+        for line in block.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.isEmpty || line.hasPrefix(":") { continue }
             if let value = fieldValue("event:", in: line) {
                 eventName = String(value)
@@ -109,7 +131,21 @@ public struct URLSessionLLMHTTP: LLMHTTP {
     public init() {}
 
     public func stream(_ request: URLRequest) async throws -> AsyncThrowingStream<Data, Error> {
-        let (byteStream, response) = try await URLSession.shared.bytes(for: request)
+        let byteStream: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (byteStream, response) = try await URLSession.shared.bytes(for: request)
+        } catch let error as AIError {
+            // Already the right type (shouldn't happen from URLSession, but
+            // keeps this rethrow exhaustive/future-proof).
+            throw error
+        } catch {
+            // Mirrors GmailKit's `URLSessionTransport.send`: a raw
+            // `URLError` (no connection, DNS failure, TLS failure, timeout,
+            // ...) must never escape untyped — `AIError`'s doc comment
+            // promises callers can switch over it exhaustively.
+            throw AIError.transport(error.localizedDescription)
+        }
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AIError.transport("Response was not HTTP.")
         }
@@ -117,7 +153,19 @@ public struct URLSessionLLMHTTP: LLMHTTP {
             throw AIError.httpStatus(httpResponse.statusCode)
         }
 
-        return AsyncThrowingStream { continuation in
+        return Self.frameEvents(from: byteStream)
+    }
+
+    /// Drives the byte-by-byte SSE framing loop over any `UInt8` async
+    /// sequence — extracted out of `stream(_:)` so this trigger/flush logic
+    /// (the actual byte-driven behavior that ships, as opposed to the pure
+    /// `SSEFraming.frame` it calls) can be driven directly on an in-memory
+    /// fixture sequence in tests, with no real socket or `URLProtocol`
+    /// double required.
+    static func frameEvents<Bytes: AsyncSequence & Sendable>(
+        from byteStream: Bytes
+    ) -> AsyncThrowingStream<Data, Error> where Bytes.Element == UInt8 {
+        AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     var buffer = Data()
@@ -143,15 +191,33 @@ public struct URLSessionLLMHTTP: LLMHTTP {
                         previousByte = byte
                     }
                     // The connection can close without a final trailing
-                    // blank line; flush whatever complete event(s) remain in
-                    // the buffer rather than silently dropping the last one.
-                    let (events, _) = SSEFraming.frame(buffer)
-                    for event in events {
-                        continuation.yield(Data(event.data.utf8))
+                    // blank line (EOF, reset, or truncation right after a
+                    // `data:` line — no more bytes ever arrive to complete
+                    // the \n\n separator the loop above waits for).
+                    // `SSEFraming.frame` requires a LITERAL \n\n to
+                    // recognize a block, so without this, any non-empty
+                    // leftover `buffer` would be silently discarded as
+                    // `remainder` and never dispatched — the exact "last
+                    // event silently dropped" bug this comment used to only
+                    // describe rather than prevent. Appending a synthetic
+                    // terminator makes a dangling-but-otherwise-complete
+                    // block still frame and flush like any other.
+                    if !buffer.isEmpty {
+                        buffer.append(contentsOf: [0x0A, 0x0A])
+                        let (events, _) = SSEFraming.frame(buffer)
+                        for event in events {
+                            continuation.yield(Data(event.data.utf8))
+                        }
                     }
                     continuation.finish()
-                } catch {
+                } catch let error as AIError {
                     continuation.finish(throwing: error)
+                } catch {
+                    // Same rewrap as the initial `bytes(for:)` call above:
+                    // a raw `URLError` from mid-stream iteration (dropped
+                    // connection, reset, timeout) must surface as a typed
+                    // `AIError`, not escape untyped.
+                    continuation.finish(throwing: AIError.transport(error.localizedDescription))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }

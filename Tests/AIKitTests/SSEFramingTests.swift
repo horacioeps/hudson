@@ -167,3 +167,76 @@ import Testing
     #expect(events.isEmpty)
     #expect(remainder.isEmpty)
 }
+
+// MARK: - CR/LF tolerance (\r\n line endings)
+
+/// The exact repro from the CR/LF-dead-code review finding: an `event:` +
+/// `data:` block whose LINES are `\r\n`-terminated but whose blank-line
+/// separator is a bare `\n\n` (mixed line endings, as a proxy that rewrites
+/// only the separator might produce). Pre-fix, this returned `events == []`
+/// forever: the `\r` immediately before the separator's first `\n` fused
+/// into one grapheme cluster in the `Substring` search, so `"\n\n"` never
+/// matched and the buffer never drained. Also proves the parsed `data`
+/// value is `"bar"`, not `"bar\r"` — the per-line CR has to come off too.
+@Test func stripsPerLineCarriageReturnBeforeBareLFSeparator() {
+    let buffer = Data("event: foo\r\ndata: bar\r\n\n".utf8)
+
+    let (events, remainder) = SSEFraming.frame(buffer)
+
+    #expect(events == [SSEEvent(event: "foo", data: "bar")])
+    #expect(remainder.isEmpty)
+}
+
+/// The full CRLF case: EVERY line ending, including the blank-line
+/// separator itself, is `\r\n` (`\r\n\r\n`) — how a strictly RFC-compliant
+/// CRLF-only HTTP server frames SSE. Pre-fix, the separator search for
+/// `"\n\n"` never matched at all (the `\r` before each `\n` fuses into one
+/// grapheme cluster), so this buffer would silently accumulate forever with
+/// zero events and a non-empty, never-draining remainder.
+@Test func framesEventWhoseSeparatorIsFullCRLFCRLF() {
+    let buffer = Data("event: content_block_delta\r\ndata: {\"text\":\"hi\"}\r\n\r\n".utf8)
+
+    let (events, remainder) = SSEFraming.frame(buffer)
+
+    #expect(events == [SSEEvent(event: "content_block_delta", data: "{\"text\":\"hi\"}")])
+    #expect(remainder.isEmpty)
+}
+
+/// Multiple full-CRLF events back to back frame in order, proving the fix
+/// holds across repeated separators, not just a single trailing one.
+@Test func framesMultipleFullCRLFEventsInOrder() {
+    let buffer = Data(
+        "data: one\r\n\r\ndata: two\r\n\r\ndata: three\r\n\r\n".utf8)
+
+    let (events, remainder) = SSEFraming.frame(buffer)
+
+    #expect(events == [
+        SSEEvent(event: nil, data: "one"),
+        SSEEvent(event: nil, data: "two"),
+        SSEEvent(event: nil, data: "three"),
+    ])
+    #expect(remainder.isEmpty)
+}
+
+/// A CRLF event split across two chunks — mirroring
+/// `reassemblesEventSplitAcrossTwoChunks` above but with `\r\n` line
+/// endings — must still reassemble once the remainder is threaded into the
+/// next call.
+@Test func reassemblesFullCRLFEventSplitAcrossTwoChunks() {
+    let full = "event: content_block_delta\r\ndata: {\"text\":\"hello world\"}\r\n\r\n"
+    let splitIndex = full.index(full.startIndex, offsetBy: 30) // inside the data JSON
+    let firstHalf = Data(full[full.startIndex..<splitIndex].utf8)
+    let secondHalf = Data(full[splitIndex...].utf8)
+
+    let (firstEvents, remainder) = SSEFraming.frame(firstHalf)
+    #expect(firstEvents.isEmpty)
+
+    var rejoined = remainder
+    rejoined.append(secondHalf)
+    let (events, finalRemainder) = SSEFraming.frame(rejoined)
+
+    #expect(events == [
+        SSEEvent(event: "content_block_delta", data: "{\"text\":\"hello world\"}"),
+    ])
+    #expect(finalRemainder.isEmpty)
+}
