@@ -10,6 +10,12 @@ import Testing
     let engine = SyncEngine(api: gmail, database: db, account: "x")
     _ = try await engine.syncOnce()  // seeds cursor 100 (default profile), empty backfill
 
+    // Both new ids arrive as minimal history stubs; the engine reconciles each
+    // with a metadata get, so both must be served.
+    await gmail.setMessages([
+        "m1": testMessage(id: "m1", historyID: "110", labels: ["INBOX"]),
+        "m2": testMessage(id: "m2", historyID: "120", labels: ["INBOX"]),
+    ])
     // Two-page history poll: page 1 has nextPageToken, page 2 finishes; both carry historyId 130.
     await gmail.setHistory([
         historyPage(#"{"historyId":"130","nextPageToken":"p2","history":[{"id":"110","messagesAdded":[{"message":{"id":"m1","threadId":"t","historyId":"110","internalDate":"1","labelIds":["INBOX"],"snippet":"s","payload":{"headers":[{"name":"Subject","value":"a"}]}}}]}]}"#),
@@ -71,6 +77,14 @@ private actor CrashingAfterNthHistoryCall: GmailAPI {
     let seedEngine = SyncEngine(api: gmail, database: db, account: "x")
     _ = try await seedEngine.syncOnce()  // seeds cursor 100, empty backfill
 
+    // Page 1's m1 arrives as a minimal stub, reconciled via a metadata get on
+    // `gmail` (the crashing wrapper forwards getMessage to it). m2 is on page 2,
+    // which the crash prevents from ever being fetched — registered anyway so
+    // the mock stays honest.
+    await gmail.setMessages([
+        "m1": testMessage(id: "m1", historyID: "110", labels: ["INBOX"]),
+        "m2": testMessage(id: "m2", historyID: "120", labels: ["INBOX"]),
+    ])
     await gmail.setHistory([
         historyPage(#"{"historyId":"130","nextPageToken":"p2","history":[{"id":"110","messagesAdded":[{"message":{"id":"m1","threadId":"t","historyId":"110","internalDate":"1","labelIds":["INBOX"],"snippet":"s","payload":{"headers":[{"name":"Subject","value":"a"}]}}}]}]}"#),
         historyPage(#"{"historyId":"130","history":[{"id":"120","messagesAdded":[{"message":{"id":"m2","threadId":"t","historyId":"120","internalDate":"2","labelIds":["INBOX"],"snippet":"s","payload":{"headers":[{"name":"Subject","value":"b"}]}}}]}]}"#),

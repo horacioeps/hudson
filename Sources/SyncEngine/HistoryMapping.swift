@@ -9,19 +9,21 @@ enum HistoryMapping {
         var changes: [HistoryChange] = []
         for record in records {
             let version = Int64(record.id) ?? 0
-            for added in record.messagesAdded ?? [] {
-                if let snapshot = SnapshotMapping.snapshot(from: added.message) {
-                    changes.append(HistoryChange(kind: .added(snapshot)))
-                }
-            }
-            for change in (record.labelsAdded ?? []) + (record.labelsRemoved ?? []) {
+            // Every history message reference is MINIMAL (id + the message's
+            // current labels — Gmail sends no content or per-message historyId
+            // here, see `HistoryMessageStub`). So a NEW message (`messagesAdded`)
+            // is emitted as a `.labels` change too: `applyHistoryChanges`
+            // reports it as an "unknown id", which `SyncEngine.pollHistory`
+            // then fetches in full via `getMessage`. That reconciliation is
+            // exactly why we don't (and can't) build a snapshot from the stub.
+            for change in (record.messagesAdded ?? [])
+                + (record.labelsAdded ?? []) + (record.labelsRemoved ?? [])
+            {
                 changes.append(HistoryChange(kind: .labels(
-                    id: change.message.id,
-                    historyID: version,
-                    labelIDs: change.message.labelIds ?? [])))
+                    id: change.id, historyID: version, labelIDs: change.labelIds ?? [])))
             }
             for deleted in record.messagesDeleted ?? [] {
-                changes.append(HistoryChange(kind: .deleted(id: deleted.message.id)))
+                changes.append(HistoryChange(kind: .deleted(id: deleted.id)))
             }
         }
         return changes

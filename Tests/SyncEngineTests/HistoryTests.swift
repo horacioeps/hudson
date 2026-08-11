@@ -15,6 +15,11 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
 
 @Test func historyEventsApplyInOrderAndAdvanceCursor() async throws {
     let (gmail, database, engine) = try await makeSyncedWorld()
+    // History nests only minimal stubs (id + current labels); the engine
+    // reconciles the new id "m1" with a metadata get. That get returns the
+    // message's CURRENT labels — [INBOX], i.e. with UNREAD already dropped by
+    // the later labelsRemoved event — so it must be served.
+    await gmail.setMessages(["m1": testMessage(id: "m1", historyID: "115", labels: ["INBOX"])])
     await gmail.setHistory([historyPage("""
         {"historyId": "120", "history": [
           {"id": "110", "messagesAdded": [{"message":
@@ -28,7 +33,7 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
     let report = try await engine.syncOnce()
     #expect(report.eventsApplied == 2)
     let row = try #require(try await database.recentMessages(account: "x", limit: 1).first)
-    #expect(row.labelIDs == ["INBOX"])  // UNREAD removed by the later event
+    #expect(row.labelIDs == ["INBOX"])  // reconciled to current labels: UNREAD gone
     let account = try #require(try await database.primaryAccount())
     #expect(account.historyCursor == 120)
 }
@@ -110,6 +115,12 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
     // fallback: it must not reset backfill, nor discard the cursor already
     // committed by this page's applyHistory call.
     let (gmail, database, engine) = try await makeSyncedWorld()
+    // Both ids arrive as minimal history stubs and are reconciled via a
+    // metadata get. "m1" is served so it materializes; "mGone" is deliberately
+    // NOT served, so its reconciliation get 404s — a message deleted before we
+    // could fetch it. That get-404 (unlike a listHistory-404) must not be
+    // mistaken for cursor expiry.
+    await gmail.setMessages(["m1": testMessage(id: "m1", historyID: "125", labels: ["INBOX"])])
     await gmail.setHistory([historyPage("""
         {"historyId": "130", "history": [
           {"id": "125", "messagesAdded": [{"message":
@@ -121,7 +132,7 @@ private func makeSyncedWorld() async throws -> (ScriptedGmail, HudsonDatabase, S
         ]}
         """)])
     // "mGone" is never registered in messagesByID, so ScriptedGmail.getMessage
-    // 404s for it, simulating a message deleted before hydration could run.
+    // 404s for it, simulating a message deleted before reconciliation could run.
     let report = try await engine.syncOnce()
     // Both of the page's changes counted as applied — the unknown-id
     // hydration 404 doesn't erase that.
