@@ -56,3 +56,58 @@ private func assertRendered(_ size: NSSize) {
     #expect(size.width > 0)
     #expect(size.height > 0)
 }
+
+/// `ThreadView` hosted against a real, opened, multi-message thread (`t01`
+/// from `DemoData` — three messages, newest expanded) — exercises the
+/// header, the AI-summary chip, both the expanded and collapsed message
+/// rendering paths, and the reply bar all in one seeded pass.
+@MainActor
+@Test func threadViewRendersWithSeededThread() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db)
+    let thread = ThreadModel(database: db, account: AppModel.demoAccount)
+    await thread.open(threadID: "t01")
+    try await Task.sleep(for: .milliseconds(50))
+
+    let view = ThreadView(thread: thread, onArchive: {}, onToggleStar: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 760, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `CommandPaletteView` hosted against a `CommandModel` reloaded with a
+/// selection present (so the triage commands — Archive/Star/Mark read — are
+/// included alongside Search/Snooze/switch-split), exercising every row
+/// kind's icon/subtitle/keycap rendering.
+@MainActor
+@Test func commandPaletteViewRendersWithSeededCommands() async throws {
+    let command = CommandModel()
+    command.reload(
+        splits: [SplitTab(key: "primary", title: "Primary", count: 10)], hasSelection: true)
+
+    let view = CommandPaletteView(command: command, perform: { _ in }, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 560, height: 480)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `SearchView` hosted against a `SearchModel` with a landed, non-empty
+/// result set — "den" matches `DemoData`'s Denver-itinerary thread (`t08`),
+/// mirroring `SearchModelTests.threeCharPrefixYieldsExpectedHitAfterDebounce`.
+@MainActor
+@Test func searchViewRendersWithSeededHits() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db)
+    let search = SearchModel(database: db, account: AppModel.demoAccount, debounce: .milliseconds(10))
+    search.query = "den"
+    search.queryChanged()
+    try await Task.sleep(for: .milliseconds(100))
+
+    let view = SearchView(search: search, onOpen: { _ in })
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 560, height: 480)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
