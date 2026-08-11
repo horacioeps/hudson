@@ -122,7 +122,7 @@ public final class AppModel {
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(
             database: database, account: email,
-            hydrateBody: Self.makeHydrateBody(database: database, account: account))
+            hydrateBody: Self.makeHydrateBody(database: database, account: account, store: self.tokenStore))
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.settings = SettingsModel(database: database, account: email)
@@ -156,7 +156,7 @@ public final class AppModel {
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(
             database: database, account: email,
-            hydrateBody: Self.makeHydrateBody(database: database, account: account))
+            hydrateBody: Self.makeHydrateBody(database: database, account: account, store: self.tokenStore))
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.settings = SettingsModel(database: database, account: email)
@@ -203,13 +203,20 @@ public final class AppModel {
     }
 
     /// `ThreadModel`'s on-demand body-fetch closure (Task: reading-pane
-    /// on-demand hydration) — thin passthrough to
-    /// `SyncBootstrap.makeHydrator`, which does the actual Keychain ->
+    /// on-demand hydration) — thin passthrough to a `LazyHydrator` (below),
+    /// which defers `SyncBootstrap.makeHydrator`'s actual Keychain ->
     /// OAuthClient -> GmailClient -> SyncEngine wiring (see its doc
-    /// comment) and builds that stack exactly ONCE, capturing it in the
-    /// returned closure. Kept here, rather than inlined at each of the two
-    /// `ThreadModel(...)` call sites above, purely to avoid repeating the
-    /// `account.flatMap { ... }` unwrap twice.
+    /// comment) to the FIRST on-demand fetch a reading pane actually
+    /// triggers, rather than building it eagerly here during `AppModel`
+    /// init — see `LazyHydrator`'s doc comment for why. Kept here, rather
+    /// than inlined at each of the two `ThreadModel(...)` call sites
+    /// above, purely to avoid repeating the `account.flatMap { ... }`
+    /// unwrap twice.
+    ///
+    /// `store` is always THIS `AppModel`'s own resolved `tokenStore` (never
+    /// a fresh default) — passing it through is what lets a test's injected
+    /// `InMemoryTokenStore` actually reach the hydrator instead of a real
+    /// `KeychainTokenStore()` silently taking over underneath it.
     ///
     /// `nil` account (no connected account — matches `accountEmail`'s own
     /// "no account yet" contract) means `nil` here too: there's no
@@ -219,10 +226,11 @@ public final class AppModel {
     /// no stored Keychain credentials (the `--demo` mailbox, or any first
     /// launch before `hudson auth`).
     private static func makeHydrateBody(
-        database: HudsonDatabase, account: AccountRecord?
+        database: HudsonDatabase, account: AccountRecord?, store: any TokenStore
     ) -> (@Sendable (String) async -> Bool)? {
         guard let account else { return nil }
-        return SyncBootstrap.makeHydrator(database: database, account: account)
+        let hydrator = LazyHydrator(database: database, account: account, store: store)
+        return { id in await hydrator.hydrate(id) }
     }
 
     /// Both subscription tasks capture `self` only weakly, so nothing here
@@ -638,5 +646,77 @@ public final class AppModel {
         autoSyncTask?.cancel()
         autoSyncTask = nil
         self.account = nil
+    }
+}
+
+/// Builds `SyncBootstrap.makeHydrator`'s Keychain -> OAuthClient ->
+/// GmailClient -> SyncEngine stack lazily — on the FIRST on-demand body
+/// fetch a reading pane actually triggers — rather than eagerly during
+/// `AppModel` init. Building that stack performs a real, synchronous
+/// token-store lookup (`store.clientSecret`, backed by the macOS Keychain
+/// in production); doing that unconditionally on EVERY `AppModel`
+/// construction, rather than only the comparatively rare case where a
+/// reading pane actually expands a message the background hydration pass
+/// hasn't reached yet, is both wasted work on every launch and, in tests,
+/// a correctness bug: constructing `SyncBootstrap`'s own default
+/// `KeychainTokenStore()` there — instead of deferring to whatever
+/// `TokenStore` double a test injected into `AppModel` — is exactly the
+/// kind of real-Keychain touch spec §6.3 forbids from CI.
+///
+/// Mirrors `ComposerModel.makeService`, which defers
+/// `SendBootstrap.makeService`'s identical wiring from init-time to
+/// send()-time (see its doc comment) — the one difference is that the
+/// built stack is cached here after the first attempt (success OR a
+/// definitive "no stored credentials"), since `SyncEngine.hydrate
+/// (messageID:)` is just as safe to reuse across on-demand fetches as
+/// `SyncBootstrap.makeStack`'s `engine` already is across
+/// `AppModel.syncNow()`/`startAutoSync` passes — there's no per-call
+/// reason (unlike `ComposerModel.send()`, where re-reading credentials
+/// fresh each send is the point) to rebuild it on every single expand.
+///
+/// An `actor` — not a plain class — because the closure `makeHydrateBody`
+/// returns is typed `@Sendable` (`ThreadModel.hydrateBody`'s contract) and
+/// its `hydrate(_:)` can genuinely be invoked from two independent call
+/// sites for two different ids at once (`ThreadModel.toggleExpanded`'s
+/// unstructured `Task` and an `observeThread` re-emit's
+/// `loadBodiesForExpandedMessages`, running inside `ThreadModel`'s
+/// `observationTask`) — actor isolation is what makes the build-once cache
+/// below safe without a separate lock, and makes `LazyHydrator` itself
+/// `Sendable` for free, satisfying the closure's own `@Sendable` capture
+/// requirement.
+private actor LazyHydrator {
+    private let database: HudsonDatabase
+    private let account: AccountRecord
+    private let store: any TokenStore
+
+    /// `nil` until the first `hydrate(_:)` call. Once built, `.some` —
+    /// even when the WRAPPED value is itself `nil` (this account has no
+    /// stored credentials, matching `SyncBootstrap.makeHydrator`'s own
+    /// "no fetch, stays uncached" contract) — so a credential-less account
+    /// never repeats the (cheap but pointless) token-store lookup on every
+    /// subsequent on-demand fetch for the rest of this `AppModel`'s
+    /// lifetime; there's nothing that would make a second attempt succeed
+    /// where the first didn't, since `account`/`store` never change here.
+    private var body: (@Sendable (String) async -> Bool)??
+
+    init(database: HudsonDatabase, account: AccountRecord, store: any TokenStore) {
+        self.database = database
+        self.account = account
+        self.store = store
+    }
+
+    /// Builds `body` on the first call only, then delegates every call
+    /// (this one included) to whatever it resolved to. Reentrant-safe: two
+    /// overlapping calls for different ids both land on this actor, so the
+    /// synchronous build-and-cache (`SyncBootstrap.makeHydrator` does no
+    /// awaiting internally) can never interleave with itself — only the
+    /// subsequent `await resolved(id)` suspends, by which point `body` is
+    /// already settled for good.
+    func hydrate(_ id: String) async -> Bool {
+        if body == nil {
+            body = SyncBootstrap.makeHydrator(database: database, account: account, store: store)
+        }
+        guard let resolved = body ?? nil else { return false }
+        return await resolved(id)
     }
 }

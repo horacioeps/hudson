@@ -249,29 +249,57 @@ private actor HydrateBodyRecorder {
     #expect(await recorder.calls.isEmpty)
 }
 
-/// The concurrency guard this task exists to add: a re-emit from
-/// `observeThread` (here, a mark-unread on the SAME message that's
-/// mid-fetch) landing while `hydrateBody` is still in flight for an id
-/// must not fire a second, overlapping fetch for that id.
+/// The concurrency guard this task exists to add: `toggleExpanded`'s
+/// independent unstructured `Task` racing a SAME-thread re-emit's
+/// `loadBodiesForExpandedMessages` for the SAME id must not fire two
+/// overlapping fetches for that id.
+///
+/// This — not a re-emit racing `open`'s OWN eager on-open fetch — is the
+/// genuine race `inFlightHydrations` exists to guard: both `open`'s eager
+/// fetch and every re-emit's fetch run inside the SAME `observationTask`
+/// for-loop (see `open`'s doc comment / `ThreadModel.swift`), which can't
+/// dequeue emission N+1 until emission N's `await
+/// loadBodiesForExpandedMessages()` — including any `hydrateBody` await
+/// inside it — has already returned. That loop therefore can never race
+/// itself, no matter how the guard is implemented; a test pitting the two
+/// against each other (as this test used to) can pass even with the guard
+/// deleted entirely. `toggleExpanded`, by contrast, fires a genuinely
+/// independent `Task` (`ThreadModel.swift`, `toggleExpanded`'s doc
+/// comment) that CAN still be in flight when a re-emit's
+/// `loadBodiesForExpandedMessages` runs — exactly the scenario below.
 @MainActor
-@Test func concurrentReemitDoesNotDuplicateAnInFlightHydration() async throws {
+@Test func toggleExpandedRacingASameThreadReemitDoesNotDuplicateAnInFlightHydration() async throws {
     let db = try HudsonDatabase.inMemory()
     let account = "you@hudson.app"
     try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    // "th7-m1" (newest -> auto-expanded by `open`) already has a LOCAL body,
+    // so `open`'s own eager fetch never touches `hydrateBody` for it — the
+    // recorder starts clean. "th7-m0" (older -> starts collapsed, no body)
+    // is the message under test.
     _ = try await db.applySnapshot(
         MessageSnapshot(
-            id: "th5-m0", threadID: "th5", historyID: 1, internalDate: 1000,
+            id: "th7-m0", threadID: "th7", historyID: 1, internalDate: 1000,
             fromLine: "Ada Lovelace <ada@example.com>", toLine: account,
             subject: "Slow hydrate", snippet: "sn", labelIDs: ["INBOX"]),
         account: account)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "th7-m1", threadID: "th7", historyID: 2, internalDate: 2000,
+            fromLine: "Ada Lovelace <ada@example.com>", toLine: account,
+            subject: "Re: Slow hydrate", snippet: "sn2", labelIDs: ["INBOX"]),
+        account: account)
+    try await db.saveBody(
+        messageID: "th7-m1", account: account,
+        body: Sanitizer.sanitize(html: nil, plainText: "Already hydrated"), attachments: [])
 
     let recorder = HydrateBodyRecorder()
     let model = ThreadModel(
         database: db, account: account,
         hydrateBody: { id in
             await recorder.record(id)
-            // Wide enough that the re-emit below lands WHILE this fetch is
-            // still in flight, giving the in-flight guard something to guard.
+            // Wide enough that the sibling-triggered re-emit below lands
+            // WHILE this fetch is still in flight, giving the in-flight
+            // guard something to actually guard.
             try? await Task.sleep(for: .milliseconds(120))
             try? await db.saveBody(
                 messageID: id, account: account,
@@ -280,17 +308,25 @@ private actor HydrateBodyRecorder {
             return true
         })
 
-    await model.open(threadID: "th5")
-    // Long enough for `open`'s eager on-open fetch to have STARTED (and
-    // recorded its call) but not yet FINISHED (still sleeping above).
-    try await Task.sleep(for: .milliseconds(30))
+    await model.open(threadID: "th7")
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(model.messages[0].isExpanded == false)  // "th7-m0" starts collapsed
 
-    // A re-emit unrelated to the body itself (a label change) lands while
-    // the fetch above is still in flight for "th5-m0".
-    try await Triage.markUnread(messageID: "th5-m0", account: account, database: db)
+    // Expand it — `toggleExpanded`'s OWN unstructured `Task` starts fetching
+    // "th7-m0" via `hydrateBody`, independent of `observationTask`.
+    model.toggleExpanded("th7-m0")
+    #expect(model.messages[0].isExpanded == true)
+
+    // While that fetch is still asleep, a re-emit lands (a label change on
+    // the SIBLING message, "th7-m1") — `observationTask`'s loop calls
+    // `loadBodiesForExpandedMessages()` again, which still sees "th7-m0" as
+    // expanded-with-no-body and, without the in-flight guard, fires a
+    // SECOND, overlapping fetch for it.
+    try await Task.sleep(for: .milliseconds(30))
+    try await Triage.markUnread(messageID: "th7-m1", account: account, database: db)
     try await Task.sleep(for: .milliseconds(200))
 
-    #expect(await recorder.calls == ["th5-m0"])
+    #expect(await recorder.calls == ["th7-m0"])
     #expect(model.messages[0].bodyText == "Hydrated")
 }
 
