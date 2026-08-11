@@ -206,6 +206,26 @@ private func assertRendered(_ size: NSSize) {
     assertRendered(host.fittingSize)
 }
 
+/// `RootView` with NO connected account (`AppModel(database:account: nil)`,
+/// not demo) — Task 4's first-launch gate must show `OnboardingView`'s
+/// welcome screen instead of the (otherwise-empty) three-pane mailbox.
+/// `RootView(model:)` builds its internal `OnboardingModel` eagerly, at
+/// `init` time (see its doc comment), so this needs no `.task`/run-loop to
+/// land before `layout()` — deterministic, matching every other test in this
+/// file's synchronous-hosting recipe.
+@MainActor
+@Test func rootViewRendersOnboardingWhenNoAccountConnected() {
+    let db = try! HudsonDatabase.inMemory()
+    let appModel = AppModel(database: db, account: nil)
+    #expect(appModel.needsOnboarding)  // precondition this test exercises
+
+    let view = RootView(model: appModel)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
 /// `RootView` with the compose sheet showing (`AppModel.composeNew()`, ⌘N's
 /// path) — exercises Task 4's new overlay branch alongside the
 /// already-covered three-pane/palette/search branches above.

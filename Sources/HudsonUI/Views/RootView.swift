@@ -9,6 +9,12 @@ import SwiftUI
 /// "no Store calls of its own" contract (see their doc comments).
 public struct RootView: View {
     @State private var model: AppModel?
+    /// The first-launch onboarding flow (Task 4's gate) — built the instant
+    /// `model` lands with `needsOnboarding == true`, either eagerly in
+    /// `init(model:)` or inside the `.task` below for the real `databaseURL`
+    /// boot path. `nil` whenever onboarding isn't (yet, or no longer)
+    /// showing, including the entire lifetime of a returning user's launch.
+    @State private var onboarding: OnboardingModel?
     /// `nil` when constructed via `init(model:)` — the direct-injection
     /// seam for tests/previews, which skips the async `.task` load below
     /// entirely because `model` already has a value.
@@ -30,16 +36,34 @@ public struct RootView: View {
     /// `AppModel`'s own `init(database:account:)` test seam, and lets a
     /// render-smoke test host the fully assembled tree against real,
     /// already-loaded data instead of racing the async `.task` below.
+    ///
+    /// Builds `onboarding` EAGERLY, right here, whenever `model` already
+    /// `needsOnboarding` — unlike the `.task`-driven boot path, this
+    /// initializer never runs the async load, so there is no later moment to
+    /// build it in; doing it now (rather than lazily on first `body`
+    /// evaluation) also sidesteps ever mutating `@State` from inside `body`,
+    /// which SwiftUI disallows.
     public init(model: AppModel) {
         self.databaseURL = nil
         self.isDemo = false
         self._model = State(initialValue: model)
+        self._onboarding = State(initialValue: nil)
+        if model.needsOnboarding {
+            self.onboarding = makeOnboardingModel(for: model)
+        }
     }
 
     public var body: some View {
         Group {
-            if let model {
+            if let model, !model.needsOnboarding {
                 assembled(model)
+            } else if let onboarding {
+                // First launch, no account yet (Task 4's gate) — the ENTIRE
+                // mailbox chrome stays unmounted until a real account exists,
+                // matching `HudsonCLI`'s old "no account -> can't do
+                // anything" posture, just with a graphical sign-in instead of
+                // a terminal command.
+                OnboardingView(model: onboarding)
             } else {
                 loadingPlaceholder
             }
@@ -48,11 +72,50 @@ public struct RootView: View {
         .background(Palette.bgApp)
         .task {
             guard model == nil, let databaseURL else { return }
-            model = try? await (isDemo ? AppModel.demo() : AppModel(databaseURL: databaseURL))
-            // Keep the mailbox live automatically — a no-op without creds
-            // (e.g. `--demo`), so it costs nothing there.
-            model?.startAutoSync()
+            let loaded = try? await (isDemo ? AppModel.demo() : AppModel(databaseURL: databaseURL))
+            model = loaded
+            guard let loaded else { return }
+            if loaded.needsOnboarding {
+                onboarding = makeOnboardingModel(for: loaded)
+            } else {
+                // Keep the mailbox live automatically — a no-op without
+                // creds (e.g. `--demo`), so it costs nothing there.
+                loaded.startAutoSync()
+            }
         }
+    }
+
+    // MARK: - Onboarding (Task 4's gate — see `onboarding` above)
+
+    /// Builds a fresh `OnboardingModel` over `model`'s already-open
+    /// `database` (no second `HudsonDatabase.open` for the same file — this
+    /// reuses the live connection) and wires `onConnected` to swap `self`
+    /// over to the mailbox: a BRAND NEW `AppModel` built for the just-signed-
+    /// in account (never mutated in place — every child model, `inbox`
+    /// through `composer`, is scoped to an account's email at construction),
+    /// followed by `startAutoSync()` and clearing `onboarding` so the body's
+    /// `assembled(model)` branch takes over. Called from both `init(model:)`
+    /// (direct-injection callers whose model already `needsOnboarding`) and
+    /// the `.task` boot path — a single definition so the wiring can never
+    /// drift between the two.
+    ///
+    /// Capturing `self` in `onConnected` (an escaping closure held by a
+    /// long-lived `OnboardingModel`) is safe here despite `RootView` being a
+    /// value type: `@State`'s `wrappedValue` setter is `nonmutating`, so
+    /// writing `self.model`/`self.onboarding` from a closure captured by an
+    /// older copy of `self` still writes through to the SAME shared storage
+    /// SwiftUI keeps for this view's identity — the same guarantee the
+    /// `.task` closure above already relies on for `model = loaded`.
+    private func makeOnboardingModel(for model: AppModel) -> OnboardingModel {
+        let database = model.database
+        let onboardingModel = OnboardingModel(database: database)
+        onboardingModel.onConnected = { [self] record in
+            let mailbox = AppModel(database: database, account: record)
+            self.model = mailbox
+            mailbox.startAutoSync()
+            self.onboarding = nil
+        }
+        return onboardingModel
     }
 
     private var loadingPlaceholder: some View {

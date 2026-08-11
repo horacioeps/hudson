@@ -2,6 +2,54 @@ import Store
 import Testing
 @testable import HudsonUI
 
+// MARK: - needsOnboarding (Task 4: first-launch gate)
+
+/// The exact formula `RootView` gates on: no connected account AND not the
+/// `--demo` path. A fresh install (no account, not demo) must signal
+/// onboarding.
+@MainActor
+@Test func needsOnboardingIsTrueWithNoAccountAndNotDemo() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+
+    #expect(model.needsOnboarding)
+    #expect(!model.isDemo)
+}
+
+/// A returning user (an account is already connected) skips onboarding
+/// entirely, regardless of `isDemo`.
+@MainActor
+@Test func needsOnboardingIsFalseOnceAnAccountIsConnected() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let model = AppModel(database: db, account: try await db.primaryAccount())
+
+    #expect(!model.needsOnboarding)
+}
+
+/// `--demo` bypasses onboarding even in the (never-should-happen-in-practice)
+/// case of no seeded account — `isDemo` alone is enough to skip the gate.
+@MainActor
+@Test func needsOnboardingIsFalseUnderDemoEvenWithoutAnAccount() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil, isDemo: true)
+
+    #expect(model.isDemo)
+    #expect(!model.needsOnboarding)
+}
+
+/// `AppModel.demo()` itself always lands on the non-onboarding path — it
+/// seeds an account AND sets `isDemo`, doubly bypassing the gate.
+@MainActor
+@Test func demoAppModelNeverNeedsOnboarding() async throws {
+    let model = try await AppModel.demo()
+
+    #expect(model.isDemo)
+    #expect(!model.needsOnboarding)
+}
+
+// MARK: - Navigation
+
 /// `openThread` both selects the row in `inbox` and loads it into `thread` —
 /// the two effects `InboxListView.onOpen`/`SearchView.onOpen` both rely on.
 @MainActor
