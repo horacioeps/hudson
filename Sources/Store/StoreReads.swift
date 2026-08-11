@@ -13,6 +13,15 @@ public struct MessageRow: Sendable, Equatable {
     public let snippet: String
     public let hasBody: Bool
     public let labelIDs: [String]
+    /// This message's own RFC 5322 `Message-ID`/`References` headers, as
+    /// persisted by `applySnapshot` (M5 Task 5) — the raw material
+    /// `Outbox.replyMessage` needs to build the threading triple's
+    /// `In-Reply-To`/`References` legs off the thread's newest message.
+    /// `nil` for messages hydrated before those columns existed, or for a
+    /// source fetch that never carried headers (see
+    /// `MessageSnapshot.rfc822MessageID`'s doc comment).
+    public let rfc822MessageID: String?
+    public let referencesHeader: String?
 }
 
 /// A message's derived body content for the reading pane, mirroring what
@@ -104,28 +113,18 @@ extension HudsonDatabase {
 
     static func messageRow(from raw: Row, account: String, db: Database) throws -> MessageRow {
         let id: String = raw["id"]
-        // Effective labels = (canonical ∪ pending adds) − pending removes.
+        // Effective labels = (canonical ∪ pending adds) − pending removes —
+        // see `EffectiveLabels.fragment` (Task 7: shared across this and
+        // three other call sites, was hand-duplicated before).
         let labels = try String.fetchAll(
             db,
-            sql: """
-                SELECT label_id FROM (
-                    SELECT label_id FROM message_labels
-                    WHERE account_email = :acct AND message_id = :mid
-                    UNION
-                    SELECT label_id FROM mutation_queue
-                    WHERE account_email = :acct AND message_id = :mid AND op = 'add'
-                ) AS present
-                WHERE label_id NOT IN (
-                    SELECT label_id FROM mutation_queue
-                    WHERE account_email = :acct AND message_id = :mid AND op = 'remove'
-                )
-                ORDER BY label_id
-                """,
+            sql: EffectiveLabels.fragment(account: ":acct", messageID: ":mid") + " ORDER BY label_id",
             arguments: ["acct": account, "mid": id])
         return MessageRow(
             id: id, threadID: raw["thread_id"], historyID: raw["history_id"],
             internalDate: raw["internal_date"], fromLine: raw["from_line"],
             toLine: raw["to_line"], subject: raw["subject"], snippet: raw["snippet"],
-            hasBody: raw["has_body"], labelIDs: labels)
+            hasBody: raw["has_body"], labelIDs: labels,
+            rfc822MessageID: raw["rfc822_message_id"], referencesHeader: raw["references_header"])
     }
 }

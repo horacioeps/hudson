@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "hudson", targets: ["HudsonCLI"]),
         .library(name: "HudsonUI", targets: ["HudsonUI"]),
         .executable(name: "HudsonApp", targets: ["HudsonApp"]),
+        .library(name: "Outbox", targets: ["Outbox"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
@@ -22,6 +23,7 @@ let package = Package(
                 "GmailKit",
                 "Store",
                 "SyncEngine",
+                "Outbox",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -32,7 +34,7 @@ let package = Package(
         ),
         .target(name: "Store", dependencies: [.product(name: "GRDB", package: "GRDB.swift")]),
         .testTarget(name: "StoreTests", dependencies: ["Store"]),
-        .testTarget(name: "HudsonCLITests", dependencies: ["HudsonCLI"]),
+        .testTarget(name: "HudsonCLITests", dependencies: ["HudsonCLI", "Outbox", "Store"]),
         .target(name: "SyncEngine", dependencies: ["GmailKit", "Store"]),
         .testTarget(name: "SyncEngineTests", dependencies: ["SyncEngine"]),
         .target(
@@ -43,5 +45,16 @@ let package = Package(
         ),
         .executableTarget(name: "HudsonApp", dependencies: ["HudsonUI"]),
         .testTarget(name: "HudsonUITests", dependencies: ["HudsonUI", "Store"]),
+        // MIME building + send state machine (spec §7). Depends on GmailKit
+        // for the `SentMessage`/`SendTransport` shapes SendService (a later
+        // M5 task) sends through, and Store for the `send_jobs` durable
+        // queue it persists to — declared now so the whole target compiles
+        // as later Task-3-adjacent M5 tasks land in the same directory.
+        .target(name: "Outbox", dependencies: ["GmailKit", "Store"]),
+        .testTarget(
+            name: "OutboxTests",
+            dependencies: ["Outbox", "Store"],
+            resources: [.copy("Golden")]
+        ),
     ]
 )

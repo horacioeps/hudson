@@ -84,7 +84,12 @@ enum FTSIndex {
     static func reindexBody(
         messageID: String, account: String, plainText: String, db: Database
     ) throws {
-        let rowid = try seq(for: messageID, account: account, db: db)
+        // Existence check BEFORE `seq(for:)` (Fix round — M5 Task 7
+        // carry-forward): `seq(for:)` INSERTs on a miss, so calling it
+        // first would allocate a `message_seq` row for a message that
+        // turns out not to exist, then hit the guard below and return —
+        // leaving that row orphaned (no `fts_messages` entry, and this
+        // early-return path never reaches `deleteIndex` to clean it up).
         guard
             let row = try Row.fetchOne(
                 db,
@@ -95,6 +100,7 @@ enum FTSIndex {
             // save) — nothing to index; `deleteIndex` already cleaned up.
             return
         }
+        let rowid = try seq(for: messageID, account: account, db: db)
         try db.execute(sql: "DELETE FROM fts_messages WHERE rowid = ?", arguments: [rowid])
         try db.execute(
             sql: """

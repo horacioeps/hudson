@@ -1,0 +1,10 @@
+# Golden MIME fixtures are byte-deterministic RFC 5322 output compared with a
+# raw `==` on `Data` in MimeBuilderTests.swift (see Task 3, spec §7.1). They
+# are plain CRLF-terminated ASCII text with no NUL bytes, so git's binary
+# heuristic does NOT classify them as binary and they would otherwise be
+# subject to a contributor's core.autocrlf/eol line-ending normalization on
+# checkout — silently turning their CRLFs into LFs on a clone configured
+# that way and breaking `buildReplyMatchesGoldenBytes` on CORRECT, unchanged
+# MimeBuilder output. `-text` opts them out of all of git's line-ending
+# handling so the checked-out bytes always match what was committed.
+Tests/OutboxTests/Golden/*.eml -text

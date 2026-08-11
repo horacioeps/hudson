@@ -158,23 +158,32 @@ func historyPage(_ json: String) -> HistoryPage {
     try! JSONDecoder().decode(HistoryPage.self, from: Data(json.utf8))
 }
 
-/// Builds a metadata-format GmailMessage for tests.
+/// Builds a metadata-format GmailMessage for tests. `messageID`/`references`
+/// (M5 Task 5) optionally add a `Message-ID`/`References` header — omitted
+/// from the payload entirely when `nil`, so every pre-existing call site
+/// (which doesn't pass them) round-trips through `GmailMessage.header(...)`
+/// exactly as before.
 func testMessage(
     id: String, threadID: String = "t1", historyID: String, internalDate: String = "1000",
-    labels: [String] = ["INBOX"], subject: String = "s"
+    labels: [String] = ["INBOX"], subject: String = "s",
+    messageID: String? = nil, references: String? = nil
 ) -> GmailMessage {
     // Decodable structs: round-trip through JSON to construct. Building the
     // `labelIds` array manually (not via `\(labels)` string interpolation,
     // whose Array<String>.description re-quotes each already-quoted element
     // into literal `\"INBOX\"` text) keeps the round-trip lossless.
     let labelIDsJSON = "[\(labels.map { "\"\($0)\"" }.joined(separator: ", "))]"
+    var headersJSON = """
+        {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"}, \
+        {"name": "Subject", "value": "\(subject)"}
+        """
+    if let messageID { headersJSON += ", {\"name\": \"Message-ID\", \"value\": \"\(messageID)\"}" }
+    if let references { headersJSON += ", {\"name\": \"References\", \"value\": \"\(references)\"}" }
     let json = """
         {"id": "\(id)", "threadId": "\(threadID)", "historyId": "\(historyID)",
          "internalDate": "\(internalDate)", "labelIds": \(labelIDsJSON),
          "snippet": "sn",
-         "payload": {"headers": [
-            {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"},
-            {"name": "Subject", "value": "\(subject)"}]}}
+         "payload": {"headers": [\(headersJSON)]}}
         """
     return try! JSONDecoder().decode(GmailMessage.self, from: Data(json.utf8))
 }
@@ -193,21 +202,28 @@ func testMessage(
 
 /// Builds a full-format GmailMessage carrying a text/plain body, for
 /// hydration tests. `internalDate` is milliseconds since epoch, as a string
-/// (Gmail's wire format).
+/// (Gmail's wire format). `messageID`/`references` (M5 Task 5) optionally
+/// add a `Message-ID`/`References` header — omitted entirely when `nil`, so
+/// every pre-existing call site round-trips unchanged.
 func testMessageWithBody(
     id: String, threadID: String = "t1", historyID: String, internalDate: String,
-    labels: [String] = ["INBOX"], subject: String = "s", plainText: String
+    labels: [String] = ["INBOX"], subject: String = "s", plainText: String,
+    messageID: String? = nil, references: String? = nil
 ) -> GmailMessage {
     let encodedBody = Data(plainText.utf8).base64EncodedString()
     let labelIDsJSON = "[\(labels.map { "\"\($0)\"" }.joined(separator: ", "))]"
+    var headersJSON = """
+        {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"}, \
+        {"name": "Subject", "value": "\(subject)"}
+        """
+    if let messageID { headersJSON += ", {\"name\": \"Message-ID\", \"value\": \"\(messageID)\"}" }
+    if let references { headersJSON += ", {\"name\": \"References\", \"value\": \"\(references)\"}" }
     let json = """
         {"id": "\(id)", "threadId": "\(threadID)", "historyId": "\(historyID)",
          "internalDate": "\(internalDate)", "labelIds": \(labelIDsJSON),
          "snippet": "sn",
          "payload": {"mimeType": "text/plain", "body": {"data": "\(encodedBody)"},
-            "headers": [
-            {"name": "From", "value": "a@ex.com"}, {"name": "To", "value": "b@ex.com"},
-            {"name": "Subject", "value": "\(subject)"}]}}
+            "headers": [\(headersJSON)]}}
         """
     return try! JSONDecoder().decode(GmailMessage.self, from: Data(json.utf8))
 }

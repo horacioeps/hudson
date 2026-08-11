@@ -1,0 +1,22 @@
+Message-ID: <b5b6b3d1-1e0e-4f0a-9a2b-a1b2c3d4e5f6@hudson.local>
+Date: Mon, 02 Feb 2026 02:40:00 +0000
+From: me@example.com
+To: alice@example.com
+Cc: bob@example.com
+Subject: Re: Q3 planning
+In-Reply-To: <orig-1@mail.gmail.com>
+References: <orig-0@mail.gmail.com> <orig-1@mail.gmail.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="hudson-alt-5bea2746d1dcf560"
+
+--hudson-alt-5bea2746d1dcf560
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+U291bmRzIGdvb2QsIHNlZSB5b3UgdGhlbi4=
+--hudson-alt-5bea2746d1dcf560
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: base64
+
+PHA+U291bmRzIGdvb2QsIHNlZSB5b3UgdGhlbi48L3A+
+--hudson-alt-5bea2746d1dcf560--

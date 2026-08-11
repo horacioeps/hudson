@@ -103,9 +103,9 @@ extension HudsonDatabase {
     /// Newest-first messages effectively labeled SENT, bounded by `limit` —
     /// the voice-profile source for M7's draft feature. Effective =
     /// (canonical `message_labels` ∪ pending `mutation_queue` adds) − pending
-    /// removes, the same overlay composition `StoreReads.messageRow` and
-    /// `SearchQuery`'s `.inbox` scope use, so an optimistic label change is
-    /// reflected here immediately, before it ever reaches Gmail.
+    /// removes — the shared `EffectiveLabels.fragment` overlay composition,
+    /// so an optimistic label change is reflected here immediately, before
+    /// it ever reaches Gmail.
     public func sentMessages(account: String, limit: Int) async throws -> [MessageRow] {
         try await writer.read { db in
             let rows = try Row.fetchAll(
@@ -114,18 +114,8 @@ extension HudsonDatabase {
                     SELECT * FROM messages m
                     WHERE m.account_email = ?
                     AND EXISTS (
-                        SELECT 1 FROM (
-                            SELECT label_id FROM message_labels
-                            WHERE account_email = m.account_email AND message_id = m.id
-                            UNION
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = m.account_email AND message_id = m.id AND op = 'add'
-                        ) AS present
-                        WHERE label_id = 'SENT'
-                        AND label_id NOT IN (
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = m.account_email AND message_id = m.id AND op = 'remove'
-                        )
+                        \(EffectiveLabels.fragment(
+                            account: "m.account_email", messageID: "m.id", label: "'SENT'"))
                     )
                     ORDER BY internal_date DESC, id DESC LIMIT ?
                     """,

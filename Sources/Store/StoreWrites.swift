@@ -175,6 +175,21 @@ extension HudsonDatabase {
                     try db.execute(
                         sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                         arguments: [account, id])
+                    // `mutation_queue` (Task 7 carry-forward) — unlike
+                    // `message_labels`, it has no FK/cascade to `messages`,
+                    // so a pending/in_flight optimistic mutation against
+                    // this id would otherwise linger forever: nothing
+                    // retires it (retirement waits on a history_cursor this
+                    // delete event already satisfies) and the flusher would
+                    // just keep re-sending a `messages.modify` that 404s.
+                    // `send_jobs` needs no equivalent cleanup here — it has
+                    // no `message_id` column at all; a job is keyed by its
+                    // own compose-time `rfc822_message_id` and, once sent,
+                    // Gmail's resulting `sent_message_id`, neither of which
+                    // is this synced inbox message's row.
+                    try db.execute(
+                        sql: "DELETE FROM mutation_queue WHERE account_email = ? AND message_id = ?",
+                        arguments: [account, id])
                     try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
                     try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
                     if let threadID {
@@ -324,6 +339,13 @@ extension HudsonDatabase {
             try db.execute(
                 sql: "DELETE FROM messages WHERE account_email = ? AND id = ?",
                 arguments: [account, id])
+            // Mirrors the `.deleted` history branch's mutation_queue
+            // cleanup (Task 7 carry-forward) — see its comment for why
+            // this is an explicit delete (no FK/cascade covers it) and why
+            // `send_jobs` needs no equivalent here.
+            try db.execute(
+                sql: "DELETE FROM mutation_queue WHERE account_email = ? AND message_id = ?",
+                arguments: [account, id])
             try FTSIndex.deleteIndex(messageID: id, account: account, db: db)
             try AIArtifacts.purge(sourceMessageID: id, account: account, db: db)
             if let threadID {
@@ -403,8 +425,9 @@ extension HudsonDatabase {
         try db.execute(
             sql: """
                 INSERT INTO messages (account_email, id, thread_id, history_id, internal_date,
-                                      from_line, to_line, subject, snippet)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      from_line, to_line, subject, snippet,
+                                      rfc822_message_id, references_header)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_email, id) DO UPDATE SET
                     history_id = excluded.history_id,
                     thread_id = excluded.thread_id,
@@ -412,12 +435,15 @@ extension HudsonDatabase {
                     from_line = excluded.from_line,
                     to_line = excluded.to_line,
                     subject = excluded.subject,
-                    snippet = excluded.snippet
+                    snippet = excluded.snippet,
+                    rfc822_message_id = excluded.rfc822_message_id,
+                    references_header = excluded.references_header
                 """,
             arguments: [
                 account, snapshot.id, snapshot.threadID, snapshot.historyID,
                 snapshot.internalDate, snapshot.fromLine, snapshot.toLine,
                 snapshot.subject, snapshot.snippet,
+                snapshot.rfc822MessageID, snapshot.referencesHeader,
             ])
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
         let rules = try splitRules ?? SplitInbox.fetchRules(account: account, db: db)
