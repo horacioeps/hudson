@@ -1,5 +1,35 @@
+import Foundation
 import Store
 import SwiftUI
+
+/// Turns a sanitized plain-text body into an `AttributedString` with
+/// http/https/mailto links detected and made tappable — so the plain-text
+/// fallback (a message with no HTML) still has working links. ONLY those three
+/// safe schemes get a link; anything else stays inert text, so a body can't
+/// smuggle a `file:`/`javascript:`/custom-scheme link past this. Uses
+/// `NSDataDetector`, Foundation's own link scanner (the same one `NSTextView`
+/// uses), so detection matches platform behavior. Tapping a rendered link goes
+/// through SwiftUI's default `openURL`, which opens it in the user's browser —
+/// never in-app.
+enum PlainTextLinkifier {
+    static func attributed(_ plainText: String) -> AttributedString {
+        let mutable = NSMutableAttributedString(string: plainText)
+        // Built locally rather than as a shared `static let`: `NSDataDetector`
+        // isn't `Sendable`, and the construction cost is negligible next to
+        // rendering a message body.
+        if let detector = try? NSDataDetector(
+            types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            let whole = NSRange(location: 0, length: (plainText as NSString).length)
+            detector.enumerateMatches(in: plainText, range: whole) { match, _, _ in
+                guard let url = match?.url, let matchRange = match?.range,
+                      let scheme = url.scheme?.lowercased(),
+                      ["http", "https", "mailto"].contains(scheme) else { return }
+                mutable.addAttribute(.link, value: url, range: matchRange)
+            }
+        }
+        return AttributedString(mutable)
+    }
+}
 
 /// A sender's display name and bare address, parsed from an RFC 5322
 /// `From:` header. Deliberately independent of `ThreadModel`'s own
@@ -140,6 +170,7 @@ public struct ThreadView: View {
             Text(thread.subject)
                 .font(Typography.serif(24, .semibold))
                 .foregroundStyle(Palette.ink)
+                .textSelection(.enabled)
             if let newestMessage {
                 senderRow(for: newestMessage.row)
             }
@@ -153,9 +184,11 @@ public struct ThreadView: View {
                 Text(SenderInfo.name(fromLine: row.fromLine))
                     .font(Typography.ui(13, .semibold))
                     .foregroundStyle(Palette.ink)
+                    .textSelection(.enabled)
                 Text(SenderInfo.address(fromLine: row.fromLine))
                     .font(Typography.ui(12))
                     .foregroundStyle(Palette.inkSecondary)
+                    .textSelection(.enabled)
             }
             Spacer(minLength: Metrics.unit)
             Text(InboxListView.formattedTime(epochMilliseconds: row.internalDate))
@@ -255,23 +288,32 @@ public struct ThreadView: View {
         .padding(.vertical, Metrics.unit * 2)
     }
 
+    @ViewBuilder
     private func bodyText(for message: ThreadMessage) -> some View {
-        Group {
-            if let bodyText = message.bodyText, !bodyText.isEmpty {
-                Text(bodyText)
-                    .font(Typography.serif(15))
-                    .foregroundStyle(Palette.ink)
-            } else {
-                // `bodyText` is nil until `ThreadModel` finishes fetching it
-                // (eagerly for the newest message, lazily on expand for
-                // everything else) — a subtle placeholder rather than an
-                // empty gap while that read is in flight.
-                Text("Loading…")
-                    .font(Typography.serif(15))
-                    .foregroundStyle(Palette.inkTertiary)
-            }
+        if let rawHTML = message.rawHTML, !rawHTML.isEmpty {
+            // Real HTML mail — render it in the privacy-sandboxed WKWebView
+            // (remote loads blocked by default; see `HTMLMessageView` for the
+            // full remote-blocking rationale). Links open in the browser.
+            HTMLMessageView(rawHTML: rawHTML, remoteURLs: message.remoteURLs)
+                .frame(maxWidth: 680, alignment: .leading)
+        } else if let bodyText = message.bodyText, !bodyText.isEmpty {
+            // Plain-text fallback: selectable, with bare URLs linkified so
+            // they're still tappable even with no HTML.
+            Text(PlainTextLinkifier.attributed(bodyText))
+                .font(Typography.serif(15))
+                .foregroundStyle(Palette.ink)
+                .textSelection(.enabled)
+                .frame(maxWidth: 680, alignment: .leading)
+        } else {
+            // `bodyText`/`rawHTML` are nil until `ThreadModel` finishes
+            // fetching (eagerly for the newest message, lazily on expand for
+            // everything else) — a subtle placeholder rather than an empty gap
+            // while that read is in flight.
+            Text("Loading…")
+                .font(Typography.serif(15))
+                .foregroundStyle(Palette.inkTertiary)
+                .frame(maxWidth: 680, alignment: .leading)
         }
-        .frame(maxWidth: 680, alignment: .leading)
     }
 
     /// Filenames to render as attachment `Chip`s for one expanded message.
