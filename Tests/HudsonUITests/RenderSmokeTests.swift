@@ -206,6 +206,54 @@ private func assertRendered(_ size: NSSize) {
     assertRendered(host.fittingSize)
 }
 
+/// `RootView` with NO connected account (`AppModel(database:account: nil)`,
+/// not demo) — Task 4's first-launch gate must show `OnboardingView`'s
+/// welcome screen instead of the (otherwise-empty) three-pane mailbox.
+/// `RootView(model:)` no longer builds its internal `OnboardingModel`
+/// eagerly at `init` time — that shape silently lost `onConnected`'s later
+/// writes (see `RootViewOnboardingWiringTests`) — so this now needs the same
+/// `try await Task.sleep(...)` land-the-`.task` step every other
+/// async-loaded `RootView` test in this file already uses, before
+/// `layout()`.
+@MainActor
+@Test func rootViewRendersOnboardingWhenNoAccountConnected() async throws {
+    let db = try! HudsonDatabase.inMemory()
+    let appModel = AppModel(database: db, account: nil)
+    #expect(appModel.needsOnboarding)  // precondition this test exercises
+
+    let view = RootView(model: appModel)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(100))
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// The REAL `HudsonApp` boot path (`RootView(databaseURL:)`, not the
+/// direct-injection `init(model:)` seam) with a fresh, empty on-disk
+/// database — no seeded account, so the async `.task` load lands a model
+/// with `needsOnboarding == true` and must build+show onboarding exactly
+/// like the `init(model:)` seam does. This path had zero coverage before
+/// Task 4's fix folded `init(model:)`'s onboarding-building into the same
+/// `.task` (see `RootView`'s doc comments) — worth confirming directly
+/// since a regression here would be invisible to every other test in this
+/// file, all of which go through `init(model:)`.
+@MainActor
+@Test func rootViewRendersOnboardingOnFreshDatabaseBoot() async throws {
+    let dbURL = FileManager.default.temporaryDirectory.appending(
+        path: "hudson-render-smoke-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+
+    let view = RootView(databaseURL: dbURL)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(150))
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
 /// `RootView` with the compose sheet showing (`AppModel.composeNew()`, ⌘N's
 /// path) — exercises Task 4's new overlay branch alongside the
 /// already-covered three-pane/palette/search branches above.
@@ -315,6 +363,88 @@ private actor RenderSmokeSendTransport: SendTransport {
 /// into a real `NSWindow`), so there is no reliable way to introspect
 /// rendered text here — `isUndoToastShown` is the closest thing to "the
 /// toast is on screen" this environment can actually assert on.
+// MARK: - OnboardingView (Task 3)
+
+/// A do-nothing `HTTPTransport`/`LoopbackServing` pair for the
+/// `OnboardingView` render-smoke tests below. Those tests only drive
+/// `OnboardingModel`'s SYNCHRONOUS phase navigation (`beginSetup`/
+/// `showBYOEntry`) — never `signInWithGoogle`/`signInBYO` — so these seams
+/// are never actually invoked; they exist purely so the model can be built
+/// without ever falling through to the real Keychain/network/browser
+/// (`KeychainTokenStore()`/`URLSessionTransport()`/`LoopbackServer()`/
+/// `NSWorkspace`), matching this suite's "no real integration, ever" rule
+/// even for a render that doesn't exercise sign-in.
+private actor RenderSmokeInertTransport: HTTPTransport {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        throw GmailError.network("RenderSmokeInertTransport should never be called")
+    }
+}
+
+private actor RenderSmokeInertLoopback: LoopbackServing {
+    func start() async throws -> UInt16 { throw GmailError.network("unused") }
+    func waitForCallback(expectedState: String) async throws -> String {
+        throw GmailError.network("unused")
+    }
+    func stop() async {}
+}
+
+/// Builds a hermetic `OnboardingModel` for the render-smoke tests below —
+/// every seam injected, none of them real.
+@MainActor
+private func makeRenderSmokeOnboardingModel(database: HudsonDatabase) -> OnboardingModel {
+    OnboardingModel(
+        database: database,
+        tokenStore: InMemoryTokenStore(),
+        transport: RenderSmokeInertTransport(),
+        makeLoopback: { RenderSmokeInertLoopback() },
+        openURL: { _ in })
+}
+
+/// `OnboardingView` in its default `.welcome` phase — the wordmark, tagline,
+/// three pitch cards, and the "Set up in about 5 minutes" button.
+@MainActor
+@Test func onboardingViewRendersWelcome() throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = makeRenderSmokeOnboardingModel(database: db)
+
+    let view = OnboardingView(model: model)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 900, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `OnboardingView` in `.chooseSignIn` (`beginSetup()`'s destination) — the
+/// "Sign in with Google" button, the unverified-app explainer card, and the
+/// "Use my own Google credentials" affordance.
+@MainActor
+@Test func onboardingViewRendersChooseSignIn() throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = makeRenderSmokeOnboardingModel(database: db)
+    model.beginSetup()
+
+    let view = OnboardingView(model: model)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 900, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `OnboardingView` in `.byoEntry` (`showBYOEntry()`'s destination) — the
+/// Client ID/Client Secret fields and the "Connect" button.
+@MainActor
+@Test func onboardingViewRendersBYOEntry() throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = makeRenderSmokeOnboardingModel(database: db)
+    model.showBYOEntry()
+
+    let view = OnboardingView(model: model)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 900, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
 @MainActor
 @Test func composerViewRendersUndoToastAfterSend() async throws {
     let db = try HudsonDatabase.inMemory()

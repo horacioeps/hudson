@@ -15,6 +15,21 @@ public final class AppModel {
     public let database: HudsonDatabase
     public private(set) var account: AccountRecord?
 
+    /// Whether this instance is the `--demo`/`HUDSON_DEMO=1` synthetic
+    /// mailbox (`AppModel.demo()`) rather than a real one. Only `demo()`
+    /// sets this `true` — every other initializer defaults it `false`. Used
+    /// solely by `needsOnboarding` below; nothing else branches on it.
+    public let isDemo: Bool
+
+    /// `RootView`'s first-launch gate (Task 4): `true` iff there is no
+    /// connected account AND this isn't the demo mailbox. A fresh install
+    /// (no account, not demo) must see `OnboardingView`, never an empty
+    /// three-pane mailbox; `--demo` always seeds its own account (see
+    /// `DemoData.seed`) but ANDs in `!isDemo` too, so the gate can never
+    /// fire for it even in the degenerate case of a corrupted/pre-seed demo
+    /// database with no account yet.
+    public var needsOnboarding: Bool { account == nil && !isDemo }
+
     public let inbox: InboxModel
     public let thread: ThreadModel
     public let command: CommandModel
@@ -87,6 +102,7 @@ public final class AppModel {
         self.database = database
         let account = try await database.primaryAccount()
         self.account = account
+        self.isDemo = false
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -108,10 +124,13 @@ public final class AppModel {
     /// since this initializer is (deliberately, to match callers like
     /// `demo()` and existing tests) synchronous. Matches `InboxModel.start()`
     /// et al.'s own contract: launching the subscription doesn't wait for
-    /// its first emission to land.
-    public init(database: HudsonDatabase, account: AccountRecord?) {
+    /// its first emission to land. `isDemo` defaults `false` — only `demo()`
+    /// passes `true`; every other caller (tests, `RootView`'s post-onboarding
+    /// rebuild) gets the real, non-demo `needsOnboarding` semantics.
+    public init(database: HudsonDatabase, account: AccountRecord?, isDemo: Bool = false) {
         self.database = database
         self.account = account
+        self.isDemo = isDemo
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -145,14 +164,17 @@ public final class AppModel {
             try await DemoData.seed(into: database, account: demoAccount)
         }
         let account = try await database.primaryAccount()
-        return AppModel(database: database, account: account)
+        return AppModel(database: database, account: account, isDemo: true)
     }
 
-    /// No account yet (a fresh install before `hudson auth`) reads back as
-    /// an empty account string — every Store read the child models below
-    /// make just comes back empty for it, never a crash, so the shell
-    /// still renders (empty inbox, empty search) while the user connects
-    /// an account in Terminal.
+    /// No account yet reads back as an empty account string — every Store
+    /// read the child models below make just comes back empty for it, never
+    /// a crash. In practice `RootView`'s `needsOnboarding` gate (Task 4)
+    /// keeps a real, non-demo launch with no account from ever mounting
+    /// this shell at all (it shows `OnboardingView` instead); this stays
+    /// the safe default regardless, so any direct `AppModel(database:
+    /// account: nil)` construction (tests, previews) still renders cleanly
+    /// (empty inbox, empty search) rather than crashing.
     private static func accountEmail(_ account: AccountRecord?) -> String {
         account?.email ?? ""
     }
