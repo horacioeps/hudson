@@ -3,21 +3,14 @@ import SwiftUI
 /// The ⌘K command palette: a centered modal with a search field and a
 /// keyboard-navigable list of `Command`s. Binds directly to a `CommandModel`
 /// for `query`/`results`; `perform` and `onClose` are supplied by the host
-/// (`AppModel`, wired in a later task) so this view owns no command
-/// DISPATCH logic itself — matches `CommandModel`'s own doc comment on why
-/// interpreting a `Command`'s `kind` deliberately lives outside the model.
+/// (`AppModel`, via `RootView`) so this view owns no command DISPATCH logic
+/// itself — matches `CommandModel`'s own doc comment on why interpreting a
+/// `Command`'s `kind` deliberately lives outside the model.
 public struct CommandPaletteView: View {
     private let command: CommandModel
     private let perform: (Command) -> Void
     private let onClose: () -> Void
 
-    /// Which row in `command.results` is highlighted. Clamped into range at
-    /// every USE site (`clampedHighlightedIndex`) rather than reset eagerly
-    /// whenever `results` changes, so a still-in-range index (e.g. filtering
-    /// from 5 results to 3 while row 1 is highlighted) survives a re-filter
-    /// unchanged; only an index that's fallen out of range snaps back to
-    /// the last row.
-    @State private var highlightedIndex = 0
     @FocusState private var isQueryFieldFocused: Bool
 
     public init(
@@ -46,12 +39,20 @@ public struct CommandPaletteView: View {
         )
         .shadow(color: .black.opacity(0.4), radius: 24, y: 12)
         .onAppear { isQueryFieldFocused = true }
+        // These `.onKeyPress` handlers are a fallback for this view hosted
+        // standalone (a Preview, a future isolated test) — under the real
+        // app, `RootView`'s global `KeyboardMonitor` is the SOLE authority
+        // for Up/Down/Return/Esc while the palette is visible (see
+        // `KeyRouter`'s doc comment on why `.onKeyPress` bubbling past a
+        // focused `TextField` is too fragile to rely on): the monitor
+        // consumes those key-downs before AppKit ever dispatches them into
+        // SwiftUI, so these handlers simply never fire in that path.
         .onKeyPress(.downArrow) {
-            moveHighlight(by: 1)
+            command.moveHighlight(by: 1)
             return .handled
         }
         .onKeyPress(.upArrow) {
-            moveHighlight(by: -1)
+            command.moveHighlight(by: -1)
             return .handled
         }
         .onKeyPress(.return) {
@@ -73,8 +74,7 @@ public struct CommandPaletteView: View {
             .padding(.horizontal, Metrics.unit * 4)
             .padding(.vertical, Metrics.unit * 4)
             .onChange(of: command.query) {
-                command.filter()
-                highlightedIndex = 0
+                command.filter()  // resets `command.highlightedIndex` to 0 itself
             }
     }
 
@@ -91,7 +91,7 @@ public struct CommandPaletteView: View {
         ScrollView {
             LazyVStack(spacing: 0) {
                 ForEach(Array(command.results.enumerated()), id: \.element.id) { index, entry in
-                    row(for: entry, isHighlighted: index == clampedHighlightedIndex)
+                    row(for: entry, isHighlighted: index == command.clampedHighlightedIndex)
                 }
             }
         }
@@ -133,19 +133,14 @@ public struct CommandPaletteView: View {
 
     // MARK: - Keyboard navigation
 
-    private var clampedHighlightedIndex: Int {
-        guard !command.results.isEmpty else { return 0 }
-        return min(max(highlightedIndex, 0), command.results.count - 1)
-    }
-
-    private func moveHighlight(by offset: Int) {
-        guard !command.results.isEmpty else { return }
-        highlightedIndex = min(max(clampedHighlightedIndex + offset, 0), command.results.count - 1)
-    }
-
+    /// Fallback for the standalone `.onKeyPress(.return)` above — see its
+    /// comment. Performing itself is dispatched by the caller-supplied
+    /// `perform` closure (matches `row(for:isHighlighted:)`'s own Button
+    /// action), never by `CommandModel` — see `CommandKind`'s doc comment
+    /// on why command dispatch deliberately lives outside the model.
     private func performHighlighted() {
-        guard command.results.indices.contains(clampedHighlightedIndex) else { return }
-        perform(command.results[clampedHighlightedIndex])
+        guard let highlighted = command.highlightedCommand else { return }
+        perform(highlighted)
     }
 
     /// A representative SF Symbol per `CommandKind` — purely decorative;

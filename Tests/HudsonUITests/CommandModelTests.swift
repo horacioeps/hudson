@@ -101,3 +101,61 @@ import Testing
     model.filter()
     #expect(model.results.map(\.id) == baseOrder)
 }
+
+// MARK: - Keyboard highlight (drives `KeyboardMonitor`'s `.moveHighlight`/`.performHighlighted`)
+
+@MainActor
+@Test func moveHighlightAdvancesAndClampsAtBounds() {
+    let model = CommandModel()
+    model.reload(splits: [], hasSelection: true)
+    #expect(model.highlightedIndex == 0)
+
+    model.moveHighlight(by: 1)
+    #expect(model.highlightedIndex == 1)
+
+    // Clamp at the top — moving past row 0 stays at row 0.
+    model.moveHighlight(by: -100)
+    #expect(model.highlightedIndex == 0)
+
+    // Clamp at the bottom — moving past the last row stays on the last row.
+    model.moveHighlight(by: 100)
+    #expect(model.highlightedIndex == model.results.count - 1)
+}
+
+@MainActor
+@Test func highlightedCommandTracksMovedIndex() throws {
+    let model = CommandModel()
+    model.reload(splits: [], hasSelection: true)
+    let first = try #require(model.results.first)
+    #expect(model.highlightedCommand?.id == first.id)
+
+    model.moveHighlight(by: 1)
+    #expect(model.highlightedCommand?.id == model.results[1].id)
+}
+
+/// `filter()` — called on every query edit AND by `reload()` — always
+/// snaps the highlight back to row 0, so a fresh result set never leaves a
+/// stale, now-irrelevant row highlighted.
+@MainActor
+@Test func filterResetsHighlightToTop() {
+    let model = CommandModel()
+    model.reload(splits: [], hasSelection: true)
+    model.moveHighlight(by: 1)
+    #expect(model.highlightedIndex == 1)
+
+    model.query = "arch"
+    model.filter()
+    #expect(model.highlightedIndex == 0)
+}
+
+/// An empty result set leaves the highlight at 0 and `highlightedCommand`
+/// `nil` — nothing for Return to perform.
+@MainActor
+@Test func emptyResultsYieldNilHighlightedCommand() {
+    let model = CommandModel()
+    model.reload(splits: [], hasSelection: true)
+    model.query = "zzz-does-not-match-anything"
+    model.filter()
+    #expect(model.results.isEmpty)
+    #expect(model.highlightedCommand == nil)
+}

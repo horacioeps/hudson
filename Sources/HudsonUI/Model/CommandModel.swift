@@ -62,6 +62,17 @@ public final class CommandModel {
     /// `query` edit alone never needs `reload()` to run again.
     private var baseCommands: [Command] = []
 
+    /// Which row in `results` is highlighted for keyboard navigation (Up/
+    /// Down move it, Return performs it) — driven by `AppModel`'s global
+    /// `KeyboardMonitor`, not view-local state. It has to live here rather
+    /// than a view's own `@State`: the monitor is an app-wide `NSEvent`
+    /// handler outside any specific view's body, so the only thing it can
+    /// drive is model state. Reset to the top row on every `filter()` call
+    /// (including the one `reload()` itself makes), so a fresh result set —
+    /// a typed character, or opening the palette anew — always starts from
+    /// row 0.
+    public private(set) var highlightedIndex: Int = 0
+
     public init() {}
 
     /// Rebuilds `baseCommands` for the current inbox state, then
@@ -115,5 +126,30 @@ public final class CommandModel {
             return (command, score)
         }
         results = scoredCommands.sorted { $0.score > $1.score }.map(\.command)
+        highlightedIndex = 0
+    }
+
+    // MARK: - Keyboard highlight
+
+    /// `highlightedIndex`, clamped into `results`' actual bounds — guards
+    /// the (rare) case `results` shrank out from under a previously-valid
+    /// index, e.g. mid-navigation a query change lands with fewer matches.
+    public var clampedHighlightedIndex: Int {
+        guard !results.isEmpty else { return 0 }
+        return min(max(highlightedIndex, 0), results.count - 1)
+    }
+
+    /// Moves the highlight by `offset` rows, clamped to `results`' bounds —
+    /// `+1`/`-1` for arrow-down/arrow-up. A no-op on an empty result set.
+    public func moveHighlight(by offset: Int) {
+        guard !results.isEmpty else { return }
+        highlightedIndex = min(max(clampedHighlightedIndex + offset, 0), results.count - 1)
+    }
+
+    /// The currently-highlighted command, or `nil` when `results` is empty
+    /// — what Return should perform.
+    public var highlightedCommand: Command? {
+        guard results.indices.contains(clampedHighlightedIndex) else { return nil }
+        return results[clampedHighlightedIndex]
     }
 }

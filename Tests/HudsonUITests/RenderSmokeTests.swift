@@ -111,3 +111,26 @@ private func assertRendered(_ size: NSSize) {
     host.layout()
     assertRendered(host.fittingSize)
 }
+
+/// The fully assembled `RootView` (sidebar + inbox list + reading pane +
+/// the keyboard-monitor background view), hosted against a seeded demo
+/// `AppModel` via `RootView`'s direct-injection `init(model:)` — this
+/// bypasses the async `.task`/`AppModel.demo()` load `HudsonApp` itself
+/// uses, so the tree is already fully wired by the time `layout()` runs,
+/// rather than racing it. At ~1200×760, comfortably inside the Pencil
+/// design's target window size.
+@MainActor
+@Test func rootViewRendersAssembledThreePane() async throws {
+    let appModel = try await AppModel.demo()
+    // Let `inbox.start()`/`refreshLabels()` (both launched from
+    // `AppModel.demo()` -> `init(database:account:)` via an unstructured
+    // `Task`) land their first emission before hosting — matches every
+    // other test in this file's "seed, sleep, then render" recipe.
+    try await Task.sleep(for: .milliseconds(100))
+
+    let view = RootView(model: appModel)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
