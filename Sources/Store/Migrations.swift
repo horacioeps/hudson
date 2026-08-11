@@ -416,5 +416,52 @@ let migrator: DatabaseMigrator = {
             on: "ai_artifact_sources", columns: ["account_email", "message_id"])
     }
 
+    migrator.registerMigration("v7") { db in
+        // M5 Task 1: `send_jobs` — the send-side durable queue, mirroring
+        // `mutation_queue`'s durability pattern (v2 above). Spec §7.3's
+        // dedup protocol needs a send job to survive a crash between "the
+        // network call may have reached Gmail" and "we recorded that it
+        // did" exactly the way a triage mutation needs to survive one
+        // between "sent" and "retired" — same shape, new domain.
+        //
+        // The state CHECK is declared directly on the column (unlike
+        // `mutation_queue_op_check`'s BEFORE-INSERT trigger twin) because
+        // this is a fresh CREATE TABLE, not an ALTER onto an existing one —
+        // SQLite only refuses to add a CHECK to a table that already exists
+        // without a full rebuild; a brand-new table can declare it inline.
+        try db.create(table: "send_jobs") { t in
+            t.autoIncrementedPrimaryKey("id")
+            t.column("account_email", .text).notNull()
+            // UUID Message-ID, assigned by SendService at ENQUEUE time
+            // (§7.3) — this is what the restart dedup probe searches Gmail
+            // for (`rfc822msgid:<id>`), so it must exist before the first
+            // network call, not be derived from Gmail's response.
+            t.column("rfc822_message_id", .text).notNull()
+            // nil deliberately starts a new thread — the edited-subject
+            // case (§7.1): threading requires the FULL triple, so a reply
+            // whose subject changed omits threadId on the send call too.
+            t.column("thread_id", .text)
+            t.column("raw_mime", .blob).notNull()
+            t.column("state", .text).notNull().defaults(to: "pending")
+                .check(sql: "state IN ('pending', 'held', 'in_flight', 'sent', 'failed')")
+            t.column("hold_until", .integer).notNull()   // ms since epoch; undo-send window end
+            t.column("enqueued_at", .integer).notNull()  // ms since epoch
+            t.column("sent_message_id", .text)           // Gmail's own message id, set by markSent
+        }
+        // The database-layer half of the dedup guard: the same Message-ID
+        // can never be enqueued twice for one account, regardless of
+        // caller discipline (SendService's own UUID-per-compose is the
+        // other half — this is belt-and-suspenders, not the only guard).
+        try db.create(
+            index: "send_jobs_unique_rfc822_message_id",
+            on: "send_jobs", columns: ["account_email", "rfc822_message_id"], unique: true)
+        // Serves both `claimSendable` (state IN pending/held, hold_until
+        // filter) and `inFlightSendJobs` (state = in_flight) — both filter
+        // on (account, state) first.
+        try db.create(
+            index: "send_jobs_claim",
+            on: "send_jobs", columns: ["account_email", "state", "hold_until"])
+    }
+
     return migrator
 }()
