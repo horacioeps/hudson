@@ -168,3 +168,151 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
     // part, "you" — mirrors `ThreadRollup.senderDisplayName`'s fallback.
     #expect(model.participants == "Priya Anand, you")
 }
+
+// MARK: - On-demand hydration (`hydrateBody`) — the reading pane's fix for
+// a message that's expanded but hasn't been reached yet by the background
+// `SyncEngine.hydrateBodies()` batch (capped at 25/pass; a large backfill
+// can starve it indefinitely). `hydrateBody` is `ThreadModel`'s injected
+// seam onto `SyncEngine.hydrate(messageID:)` — these tests script it
+// directly rather than standing up a real network stack, matching how
+// `ThreadModel`'s other tests script Store directly rather than Gmail.
+
+/// Records every id `hydrateBody` was invoked with — an `actor` so it's
+/// safe to mutate from the `@Sendable` closure `ThreadModel` calls it
+/// through, and to read back from `@MainActor` test code.
+private actor HydrateBodyRecorder {
+    private(set) var calls: [String] = []
+    func record(_ id: String) { calls.append(id) }
+}
+
+@MainActor
+@Test func expandingABodylessMessageHydratesOnDemandExactlyOnceAndCaches() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "th4-m0", threadID: "th4", historyID: 1, internalDate: 1000,
+            fromLine: "Ada Lovelace <ada@example.com>", toLine: account,
+            subject: "Not hydrated yet", snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+    // Deliberately no `saveBody` — has_body stays 0, exactly what a
+    // backfilled row the background hydration batch hasn't reached yet
+    // looks like.
+
+    let recorder = HydrateBodyRecorder()
+    let model = ThreadModel(
+        database: db, account: account,
+        hydrateBody: { id in
+            await recorder.record(id)
+            // Mirrors `SyncEngine.hydrate`'s real contract: on success it
+            // has ALREADY saved the body to Store before returning `true`.
+            try? await db.saveBody(
+                messageID: id, account: account,
+                body: Sanitizer.sanitize(html: nil, plainText: "Fetched on demand"),
+                attachments: [])
+            return true
+        })
+
+    await model.open(threadID: "th4")
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(model.messages.count == 1)
+    #expect(model.messages[0].isExpanded)  // sole message -> newest -> auto-expanded
+    #expect(model.messages[0].bodyText == "Fetched on demand")
+    #expect(await recorder.calls == ["th4-m0"])
+}
+
+@Test @MainActor func hydrateBodyIsNotCalledWhenTheLocalBodyAlreadyExists() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    // Both messages already have locally-hydrated bodies (`seedTwoMessageThread`).
+    try await seedTwoMessageThread(into: db, account: account)
+
+    let recorder = HydrateBodyRecorder()
+    let model = ThreadModel(
+        database: db, account: account,
+        hydrateBody: { id in
+            await recorder.record(id)
+            return true
+        })
+
+    await model.open(threadID: "th1")
+    try await Task.sleep(for: .milliseconds(50))
+    // Expanding the already-hydrated older message too must still never
+    // reach for the network — its body is already local.
+    model.toggleExpanded("th1-m0")
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.messages[0].bodyText == "Body of the first message.")
+    #expect(model.messages[1].bodyText == "Body of the second (newest) message.")
+    #expect(await recorder.calls.isEmpty)
+}
+
+/// The concurrency guard this task exists to add: a re-emit from
+/// `observeThread` (here, a mark-unread on the SAME message that's
+/// mid-fetch) landing while `hydrateBody` is still in flight for an id
+/// must not fire a second, overlapping fetch for that id.
+@MainActor
+@Test func concurrentReemitDoesNotDuplicateAnInFlightHydration() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "th5-m0", threadID: "th5", historyID: 1, internalDate: 1000,
+            fromLine: "Ada Lovelace <ada@example.com>", toLine: account,
+            subject: "Slow hydrate", snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+
+    let recorder = HydrateBodyRecorder()
+    let model = ThreadModel(
+        database: db, account: account,
+        hydrateBody: { id in
+            await recorder.record(id)
+            // Wide enough that the re-emit below lands WHILE this fetch is
+            // still in flight, giving the in-flight guard something to guard.
+            try? await Task.sleep(for: .milliseconds(120))
+            try? await db.saveBody(
+                messageID: id, account: account,
+                body: Sanitizer.sanitize(html: nil, plainText: "Hydrated"),
+                attachments: [])
+            return true
+        })
+
+    await model.open(threadID: "th5")
+    // Long enough for `open`'s eager on-open fetch to have STARTED (and
+    // recorded its call) but not yet FINISHED (still sleeping above).
+    try await Task.sleep(for: .milliseconds(30))
+
+    // A re-emit unrelated to the body itself (a label change) lands while
+    // the fetch above is still in flight for "th5-m0".
+    try await Triage.markUnread(messageID: "th5-m0", account: account, database: db)
+    try await Task.sleep(for: .milliseconds(200))
+
+    #expect(await recorder.calls == ["th5-m0"])
+    #expect(model.messages[0].bodyText == "Hydrated")
+}
+
+/// Under a `nil` hydrateBody (the `--demo`/no-Keychain-creds case), a
+/// body-less message stays exactly as uncached as it was before on-demand
+/// hydration existed — no fetch, no crash, nothing to await.
+@MainActor
+@Test func nilHydrateBodyLeavesABodylessMessageUncached() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "th6-m0", threadID: "th6", historyID: 1, internalDate: 1000,
+            fromLine: "Ada Lovelace <ada@example.com>", toLine: account,
+            subject: "No hydrator wired", snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+
+    let model = ThreadModel(database: db, account: account)  // hydrateBody defaults to nil
+    await model.open(threadID: "th6")
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.messages[0].isExpanded)
+    #expect(model.messages[0].bodyText == nil)
+}

@@ -50,9 +50,40 @@ public final class ThreadModel {
     /// `InboxModel.rowsTask`.
     private var observationTask: Task<Void, Never>?
 
-    public init(database: HudsonDatabase, account: String) {
+    /// On-demand Gmail body fetch — the fix for a message that's expanded
+    /// but hasn't been reached yet by the background `SyncEngine
+    /// .hydrateBodies()` batch (capped at 25/pass; a large mailbox's
+    /// backfill can starve it for a long time). `fetchAndCacheBody` calls
+    /// this ONLY when the local `message_bodies` read comes back empty —
+    /// Hudson stays local-first, this is purely a fallback for a body that
+    /// genuinely isn't hydrated yet. Returns `true` iff it fetched and
+    /// saved a body (mirroring `SyncEngine.hydrate(messageID:)`, which is
+    /// what `AppModel`/`SyncBootstrap.makeHydrator` wires in for a real
+    /// account). `nil` under `--demo`/no-Keychain-creds — the app passes
+    /// `nil` there — which restores exactly today's local-only behavior:
+    /// no fetch, a body-less message simply stays uncached until the next
+    /// background pass.
+    private let hydrateBody: (@Sendable (String) async -> Bool)?
+
+    /// Ids currently mid-fetch via `hydrateBody` — guards against firing
+    /// the SAME on-demand fetch twice. Both `loadBodiesForExpandedMessages`
+    /// (an `observeThread` re-emit) and `toggleExpanded` (a user tap) can
+    /// independently decide "no local body yet" for the same id before
+    /// either fetch has finished; `fetchAndCacheBody` inserts before
+    /// awaiting `hydrateBody` and removes in a `defer`, so a fetch that
+    /// throws/returns `false` still frees the slot for a later retry.
+    private var inFlightHydrations: Set<String> = []
+
+    /// - Parameter hydrateBody: see the property's doc comment above.
+    ///   Defaults to `nil` (today's local-only behavior) so every existing
+    ///   call site — tests, previews — keeps working unchanged.
+    public init(
+        database: HudsonDatabase, account: String,
+        hydrateBody: (@Sendable (String) async -> Bool)? = nil
+    ) {
         self.database = database
         self.account = account
+        self.hydrateBody = hydrateBody
     }
 
     /// `isolated` (SE-0371) because `observationTask` is `@MainActor`-
@@ -123,21 +154,14 @@ public final class ThreadModel {
     /// that doesn't have one yet. Skips ids that are already cached (see
     /// `ThreadMessage.bodyText`'s doc comment) — a re-emit here is cheap
     /// even on a long thread since only the newly-expanded/newly-arrived
-    /// ids ever lack a body. A read that comes back with `plainText ==
-    /// nil` (body not yet hydrated by sync) is deliberately left uncached
-    /// so the NEXT re-emit or expand retries it.
+    /// ids ever lack a body. Each id goes through `fetchAndCacheBody`,
+    /// which falls back to `hydrateBody` (an on-demand Gmail fetch) when
+    /// the local read comes back empty — see that method's doc comment.
     private func loadBodiesForExpandedMessages() async {
         let idsNeedingBody = messages.filter { $0.isExpanded && $0.bodyText == nil }.map(\.id)
         for id in idsNeedingBody {
             guard !Task.isCancelled else { return }
-            // `messageBody` returns nil only when no body row exists yet (not
-            // hydrated) — that's left uncached so the next re-emit/expand
-            // retries it, exactly as before.
-            guard let fetched = try? await database.messageBody(id: id, account: account) else { continue }
-            guard !Task.isCancelled, let index = messages.firstIndex(where: { $0.id == id }) else { continue }
-            messages[index].bodyText = fetched.plainText
-            messages[index].rawHTML = fetched.rawHTML
-            messages[index].remoteURLs = fetched.remoteURLs
+            await fetchAndCacheBody(for: id)
         }
     }
 
@@ -156,15 +180,54 @@ public final class ThreadModel {
         messages[index].isExpanded.toggle()
         guard messages[index].isExpanded, messages[index].bodyText == nil else { return }
 
-        let database = self.database
-        let account = self.account
         Task { [weak self] in
-            guard let fetched = try? await database.messageBody(id: id, account: account) else { return }
-            guard let self, let currentIndex = self.messages.firstIndex(where: { $0.id == id }) else { return }
-            self.messages[currentIndex].bodyText = fetched.plainText
-            self.messages[currentIndex].rawHTML = fetched.rawHTML
-            self.messages[currentIndex].remoteURLs = fetched.remoteURLs
+            await self?.fetchAndCacheBody(for: id)
         }
+    }
+
+    /// The one place that fetches and caches a single message's body — used
+    /// by both `loadBodiesForExpandedMessages` (an `observeThread` re-emit)
+    /// and `toggleExpanded` (a user tap), so there is exactly one body-fetch
+    /// code path on the `ThreadModel` side (mirroring `SyncEngine.hydrate`
+    /// being the one path on the sync side).
+    ///
+    /// Local-first (§4 invariant 3): reads `database.messageBody` first.
+    /// Only when that comes back `nil` — no body row exists yet, i.e. sync
+    /// hasn't hydrated this message — does it fall back to `hydrateBody`,
+    /// the injected on-demand Gmail fetch, and ONLY if `hydrateBody` is
+    /// non-nil and `id` isn't already mid-fetch (`inFlightHydrations`
+    /// guards two independent call sites from racing the same id — see its
+    /// doc comment). A `hydrateBody` that returns `false` (the message
+    /// 404'd) or throws (via `try?`, not possible here since the closure
+    /// itself can't throw, but a save failure inside it could still surface
+    /// as `false`) leaves the message uncached, exactly like a local miss
+    /// always has — the next re-emit or expand retries it.
+    ///
+    /// Re-finds `id` in `messages` right before writing (`guard let index`)
+    /// rather than trusting the id is still valid — the same stale-write
+    /// guard `toggleExpanded` always used, now shared: if the thread was
+    /// switched via `open`, or `id` dropped out of this thread, while the
+    /// fetch was in flight, the write silently no-ops instead of corrupting
+    /// a DIFFERENT thread's `messages`. `Task.isCancelled` is also
+    /// rechecked before writing, for `loadBodiesForExpandedMessages`'
+    /// benefit (its `observationTask` can be cancelled mid-fetch by a
+    /// thread switch); it's always `false` for `toggleExpanded`'s own
+    /// unstructured `Task`, so this adds nothing to check there.
+    private func fetchAndCacheBody(for id: String) async {
+        var fetched = try? await database.messageBody(id: id, account: account)
+        if fetched == nil, let hydrateBody, !inFlightHydrations.contains(id) {
+            inFlightHydrations.insert(id)
+            defer { inFlightHydrations.remove(id) }
+            if await hydrateBody(id) {
+                fetched = try? await database.messageBody(id: id, account: account)
+            }
+        }
+        guard !Task.isCancelled, let fetched,
+            let index = messages.firstIndex(where: { $0.id == id })
+        else { return }
+        messages[index].bodyText = fetched.plainText
+        messages[index].rawHTML = fetched.rawHTML
+        messages[index].remoteURLs = fetched.remoteURLs
     }
 
     /// The newest message by `internalDate`, or `nil` before `open`'s
