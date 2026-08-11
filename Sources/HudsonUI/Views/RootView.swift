@@ -105,60 +105,54 @@ public struct RootView: View {
     }
 
     private func threePane(_ model: AppModel) -> some View {
-        NavigationSplitView {
+        // A real AppKit `NSSplitView` (via `HSplitView`), NOT
+        // `NavigationSplitView`: the latter gives no freely-draggable divider
+        // between the list and the reading pane on macOS and lets the detail
+        // column greedily eat the remaining width. `HSplitView`'s dividers drag
+        // freely within each pane's frame bounds, so the reading pane is
+        // genuinely resizable — drag the divider to its left to size it.
+        HSplitView {
             SidebarView(
                 accountEmail: model.account?.email,
                 unreadCount: model.totalUnread,
                 labels: model.labels,
                 pendingCount: model.pendingCount,
                 // Only "Inbox" is wired to a real Store-backed filter this
-                // milestone (see `onSelect` below) — pinning the highlight
-                // there avoids a misleading "selected but does nothing"
-                // affordance for Starred/Snoozed/Sent/labels.
+                // milestone; pinning the highlight there avoids a misleading
+                // "selected but does nothing" affordance for the rest.
                 selection: .inbox,
                 onSelect: { selection in
                     switch selection {
                     case .inbox:
                         model.inbox.activeSplit = nil
                     case .starred, .snoozed, .sent, .label:
-                        // Non-functional this milestone: Store has no query
-                        // backing these yet (only `activeSplit`'s split-key
-                        // filter exists, driven by the inbox list's own tab
-                        // strip). Real nav lands with a later task's Store
-                        // API — matches `ThreadView`'s AI-summary/reply-bar
-                        // placeholders: an explicit, deliberate gap, not an
-                        // oversight.
+                        // Non-functional this milestone (no Store query backs
+                        // them yet) — a deliberate gap, like ThreadView's
+                        // AI-summary / reply-bar placeholders.
                         break
                     }
                 })
-                // Draggable, within sane bounds — replaces the sidebar's old
-                // hard `.frame(width:)` so its divider actually resizes.
-                .navigationSplitViewColumnWidth(min: 200, ideal: Metrics.sidebarWidth, max: 320)
-        } content: {
+                .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)
+
             InboxListView(inbox: model.inbox, onOpen: { model.openThread($0) })
-                // Draggable list column — replaces the inbox list's old hard
-                // `.frame(width:)`. The detail (reading) pane takes whatever
-                // space is left and resizes with this divider.
-                .navigationSplitViewColumnWidth(min: 320, ideal: Metrics.listWidth, max: 560)
-        } detail: {
-            // Only mount the full ThreadView (toolbar + reply bar + body) once
-            // a thread is actually open. With nothing selected we show a bare
-            // centered empty state instead, so the reading pane never presents
-            // dead chrome (a Reply bar with nothing to reply to, etc.).
-            if model.inbox.selectedThreadID != nil && !model.thread.messages.isEmpty {
-                ThreadView(
-                    thread: model.thread,
-                    onArchive: { Task { try? await model.inbox.archiveSelected() } },
-                    onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } })
-            } else {
-                readingPaneEmptyState
+                .frame(minWidth: 300, idealWidth: Metrics.listWidth, maxWidth: 620)
+
+            // Reading pane: takes the remaining width, freely resizable via the
+            // divider on its left. Only mount the full ThreadView once a thread
+            // is open; otherwise a bare centered empty state, so the pane never
+            // shows dead chrome (a Reply bar with nothing to reply to).
+            Group {
+                if model.inbox.selectedThreadID != nil && !model.thread.messages.isEmpty {
+                    ThreadView(
+                        thread: model.thread,
+                        onArchive: { Task { try? await model.inbox.archiveSelected() } },
+                        onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } })
+                } else {
+                    readingPaneEmptyState
+                }
             }
+            .frame(minWidth: 420, maxWidth: .infinity)
         }
-        // The design has no sidebar-collapse affordance (SidebarView's own
-        // comment: the hidden-title-bar window reserves the traffic-light
-        // inset itself); `NavigationSplitView` otherwise injects one into
-        // the toolbar automatically.
-        .toolbar(removing: .sidebarToggle)
         .background(Palette.bgApp)
     }
 
