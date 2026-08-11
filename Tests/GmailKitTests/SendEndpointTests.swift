@@ -25,7 +25,17 @@ private func makeClient(_ transport: MockTransport, quota: QuotaBucket = QuotaBu
 @Test func sendRawMessagePostsBase64URLRawAndThreadID() async throws {
     let body = #"{"id":"18f1a","threadId":"t99","labelIds":["SENT"]}"#
     let transport = MockTransport(responses: [(Data(body.utf8), 200)])
+    // A plain ASCII MIME body happens to base64-encode identically under
+    // both standard base64 and base64url (no '+'/'/'/'=' ever appear), so
+    // it can't distinguish the two encoders. Appending these four
+    // high-entropy trailing bytes forces standard base64 to contain '+',
+    // '/', AND '=' padding (verified directly: `Data(mimeBytes)
+    // .base64EncodedString()` on this exact sequence is
+    // "...Ym9kef/+/fs="), while base64url of the same bytes contains none
+    // of those characters — so this fixture actually exercises which
+    // encoder was used, unlike the all-ASCII fixture it replaces.
     let mime = Data("From: a@example.com\r\nSubject: hi\r\n\r\nbody".utf8)
+        + Data([0xFF, 0xFE, 0xFD, 0xFB])
     _ = try await makeClient(transport).sendRawMessage(mime, threadID: "t99")
 
     let request = try #require(await transport.recordedRequests().first)
@@ -35,11 +45,12 @@ private func makeClient(_ transport: MockTransport, quota: QuotaBucket = QuotaBu
     #expect(json["threadId"] as? String == "t99")
 
     // Gmail requires base64URL (RFC 4648 §5), not standard base64 — no
-    // '+'/'/' padding characters, and it must round-trip back to the exact
-    // MIME bytes handed in.
+    // '+'/'/' characters and no '=' padding, and it must round-trip back to
+    // the exact MIME bytes handed in.
     let raw = try #require(json["raw"] as? String)
     #expect(!raw.contains("+"))
     #expect(!raw.contains("/"))
+    #expect(!raw.contains("="))
     var padded = raw.replacingOccurrences(of: "-", with: "+")
         .replacingOccurrences(of: "_", with: "/")
     while padded.count % 4 != 0 { padded.append("=") }
