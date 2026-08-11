@@ -92,7 +92,17 @@ private func answerText(_ events: [AskEvent]) -> String {
 
 /// A multi-word question ending in "?" is NOT a keyword search — it triggers
 /// the optional Haiku query-expansion hop BEFORE the Sonnet answer hop, so
-/// two provider calls happen instead of one.
+/// two provider calls happen instead of one. Beyond the call count, this also
+/// proves the full expansion→retrieval→citation pipeline: the raw question
+/// itself ("What is the status of the contract renewal?") does NOT lexically
+/// match m1's indexed content (FTS5's implicit AND rejects "What"/"is"/"of",
+/// none of which appear in m1), so retrieval depends entirely on the
+/// expansion hop's alternate phrase actually reaching a second `searchMessages`
+/// call and matching. `ScriptedProvider(scripts:)` gives the expansion hop and
+/// the answer hop DISTINCT scripted responses (a single shared script — the
+/// bug this test used to have — would make the expansion hop's "search
+/// phrase" literally equal the final answer text, which also fails to match
+/// m1 and would let a broken pipeline pass by accident).
 @Test func nonLexicalQuestionTriggersExpansionHopBeforeTheAnswer() async throws {
     let db = try HudsonDatabase.inMemory()
     _ = try await db.applySnapshot(
@@ -101,15 +111,30 @@ private func answerText(_ events: [AskEvent]) -> String {
         messageID: "m1", account: account,
         body: Sanitizer.sanitize(html: nil, plainText: "The contract renews next month."))
     try await optInAsk(db)
-    let provider = ScriptedProvider(script: [.textDelta("It renews next month."), .stopped])
+    let provider = ScriptedProvider(scripts: [
+        // Expansion hop: an alternate search phrase whose every term appears
+        // in m1's subject ("Contract renewal"), so the second (unioned)
+        // `searchMessages` pass in `retrieve` actually finds it.
+        [.textDelta("contract renewal"), .stopped],
+        // Answer hop: distinct text, so the assertions below can tell the two
+        // hops apart instead of both trivially matching one shared script.
+        [.textDelta("It renews next month."), .stopped],
+    ])
     let egressGuard = EgressGuard(provider: provider, database: db, account: account)
     let askInbox = AskInbox(guard: egressGuard, database: db, account: account)
 
     let stream = try await askInbox.ask(
         "What is the status of the contract renewal?", invocation: .userInvoked(.ask))
-    _ = try await collect(stream)
+    let events = try await collect(stream)
 
     #expect(provider.callCount == 2)  // 1 expansion hop + 1 answer hop
+    // The expansion phrase's retrieval hit — m1 — is what gets cited; the
+    // raw question alone would have retrieved nothing (see doc comment).
+    #expect(events.contains(.citations(["m1"])))
+    #expect(events.contains(.coverage(hydratedFraction: 1.0)))
+    // The streamed answer text is the ANSWER hop's script, not the expansion
+    // hop's search phrase leaking through.
+    #expect(answerText(events) == "It renews next month.")
 }
 
 // MARK: - RED: not opted in — throws before any egress, including expansion
@@ -201,16 +226,28 @@ private func answerText(_ events: [AskEvent]) -> String {
     #expect(events.contains(.coverage(hydratedFraction: 1.0)))
 }
 
-// MARK: - RED: model falls back to the documented default, never hardcoded as the only source
+// MARK: - RED: the request carries ai_config's configured model, not a hardcoded constant
 
-@Test func askModelFallsBackToDocumentedDefaultWhenUnconfigured() async throws {
+/// Proves `resolvedModel()`'s plumbing: the model that reaches the request is
+/// whatever `ai_config` has configured for `.ask`, not some literal baked
+/// into the request path. Deliberately configures a model DIFFERENT from
+/// `AskInbox.defaultModel` so the assertion can't be satisfied by coincidence.
+///
+/// This does NOT (and, unlike `Summarize.modelFallsBackToDocumentedDefaultWhenUnconfigured`,
+/// CANNOT) test the `?? AskInbox.defaultModel` fallback branch itself:
+/// `AskInbox` has no cache-first path that could let `resolvedModel()`'s
+/// output surface without ALSO passing `EgressGuard`'s identical opt-in check
+/// on that same `ai_config` row, and `ai_config.model` is `NOT NULL` — so any
+/// row that clears the opt-in gate always carries an explicit model. There is
+/// no reachable state where `.ask` is opted in (so the request actually
+/// fires) and the fallback constant is what supplied the model.
+@Test func askUsesAIConfigsConfiguredModelNotTheHardcodedDefault() async throws {
     let db = try HudsonDatabase.inMemory()
     _ = try await db.applySnapshot(snap("m1", subject: "Invoice"), account: account)
     try await db.saveBody(messageID: "m1", account: account, body: Sanitizer.sanitize(html: nil, plainText: "The invoice."))
-    // `.ask` opted in via a raw INSERT so no model is implied by a helper default.
-    try await db.setAIConfig(
-        feature: AIFeature.ask.rawValue, model: AskInbox.defaultModel, baseURL: nil, optIn: true,
-        account: account)
+    let configuredModel = "claude-opus-5"
+    #expect(configuredModel != AskInbox.defaultModel)
+    try await optInAsk(db, model: configuredModel)
     let provider = ScriptedProvider(script: [.textDelta("ok"), .stopped])
     let egressGuard = EgressGuard(provider: provider, database: db, account: account)
     let askInbox = AskInbox(guard: egressGuard, database: db, account: account)
@@ -218,6 +255,5 @@ private func answerText(_ events: [AskEvent]) -> String {
     let stream = try await askInbox.ask("invoice", invocation: .userInvoked(.ask))
     _ = try await collect(stream)
 
-    #expect(provider.lastRequest?.model == AskInbox.defaultModel)
-    #expect(AskInbox.defaultModel == "claude-sonnet-5")
+    #expect(provider.lastRequest?.model == configuredModel)
 }
