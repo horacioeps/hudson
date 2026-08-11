@@ -120,7 +120,9 @@ public final class AppModel {
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
-        self.thread = ThreadModel(database: database, account: email)
+        self.thread = ThreadModel(
+            database: database, account: email,
+            hydrateBody: Self.makeHydrateBody(database: database, account: account))
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.settings = SettingsModel(database: database, account: email)
@@ -152,7 +154,9 @@ public final class AppModel {
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
-        self.thread = ThreadModel(database: database, account: email)
+        self.thread = ThreadModel(
+            database: database, account: email,
+            hydrateBody: Self.makeHydrateBody(database: database, account: account))
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.settings = SettingsModel(database: database, account: email)
@@ -196,6 +200,29 @@ public final class AppModel {
     /// (empty inbox, empty search) rather than crashing.
     private static func accountEmail(_ account: AccountRecord?) -> String {
         account?.email ?? ""
+    }
+
+    /// `ThreadModel`'s on-demand body-fetch closure (Task: reading-pane
+    /// on-demand hydration) — thin passthrough to
+    /// `SyncBootstrap.makeHydrator`, which does the actual Keychain ->
+    /// OAuthClient -> GmailClient -> SyncEngine wiring (see its doc
+    /// comment) and builds that stack exactly ONCE, capturing it in the
+    /// returned closure. Kept here, rather than inlined at each of the two
+    /// `ThreadModel(...)` call sites above, purely to avoid repeating the
+    /// `account.flatMap { ... }` unwrap twice.
+    ///
+    /// `nil` account (no connected account — matches `accountEmail`'s own
+    /// "no account yet" contract) means `nil` here too: there's no
+    /// `AccountRecord` to build a `GmailClient` from, so on-demand
+    /// hydration is simply unavailable — exactly the same "local-only"
+    /// posture `SyncBootstrap.makeHydrator` already gives an account with
+    /// no stored Keychain credentials (the `--demo` mailbox, or any first
+    /// launch before `hudson auth`).
+    private static func makeHydrateBody(
+        database: HudsonDatabase, account: AccountRecord?
+    ) -> (@Sendable (String) async -> Bool)? {
+        guard let account else { return nil }
+        return SyncBootstrap.makeHydrator(database: database, account: account)
     }
 
     /// Both subscription tasks capture `self` only weakly, so nothing here
