@@ -1,4 +1,5 @@
 import Foundation
+import GmailKit
 import Store
 
 /// The root of the app's object graph. Owns the open database, the active
@@ -14,6 +15,13 @@ import Store
 public final class AppModel {
     public let database: HudsonDatabase
     public private(set) var account: AccountRecord?
+
+    /// Where Gmail OAuth tokens + the BYO client secret live — injected so
+    /// `disconnectAccount()` (Task 5's "Disconnect account") is testable
+    /// without ever touching the real Keychain, mirroring how
+    /// `SettingsModel` injects `keyStore`. `KeychainTokenStore` in
+    /// production; an `InMemoryTokenStore` in tests.
+    private let tokenStore: any TokenStore
 
     /// Whether this instance is the `--demo`/`HUDSON_DEMO=1` synthetic
     /// mailbox (`AppModel.demo()`) rather than a real one. Only `demo()`
@@ -97,12 +105,13 @@ public final class AppModel {
     /// builds every child model. Never touches the Keychain or the network
     /// — the app is read-and-triage until the user explicitly triggers
     /// `syncNow()`.
-    public init(databaseURL: URL) async throws {
+    public init(databaseURL: URL, tokenStore: (any TokenStore)? = nil) async throws {
         let database = try HudsonDatabase.open(at: databaseURL)
         self.database = database
         let account = try await database.primaryAccount()
         self.account = account
         self.isDemo = false
+        self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -127,10 +136,14 @@ public final class AppModel {
     /// its first emission to land. `isDemo` defaults `false` — only `demo()`
     /// passes `true`; every other caller (tests, `RootView`'s post-onboarding
     /// rebuild) gets the real, non-demo `needsOnboarding` semantics.
-    public init(database: HudsonDatabase, account: AccountRecord?, isDemo: Bool = false) {
+    public init(
+        database: HudsonDatabase, account: AccountRecord?, isDemo: Bool = false,
+        tokenStore: (any TokenStore)? = nil
+    ) {
         self.database = database
         self.account = account
         self.isDemo = isDemo
+        self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -501,5 +514,84 @@ public final class AppModel {
         } catch {
             syncBanner = "Sync failed — check your connection."
         }
+    }
+
+    // MARK: - Disconnect account (Task 5)
+
+    /// User-visible message shown via `syncBanner` — reusing `runSyncPass`'s
+    /// own banner mechanism, not a new one — when `disconnectAccount()`'s
+    /// purge only PARTIALLY completes. See that method's doc comment for why
+    /// a partial failure must never be reported as success.
+    private static let disconnectFailedBannerText = "Couldn't disconnect — try again."
+
+    /// "Disconnect <email>" from Settings: removes this Mac's copy of the
+    /// connected account — clears its Gmail OAuth tokens + BYO client secret
+    /// from the Keychain (`tokenStore.deleteAll`), deletes its `accounts` row
+    /// (`database.deleteAccount`), stops the now-pointless background
+    /// auto-sync loop, and clears `account`. That last write is what flips
+    /// `needsOnboarding` back to `true` — `RootView`'s reverse gate (the
+    /// `.onChange` mirror of Task 4's forward `.task` gate) reacts to that
+    /// exact transition and brings `OnboardingView` back, so the app
+    /// genuinely returns to first-launch, not just an emptied mailbox.
+    ///
+    /// Neither delete is `try?`'d away: a genuinely thrown error from EITHER
+    /// one aborts the disconnect, surfaces `syncBanner` (mirrors
+    /// `runSyncPass`'s own failure posture), and — crucially — leaves
+    /// `self.account` set. `needsOnboarding` therefore stays `false` and
+    /// Settings' "Disconnect" affordance stays up, so the app never lies
+    /// about having forgotten an account it still has a live trace of, and
+    /// the user can simply retry.
+    ///
+    /// The two deletes run in this order, DELIBERATELY, not concurrently:
+    ///
+    /// 1. Keychain (`tokenStore.deleteAll`) first. Both `TokenStore`
+    ///    implementations (`InMemoryTokenStore`, `KeychainTokenStore`) treat
+    ///    deleting an already-empty/missing entry as a no-op rather than an
+    ///    error, so if THIS step throws, nothing has changed yet — a retry
+    ///    (or simply relaunching, since the `accounts` row is still there)
+    ///    starts from the exact same state.
+    /// 2. The `accounts` row (`database.deleteAccount`) second, ONLY once the
+    ///    Keychain half is confirmed gone. Running these in the opposite
+    ///    order would risk the worse failure: the `accounts` row (the thing
+    ///    that flips `needsOnboarding` and hides "Disconnect") gone while a
+    ///    failed Keychain purge leaves the OAuth tokens/BYO secret orphaned —
+    ///    with no UI left to retry removing them, since there's no longer a
+    ///    connected account to run "Disconnect" against.
+    ///
+    /// If step 1 succeeds but step 2 throws, the Keychain half genuinely IS
+    /// clean — only the Store half still needs to land, and a retry's step 1
+    /// is then a cheap no-op.
+    ///
+    /// A no-op if there's no connected account to disconnect (mirrors
+    /// `syncNow()`'s own "guard on account" posture) — nothing to clear, and
+    /// crucially nothing that could flip `needsOnboarding` for the demo
+    /// mailbox (`isDemo` alone keeps that gate shut regardless, but this
+    /// guard means a stray call here never even touches the Keychain/Store
+    /// for a mailbox with no real account).
+    ///
+    /// Deliberately does NOT touch already-synced mail (`messages`/
+    /// `threads`, ...) — see `AccountStore.deleteAccount`'s doc comment.
+    /// "Disconnect" forgets the CONNECTION; it isn't a full data wipe.
+    public func disconnectAccount() async {
+        guard let account else { return }
+        let email = account.email
+        syncBanner = nil
+
+        do {
+            try tokenStore.deleteAll(account: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
+        do {
+            try await database.deleteAccount(email: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
+
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
+        self.account = nil
     }
 }

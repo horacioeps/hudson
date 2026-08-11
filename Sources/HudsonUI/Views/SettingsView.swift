@@ -1,10 +1,29 @@
 import SwiftUI
 
-/// The Settings sheet — currently AI setup (turn on summarize/draft/ask with
-/// your own key, or a local model). Presented from the sidebar's gear.
+/// The Settings sheet — AI setup (turn on summarize/draft/ask with your own
+/// key, or a local model) plus account management (Task 5: "Disconnect
+/// account"). Presented from the sidebar's gear.
 struct SettingsView: View {
     @Bindable var settings: SettingsModel
+    /// The connected account's address, or `nil` when there isn't one
+    /// (defensive — `SettingsView` is only ever presented from inside the
+    /// assembled mailbox, which `RootView`'s onboarding gate keeps un-
+    /// mounted without an account, but this stays a plain optional rather
+    /// than trust that invariant). `nil` hides the disconnect section
+    /// entirely — there is nothing to disconnect.
+    let accountEmail: String?
+    /// Runs `AppModel.disconnectAccount()` — called only after the user
+    /// confirms in the dialog below. This view makes no `AppModel`/Store
+    /// calls of its own (matches every other Hudson view's "presentational
+    /// only" contract), so the actual disconnect logic lives entirely on
+    /// the host's side of this closure.
+    let onDisconnect: () -> Void
     let onClose: () -> Void
+
+    /// Whether the "Disconnect <email>?" confirmation is showing — view-
+    /// local, like `OnboardingView`'s BYO draft fields, since there's
+    /// nowhere else for a yes/no dialog's presentation state to live.
+    @State private var isConfirmingDisconnect = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.unit * 4) {
@@ -49,6 +68,10 @@ struct SettingsView: View {
                 QuietButton(title: "Done", action: onClose)
             }
             .padding(.top, Metrics.unit)
+
+            if let accountEmail {
+                accountSection(accountEmail)
+            }
         }
         .padding(Metrics.unit * 5)
         .frame(width: 460)
@@ -59,6 +82,42 @@ struct SettingsView: View {
                 .stroke(Palette.borderStrong, lineWidth: 1))
         .shadow(color: .black.opacity(0.4), radius: 24, y: 12)
         .task { await settings.load() }
+        .confirmationDialog(
+            "Disconnect \(accountEmail ?? "")?",
+            isPresented: $isConfirmingDisconnect,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect", role: .destructive, action: onDisconnect)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Hudson will forget this account on this Mac. You can reconnect anytime.")
+        }
+    }
+
+    /// "Disconnect <email>" (Task 5) — a thin rule to separate it from the
+    /// AI section above, then a single low-emphasis, danger-colored button
+    /// that opens the confirmation dialog attached to `body`. Tapping never
+    /// disconnects directly: `onDisconnect` only runs once the dialog's
+    /// "Disconnect" choice is picked, so a stray click can't silently sign
+    /// the user out.
+    private func accountSection(_ email: String) -> some View {
+        VStack(alignment: .leading, spacing: Metrics.unit * 3) {
+            Rectangle()
+                .fill(Palette.border)
+                .frame(height: 1)
+
+            Text("Account")
+                .font(Typography.ui(13, .semibold))
+                .foregroundStyle(Palette.ink)
+
+            Button(action: { isConfirmingDisconnect = true }) {
+                Text("Disconnect \(email)")
+                    .font(Typography.ui(13, .medium))
+                    .foregroundStyle(Palette.danger)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.top, Metrics.unit)
     }
 
     private var header: some View {

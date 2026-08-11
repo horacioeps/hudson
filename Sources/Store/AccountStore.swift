@@ -37,6 +37,21 @@ extension HudsonDatabase {
         }
     }
 
+    /// Removes the account row entirely — the Store half of "Disconnect
+    /// account" (the other half is `KeychainTokenStore.deleteAll`, which the
+    /// caller is responsible for running against the SAME `email` first).
+    /// No FK from any other table references `accounts`, so this never needs
+    /// to cascade: mail already synced to `messages`/`threads` is untouched,
+    /// matching this feature's scope of forgetting the CONNECTION, not
+    /// wiping locally cached mail. A no-op (not an error) if `email` was
+    /// never connected — mirrors `TokenStore.deleteAll`'s own
+    /// idempotent-on-miss contract.
+    public func deleteAccount(email: String) async throws {
+        try await writer.write { db in
+            try db.execute(sql: "DELETE FROM accounts WHERE email = ?", arguments: [email])
+        }
+    }
+
     /// The account CLI commands operate on (first alphabetically; M1 parity).
     public func primaryAccount() async throws -> AccountRecord? {
         try await writer.read { db in
