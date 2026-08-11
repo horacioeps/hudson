@@ -375,7 +375,7 @@ enum ThreadRollup {
 
     /// Whether any message in the ONE given thread effectively carries
     /// `label` — effective = (canonical ∪ pending adds) − pending removes,
-    /// mirroring `StoreReads.messageRow`'s overlay composition. Scoped to
+    /// the shared `EffectiveLabels.fragment` overlay composition. Scoped to
     /// `thread_id = :thread` throughout, so this is a bounded scan of that
     /// thread's messages only, never other threads.
     private static func effectiveLabelPresentInThread(
@@ -388,18 +388,7 @@ enum ThreadRollup {
                     SELECT 1 FROM messages m
                     WHERE m.account_email = :account AND m.thread_id = :thread
                     AND EXISTS (
-                        SELECT 1 FROM (
-                            SELECT label_id FROM message_labels
-                            WHERE account_email = :account AND message_id = m.id
-                            UNION
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = :account AND message_id = m.id AND op = 'add'
-                        ) AS present
-                        WHERE label_id = :label
-                        AND label_id NOT IN (
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = :account AND message_id = m.id AND op = 'remove'
-                        )
+                        \(EffectiveLabels.fragment(account: ":account", messageID: "m.id", label: ":label"))
                     )
                 )
                 """,

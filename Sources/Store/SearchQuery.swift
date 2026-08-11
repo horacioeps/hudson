@@ -65,14 +65,12 @@ extension HudsonDatabase {
     /// to the requesting account, since `fts_messages` itself carries no
     /// account column.
     ///
-    /// **Overlay scope:** `.inbox` adds an `EXISTS` filter over the same
-    /// effective-labels composition `StoreReads.messageRow` and
-    /// `ThreadRollup.effectiveLabelPresentInThread` use — (canonical
-    /// `message_labels` ∪ pending `mutation_queue` adds) − pending
-    /// `mutation_queue` removes — evaluated per hit message rather than per
-    /// thread, so an optimistically-archived message drops out of an
-    /// in-inbox search on the very next call, before the archive ever
-    /// reaches Gmail.
+    /// **Overlay scope:** `.inbox` adds an `EXISTS` filter using the shared
+    /// `EffectiveLabels.fragment` (canonical `message_labels` ∪ pending
+    /// `mutation_queue` adds, minus pending `mutation_queue` removes) —
+    /// evaluated per hit message rather than per thread, so an
+    /// optimistically-archived message drops out of an in-inbox search on
+    /// the very next call, before the archive ever reaches Gmail.
     public func searchMessages(
         account: String, query: String, limit: Int, scope: SearchScope = .all
     ) async throws -> [SearchHit] {
@@ -92,21 +90,15 @@ extension HudsonDatabase {
                 """
             var arguments: StatementArguments = [match, account]
             if case .inbox = scope {
+                // See `EffectiveLabels.fragment`'s doc comment: `EXISTS`
+                // only cares whether a row comes back, so embedding the
+                // shared "list effective labels" shape directly (rather
+                // than a bespoke `SELECT 1`) is behaviorally identical.
                 sql += """
 
                     AND EXISTS (
-                        SELECT 1 FROM (
-                            SELECT label_id FROM message_labels
-                            WHERE account_email = m.account_email AND message_id = m.id
-                            UNION
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = m.account_email AND message_id = m.id AND op = 'add'
-                        ) AS present
-                        WHERE label_id = 'INBOX'
-                        AND label_id NOT IN (
-                            SELECT label_id FROM mutation_queue
-                            WHERE account_email = m.account_email AND message_id = m.id AND op = 'remove'
-                        )
+                        \(EffectiveLabels.fragment(
+                            account: "m.account_email", messageID: "m.id", label: "'INBOX'"))
                     )
                     """
             }
