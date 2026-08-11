@@ -407,9 +407,11 @@ private struct ThreadSeed: Sendable {
                     snippet: message.snippet, labelIDs: labelIDs))
 
             if let bodyText = message.body {
-                let body = SanitizedBody(
-                    rawHTML: nil, plainText: bodyText, sanitizerVersion: Sanitizer.version,
-                    cidReferences: [], remoteURLs: [])
+                // Build the body through the real sanitizer factory rather than
+                // fabricating a `SanitizedBody` — that keeps the §3.5 invariant
+                // that a `SanitizedBody` only ever comes out of `Sanitizer`. With
+                // `html: nil` this yields exactly the plain-text body we want.
+                let body = Sanitizer.sanitize(html: nil, plainText: bodyText)
                 let attachments = message.attachment.map { [$0] } ?? []
                 bodySaves.append((messageID: messageID, body: body, attachments: attachments))
             }

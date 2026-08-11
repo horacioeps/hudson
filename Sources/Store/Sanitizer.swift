@@ -9,21 +9,11 @@ public struct SanitizedBody: Sendable, Equatable {
     public let sanitizerVersion: Int
     public let cidReferences: [String]
     public let remoteURLs: [String]
-
-    /// Public memberwise init — the struct's implicit one is only
-    /// `internal`, so cross-module callers that already hold sanitized
-    /// content (e.g. `DemoData`'s synthetic bodies) need this to construct
-    /// one directly instead of routing invented text through `sanitize(_:)`.
-    public init(
-        rawHTML: Data?, plainText: String, sanitizerVersion: Int, cidReferences: [String],
-        remoteURLs: [String]
-    ) {
-        self.rawHTML = rawHTML
-        self.plainText = plainText
-        self.sanitizerVersion = sanitizerVersion
-        self.cidReferences = cidReferences
-        self.remoteURLs = remoteURLs
-    }
+    // No public initializer by design (spec §3.5): a `SanitizedBody` is only
+    // ever the OUTPUT of `Sanitizer.sanitize`, so untrusted content can never
+    // reach the terminal or FTS index without passing through the sanitizer.
+    // The implicit memberwise init stays `internal` — usable inside Store,
+    // never fabricable from another module.
 }
 
 /// The single sanitizer/extractor (spec §3.5). Mail content is hostile input:
