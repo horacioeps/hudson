@@ -14,8 +14,15 @@ enum SendBootstrap {
     /// Returns `nil` — NEVER throws — whenever a credential is missing, so
     /// `ComposerModel.send()` can show a friendly "connect an account"
     /// banner instead of crashing. Same contract as `SyncBootstrap.makeStack`.
-    static func makeService(database: HudsonDatabase, account: AccountRecord) -> SendService? {
-        let store = KeychainTokenStore()
+    ///
+    /// `store` defaults to the real Keychain in production (every existing
+    /// call site keeps working unchanged) but is an injectable seam so
+    /// tests can pass `InMemoryTokenStore()` instead — CI must never touch
+    /// a real keychain (spec §6.3, same rule `GmailKitTests` already
+    /// follows for every other `TokenStore` consumer).
+    static func makeService(
+        database: HudsonDatabase, account: AccountRecord, store: any TokenStore = KeychainTokenStore()
+    ) -> SendService? {
         guard let clientSecret = try? store.clientSecret(account: account.email) else { return nil }
         let session = AccountSession(
             account: account.email,
