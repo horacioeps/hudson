@@ -1,3 +1,4 @@
+import AIKit
 import Foundation
 import Outbox
 import Store
@@ -90,6 +91,10 @@ public final class ComposerModel {
     /// A user-visible strip for compose-level state (no account connected, a
     /// send/undo failure, an undo outcome). `nil` when there's nothing to say.
     public private(set) var banner: String?
+
+    /// True while an AI draft is streaming into the body — the Draft button
+    /// shows a spinner and disables while this is set.
+    public private(set) var isDrafting = false
 
     /// Called after a successful `send()` so the presenter (Task 4's
     /// `AppModel`) can dismiss the sheet. The draft's undo handle
@@ -230,6 +235,37 @@ public final class ComposerModel {
             // A build/size or Store failure — keep the draft intact so the
             // user doesn't lose what they wrote.
             banner = "Couldn't send — check the message and try again."
+        }
+    }
+
+    /// Draft-in-voice: replaces the body with an AI draft written in the user's
+    /// OWN style (a voice profile distilled from their sent mail). Explicit —
+    /// only the composer's "✦ Draft" button calls this; the tap IS the
+    /// `Invocation`. Whatever the user roughed out becomes the instruction (a
+    /// terse note still comes back sounding like them). If AI isn't enabled it
+    /// points at Settings and egresses nothing.
+    public func generateDraft() async {
+        guard !isDrafting, let account else { return }
+        guard let draft = await AIBootstrap.makeDraft(database: database, account: account.email) else {
+            banner = "Enable AI in Settings to draft in your voice."
+            return
+        }
+        let threadID: String? = { if case .reply(let id) = mode { return id }; return nil }()
+        let instruction = bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Write a brief, friendly email." : bodyText
+
+        isDrafting = true
+        banner = nil
+        defer { isDrafting = false }
+        do {
+            let stream = try await draft.draft(
+                replyTo: threadID, instruction: instruction, invocation: .userInvoked(.draft))
+            bodyText = ""
+            for try await delta in stream {
+                bodyText += delta
+            }
+        } catch {
+            banner = "Couldn't draft — check your AI settings."
         }
     }
 

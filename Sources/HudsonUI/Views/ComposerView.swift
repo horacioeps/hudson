@@ -175,10 +175,8 @@ public struct ComposerView: View {
                 .disabled(composer.isSending)
             QuietButton(title: "Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)
+            draftButton
             Spacer(minLength: Metrics.unit)
-            if isReplyMode {
-                draftPlaceholderChip
-            }
         }
         .padding(.horizontal, Metrics.unit * 5)
         .padding(.vertical, Metrics.unit * 3)
@@ -187,22 +185,29 @@ public struct ComposerView: View {
         }
     }
 
-    /// The AI "Draft in your voice" affordance from the Pencil design's
-    /// right-hand panel — NON-FUNCTIONAL here (that panel's real streaming
-    /// draft is a later milestone), so a tap only surfaces a toast, exactly
-    /// matching `ThreadView.summaryChip`'s own "not built yet" placeholder
-    /// convention (same `aiBg`/`aiInk` tokens, zero network egress).
-    private var draftPlaceholderChip: some View {
-        Button(action: { showPlaceholderToast("AI draft arrives in a later milestone") }) {
-            Text("✦ Draft")
-                .font(Typography.ui(12, .medium))
-                .foregroundStyle(Palette.aiInk)
-                .padding(.vertical, Metrics.unit * 2)
-                .padding(.horizontal, Metrics.unit * 3)
-                .background(Palette.aiBg)
-                .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
+    /// AI "draft in your voice" — writes the body in the user's OWN style,
+    /// learned from their sent mail. Explicit: the tap IS the invocation. Shows
+    /// a spinner while streaming; if AI isn't enabled, `ComposerModel` points
+    /// the user at Settings via `banner` (no egress).
+    private var draftButton: some View {
+        Button(action: { Task { await composer.generateDraft() } }) {
+            HStack(spacing: Metrics.unit) {
+                if composer.isDrafting {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("✦")
+                }
+                Text(composer.isDrafting ? "Drafting…" : "Draft")
+            }
+            .font(Typography.ui(12, .medium))
+            .foregroundStyle(Palette.aiInk)
+            .padding(.vertical, Metrics.unit * 2)
+            .padding(.horizontal, Metrics.unit * 3)
+            .background(Palette.aiBg)
+            .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
         }
         .buttonStyle(.plain)
+        .disabled(composer.isDrafting || composer.isSending)
     }
 
     private var isReplyMode: Bool {

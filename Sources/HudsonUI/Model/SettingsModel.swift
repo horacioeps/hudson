@@ -88,12 +88,17 @@ public final class SettingsModel {
             modelsByFeature = [
                 (.summarize, "claude-haiku-4-5"),
                 (.draft, "claude-sonnet-5"), (.ask, "claude-sonnet-5"),
+                // Draft-in-voice distills a style card from sent mail with its
+                // OWN opt-in — enable it alongside draft so the button works.
+                (.voiceProfile, "claude-sonnet-5"),
             ]
         case .openAICompat:
             let trimmedURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             baseEncoding = trimmedURL.isEmpty ? "openai-compat" : "openai-compat|\(trimmedURL)"
             let chosen = model.trimmingCharacters(in: .whitespacesAndNewlines)
-            modelsByFeature = [(.summarize, chosen), (.draft, chosen), (.ask, chosen)]
+            modelsByFeature = [
+                (.summarize, chosen), (.draft, chosen), (.ask, chosen), (.voiceProfile, chosen),
+            ]
         }
 
         do {
@@ -116,7 +121,7 @@ public final class SettingsModel {
     /// Turn AI back off (opt every feature out — the key stays in the Keychain
     /// so re-enabling doesn't require re-pasting it).
     public func disable() async {
-        for feature in [AIFeature.summarize, .draft, .ask] {
+        for feature in [AIFeature.summarize, .draft, .ask, .voiceProfile] {
             try? await database.setAIConfig(
                 feature: feature.rawValue, model: "", baseURL: nil, optIn: false, account: account)
         }

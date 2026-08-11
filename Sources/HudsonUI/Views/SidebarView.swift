@@ -135,19 +135,25 @@ public struct SidebarView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: Metrics.unit * 2) {
+        VStack(alignment: .leading, spacing: Metrics.unit) {
+            HStack(spacing: Metrics.unit * 2) {
+                // The Hudson wordmark — the app's mark in the bottom bar.
+                Text("Hudson")
+                    .font(Typography.serif(15, .semibold))
+                    .foregroundStyle(Palette.ink)
+                Spacer(minLength: Metrics.unit)
+                syncNowButton
+                Button(action: onSettings) {
+                    Image(systemName: "gearshape")
+                        .foregroundStyle(Palette.inkTertiary)
+                }
+                .buttonStyle(.plain)
+            }
+            // Sync status as a quiet subtitle under the wordmark.
             Text(footerStatusText)
-                .font(Typography.ui(11))
+                .font(Typography.ui(10))
                 .foregroundStyle(syncBanner != nil ? Palette.danger : Palette.inkTertiary)
                 .lineLimit(1)
-            Spacer(minLength: Metrics.unit)
-            syncNowButton
-            // Non-functional placeholder — a settings scene lands in a later task.
-            Button(action: onSettings) {
-                Image(systemName: "gearshape")
-                    .foregroundStyle(Palette.inkTertiary)
-            }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, Metrics.unit * 3)
         .padding(.vertical, Metrics.unit * 3)

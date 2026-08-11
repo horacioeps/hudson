@@ -187,12 +187,15 @@ import Testing
     let db = try HudsonDatabase.inMemory()
     try await DemoData.seed(into: db, account: AppModel.demoAccount)
     let model = AppModel(database: db, account: try await db.primaryAccount())
-    try await Task.sleep(for: .milliseconds(50))
     model.openThread("t01")
-    try await Task.sleep(for: .milliseconds(50))
-
     model.replyToOpenThread()
-    try await Task.sleep(for: .milliseconds(50))
+
+    // `replyToOpenThread` builds the reply scaffold asynchronously (ReplyBuilder
+    // reads the thread) and only then shows the sheet — poll for that rather
+    // than guessing a fixed sleep (the flake this replaces).
+    for _ in 0..<80 where !model.isComposerVisible {
+        try await Task.sleep(for: .milliseconds(25))
+    }
 
     #expect(model.isComposerVisible)
     guard case .reply(let threadID) = model.composer.mode else {
