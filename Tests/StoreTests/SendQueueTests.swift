@@ -247,3 +247,48 @@ import Testing
         rawMIME: Data(), holdUntil: 0, now: 0)
     #expect(secondID > 0)
 }
+
+// M5 Task 6: `hudson send`/`hudson reply` needs to report THIS job's
+// resulting state after a flush pass (sent-with-Gmail-id vs. still-held vs.
+// ambiguous in_flight) — `flushOnce`'s aggregate confirmed-count return
+// doesn't distinguish which job(s) it confirmed, so the CLI needs a
+// by-id/by-account read. Mirrors `StoreReads.message`'s "return nil, don't
+// throw" posture for an unknown id.
+@Test func sendJobReadsBackAnExistingJobByIDAndAccount() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: "t1",
+        rawMIME: Data("raw-mime-bytes".utf8), holdUntil: 1_100, now: 1_000)
+
+    let job = try await database.sendJob(id: id, account: "a@b.c")
+
+    #expect(job?.id == id)
+    #expect(job?.state == .pending)
+    #expect(job?.rfc822MessageID == "<m1@hudson.local>")
+    #expect(job?.threadID == "t1")
+}
+
+@Test func sendJobReturnsNilForAnUnknownIDOrWrongAccount() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+
+    #expect(try await database.sendJob(id: 999_999, account: "a@b.c") == nil)
+    // Same id, wrong account — never leaks another account's job.
+    #expect(try await database.sendJob(id: id, account: "x@y.z") == nil)
+}
+
+@Test func sendJobReflectsStateAfterMarkSent() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+    try await database.markSendInFlight(id: id, account: "a@b.c")
+    try await database.markSent(id: id, account: "a@b.c", sentMessageID: "gmail-1")
+
+    let job = try await database.sendJob(id: id, account: "a@b.c")
+
+    #expect(job?.state == .sent)
+    #expect(job?.sentMessageID == "gmail-1")
+}

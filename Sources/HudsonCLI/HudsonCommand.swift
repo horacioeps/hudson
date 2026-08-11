@@ -11,6 +11,7 @@ struct HudsonCommand: AsyncParsableCommand {
                       ArchiveCommand.self, UnarchiveCommand.self,
                       StarCommand.self, UnstarCommand.self,
                       ReadCommand.self, UnreadCommand.self,
-                      LabelCommand.self, PendingCommand.self, UndoCommand.self]
+                      LabelCommand.self, PendingCommand.self, UndoCommand.self,
+                      SendCommand.self, ReplyCommand.self]
     )
 }

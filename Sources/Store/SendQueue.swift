@@ -134,6 +134,25 @@ extension HudsonDatabase {
         }
     }
 
+    /// Reads back one job by id, scoped to `account` so a caller can never
+    /// leak another account's row by guessing an id. `nil` for an unknown
+    /// id (or one that belongs to a different account) — same "return nil,
+    /// don't throw" posture as `StoreReads.message`.
+    ///
+    /// Exists for `hudson send`/`hudson reply` (M5 Task 6): after a flush
+    /// pass, the CLI needs to report THIS specific job's resulting state
+    /// (sent — with Gmail's id — vs. still held inside its undo window vs.
+    /// ambiguous `in_flight`), and `flushOnce`'s aggregate confirmed-count
+    /// return doesn't say which job(s) it confirmed.
+    public func sendJob(id: Int64, account: String) async throws -> SendJob? {
+        try await writer.read { db in
+            try Row.fetchOne(
+                db, sql: "SELECT * FROM send_jobs WHERE id = ? AND account_email = ?",
+                arguments: [id, account]
+            ).map(Self.sendJob(from:))
+        }
+    }
+
     /// Jobs of unknown outcome after a crash or restart — the restart
     /// dedup probe's worklist (§7.3). Each is re-checked against Gmail
     /// (`rfc822msgid` search) before the caller decides sent / resend /
