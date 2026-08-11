@@ -463,5 +463,28 @@ let migrator: DatabaseMigrator = {
             on: "send_jobs", columns: ["account_email", "state", "hold_until"])
     }
 
+    migrator.registerMigration("v8") { db in
+        // M5 Task 5: reply threading needs the FULL threading triple
+        // (§7.1) — Gmail's own thread id was already on `messages.
+        // thread_id` (v1), but the other two legs (`In-Reply-To`/
+        // `References`) require the ORIGINAL message's own RFC
+        // `Message-ID`/`References` headers, which nothing before this
+        // task persisted (v1's `messages` row only kept From/To/Subject/
+        // snippet). Two nullable columns, ALTERed onto the existing table
+        // — unlike `send_jobs`' v7, which could declare its CHECK inline
+        // on a brand-new CREATE TABLE, these are plain nullable adds with
+        // no CHECK, so SQLite's ALTER ADD COLUMN applies with no
+        // full-table rebuild.
+        //
+        // `references_header` is stored exactly as Gmail sent it — a
+        // single whitespace-separated string of `<id>` tokens (RFC 5322
+        // §3.6.4) — not re-parsed into a JSON array at write time; see
+        // `MessageSnapshot.referencesHeader`'s doc comment for why.
+        try db.alter(table: "messages") { t in
+            t.add(column: "rfc822_message_id", .text)
+            t.add(column: "references_header", .text)
+        }
+    }
+
     return migrator
 }()

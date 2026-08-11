@@ -403,8 +403,9 @@ extension HudsonDatabase {
         try db.execute(
             sql: """
                 INSERT INTO messages (account_email, id, thread_id, history_id, internal_date,
-                                      from_line, to_line, subject, snippet)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      from_line, to_line, subject, snippet,
+                                      rfc822_message_id, references_header)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_email, id) DO UPDATE SET
                     history_id = excluded.history_id,
                     thread_id = excluded.thread_id,
@@ -412,12 +413,15 @@ extension HudsonDatabase {
                     from_line = excluded.from_line,
                     to_line = excluded.to_line,
                     subject = excluded.subject,
-                    snippet = excluded.snippet
+                    snippet = excluded.snippet,
+                    rfc822_message_id = excluded.rfc822_message_id,
+                    references_header = excluded.references_header
                 """,
             arguments: [
                 account, snapshot.id, snapshot.threadID, snapshot.historyID,
                 snapshot.internalDate, snapshot.fromLine, snapshot.toLine,
                 snapshot.subject, snapshot.snippet,
+                snapshot.rfc822MessageID, snapshot.referencesHeader,
             ])
         try replaceLabels(snapshot.labelIDs, messageID: snapshot.id, account: account, db: db)
         let rules = try splitRules ?? SplitInbox.fetchRules(account: account, db: db)

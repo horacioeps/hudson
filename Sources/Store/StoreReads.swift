@@ -13,6 +13,15 @@ public struct MessageRow: Sendable, Equatable {
     public let snippet: String
     public let hasBody: Bool
     public let labelIDs: [String]
+    /// This message's own RFC 5322 `Message-ID`/`References` headers, as
+    /// persisted by `applySnapshot` (M5 Task 5) — the raw material
+    /// `Outbox.replyMessage` needs to build the threading triple's
+    /// `In-Reply-To`/`References` legs off the thread's newest message.
+    /// `nil` for messages hydrated before those columns existed, or for a
+    /// source fetch that never carried headers (see
+    /// `MessageSnapshot.rfc822MessageID`'s doc comment).
+    public let rfc822MessageID: String?
+    public let referencesHeader: String?
 }
 
 extension HudsonDatabase {
@@ -72,6 +81,7 @@ extension HudsonDatabase {
             id: id, threadID: raw["thread_id"], historyID: raw["history_id"],
             internalDate: raw["internal_date"], fromLine: raw["from_line"],
             toLine: raw["to_line"], subject: raw["subject"], snippet: raw["snippet"],
-            hasBody: raw["has_body"], labelIDs: labels)
+            hasBody: raw["has_body"], labelIDs: labels,
+            rfc822MessageID: raw["rfc822_message_id"], referencesHeader: raw["references_header"])
     }
 }
