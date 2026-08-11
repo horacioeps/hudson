@@ -91,26 +91,46 @@ extension HudsonDatabase {
 
     /// Terminal success. `sentMessageID` is Gmail's own message id (from
     /// the `messages.send` response) — distinct from `rfc822_message_id`,
-    /// the RFC `Message-ID` header used for dedup and threading.
-    public func markSent(id: Int64, account: String, sentMessageID: String) async throws {
+    /// the RFC `Message-ID` header used for dedup and threading. Guarded
+    /// to `state = 'in_flight'` so the state machine (§7.3) is actually
+    /// enforced at the database layer, not just by caller discipline: a
+    /// job that never went through `markSendInFlight` (or one already
+    /// terminal — `sent`/`failed`) cannot be silently flipped to `sent`.
+    /// Returns whether the transition actually happened so a caller that
+    /// raced another writer (or called this out of order) can detect a
+    /// no-op instead of believing the job is now recorded sent.
+    @discardableResult
+    public func markSent(id: Int64, account: String, sentMessageID: String) async throws -> Bool {
         try await writer.write { db in
             try db.execute(
                 sql: """
                     UPDATE send_jobs SET state = 'sent', sent_message_id = ?
-                    WHERE id = ? AND account_email = ?
+                    WHERE id = ? AND account_email = ? AND state = 'in_flight'
                     """,
                 arguments: [sentMessageID, id, account])
+            return db.changesCount > 0
         }
     }
 
     /// Terminal failure. Callers must only reach this on a DEFINITIVE
     /// non-delivery signal (§7.3) — an ambiguous restart-probe miss must
     /// leave the job `in_flight` for re-probing instead, never call this.
-    public func markSendFailed(id: Int64, account: String) async throws {
+    /// Guarded to `state = 'in_flight'` for the same reason as `markSent`:
+    /// without it, a job already recorded `sent` could be silently
+    /// overwritten to `failed` (a permanent miscord with no reconciliation
+    /// path, unlike `dropMutation`'s re-fetch-truth flow), risking an
+    /// accidental resend that defeats the dedup protocol. Returns whether
+    /// the transition actually happened.
+    @discardableResult
+    public func markSendFailed(id: Int64, account: String) async throws -> Bool {
         try await writer.write { db in
             try db.execute(
-                sql: "UPDATE send_jobs SET state = 'failed' WHERE id = ? AND account_email = ?",
+                sql: """
+                    UPDATE send_jobs SET state = 'failed'
+                    WHERE id = ? AND account_email = ? AND state = 'in_flight'
+                    """,
                 arguments: [id, account])
+            return db.changesCount > 0
         }
     }
 

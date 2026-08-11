@@ -172,6 +172,71 @@ import Testing
     }
 }
 
+@Test func markSentRefusesAJobThatNeverWentInFlight() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+
+    // Skips markSendInFlight entirely — the state machine (§7.3) requires
+    // pending/held → in_flight → sent, so a still-`pending` job must not
+    // be recordable as sent (that would let a job be marked sent without
+    // ever having been committed in_flight before any network call).
+    let transitioned = try await database.markSent(id: id, account: "a@b.c", sentMessageID: "gmail-sent-1")
+
+    #expect(!transitioned)
+    let row = try database.writer.read { db in
+        try Row.fetchOne(db, sql: "SELECT state, sent_message_id FROM send_jobs WHERE id = ?", arguments: [id])
+    }
+    #expect(row?["state"] == "pending")
+    #expect(row?["sent_message_id"] == nil)
+}
+
+@Test func markSendFailedRefusesAJobAlreadyRecordedSent() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+    try await database.markSendInFlight(id: id, account: "a@b.c")
+    try await database.markSent(id: id, account: "a@b.c", sentMessageID: "gmail-sent-1")
+
+    // A job already terminally `sent` must never be flipped to `failed` —
+    // that would be a silent, unreconciled miscord (unlike dropMutation's
+    // re-fetch-truth path) risking an accidental duplicate resend.
+    let transitioned = try await database.markSendFailed(id: id, account: "a@b.c")
+
+    #expect(!transitioned)
+    let row = try database.writer.read { db in
+        try Row.fetchOne(db, sql: "SELECT state, sent_message_id FROM send_jobs WHERE id = ?", arguments: [id])
+    }
+    #expect(row?["state"] == "sent")
+    #expect(row?["sent_message_id"] == "gmail-sent-1")
+}
+
+@Test func markSentReturnsTrueOnASuccessfulTransition() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+    try await database.markSendInFlight(id: id, account: "a@b.c")
+
+    let transitioned = try await database.markSent(id: id, account: "a@b.c", sentMessageID: "gmail-sent-1")
+
+    #expect(transitioned)
+}
+
+@Test func markSendFailedReturnsTrueOnASuccessfulTransition() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let id = try await database.enqueueSend(
+        account: "a@b.c", rfc822MessageID: "<m1@hudson.local>", threadID: nil,
+        rawMIME: Data(), holdUntil: 0, now: 0)
+    try await database.markSendInFlight(id: id, account: "a@b.c")
+
+    let transitioned = try await database.markSendFailed(id: id, account: "a@b.c")
+
+    #expect(transitioned)
+}
+
 @Test func enqueueSendAllowsTheSameRFC822MessageIDAcrossDifferentAccounts() async throws {
     let database = try HudsonDatabase.inMemory()
     _ = try await database.enqueueSend(
