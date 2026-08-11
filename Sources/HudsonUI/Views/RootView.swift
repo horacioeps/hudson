@@ -5,8 +5,16 @@ import SwiftUI
 public struct RootView: View {
     @State private var model: AppModel?
     private let databaseURL: URL
+    private let isDemo: Bool
 
-    public init(databaseURL: URL) { self.databaseURL = databaseURL }
+    /// `isDemo` routes through `AppModel.demo()` (a fixed-path temp
+    /// database, seeded with `DemoData` on first open) instead of opening
+    /// `databaseURL` — used by `--demo`/`HUDSON_DEMO=1` for screenshots and
+    /// manual QA without ever touching a real mailbox.
+    public init(databaseURL: URL, isDemo: Bool = false) {
+        self.databaseURL = databaseURL
+        self.isDemo = isDemo
+    }
 
     public var body: some View {
         ZStack {
@@ -17,7 +25,8 @@ public struct RootView: View {
         }
         .frame(minWidth: 1040, minHeight: 680)
         .task {
-            if model == nil { model = try? await AppModel(databaseURL: databaseURL) }
+            guard model == nil else { return }
+            model = try? await (isDemo ? AppModel.demo() : AppModel(databaseURL: databaseURL))
         }
     }
 }

@@ -25,4 +25,24 @@ public final class AppModel {
         self.database = database
         self.account = account
     }
+
+    /// The demo mailbox's account — matches `DemoData.seed`'s default so
+    /// `--demo` reads back exactly what it seeded.
+    public static let demoAccount = "you@hudson.app"
+
+    /// Opens (creating if needed) the fixed-path demo database and seeds it
+    /// with `DemoData` on first open — guarded on `inboxThreads` being
+    /// empty so a relaunch of `--demo`/`HUDSON_DEMO=1` never re-seeds (and
+    /// never duplicates) an already-seeded demo mailbox. Used for
+    /// screenshots and manual QA without ever touching a real mailbox.
+    public static func demo() async throws -> AppModel {
+        let url = FileManager.default.temporaryDirectory.appending(path: "hudson-demo.sqlite")
+        let database = try HudsonDatabase.open(at: url)
+        let existing = try await database.inboxThreads(account: demoAccount, split: nil, limit: 1)
+        if existing.isEmpty {
+            try await DemoData.seed(into: database, account: demoAccount)
+        }
+        let account = try await database.primaryAccount()
+        return AppModel(database: database, account: account)
+    }
 }

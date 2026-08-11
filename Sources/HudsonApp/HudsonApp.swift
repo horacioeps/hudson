@@ -21,21 +21,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct HudsonApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
-    /// `--demo` (or `HUDSON_DEMO=1`) opens a throwaway demo database instead of
-    /// the real mailbox — used for screenshots and manual QA without exposing
-    /// real mail. The demo DB is seeded in Task 5; until then this resolves to a
-    /// temp path that simply opens empty.
-    private var databaseURL: URL {
-        let demo = CommandLine.arguments.contains("--demo")
+    /// `--demo` (or `HUDSON_DEMO=1`) opens a synthetic demo mailbox instead of
+    /// the real one — used for screenshots and manual QA without exposing
+    /// real mail. `RootView` routes this through `AppModel.demo()`, which
+    /// opens a fixed temp-path database and seeds it with `DemoData` on
+    /// first open.
+    private var isDemo: Bool {
+        CommandLine.arguments.contains("--demo")
             || ProcessInfo.processInfo.environment["HUDSON_DEMO"] == "1"
-        return demo
-            ? FileManager.default.temporaryDirectory.appending(path: "hudson-demo.sqlite")
-            : HudsonDatabase.defaultDatabaseURL
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView(databaseURL: databaseURL)
+            RootView(databaseURL: HudsonDatabase.defaultDatabaseURL, isDemo: isDemo)
         }
         .windowStyle(.hiddenTitleBar)
     }
