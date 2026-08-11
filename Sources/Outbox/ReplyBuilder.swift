@@ -73,6 +73,21 @@ enum ReplyRecipients {
     /// line, minus the replying user's own address (so replying doesn't
     /// re-address yourself).
     ///
+    /// **Self-authored newest message:** Sent mail shares the thread's
+    /// `thread_id` too, and `threadMessages` doesn't filter by direction —
+    /// so the "newest" message can legitimately be a follow-up the
+    /// replying user sent themselves (e.g. before the other side
+    /// answered), not a message from the correspondent. In that case
+    /// `newest.fromLine`'s bare address IS `from`, and blindly addressing
+    /// the reply back to "the sender" would silently mail the user their
+    /// own inbox and drop the real correspondent (plain reply) or merely
+    /// self-CC them alongside the real recipient (reply-all). When that
+    /// happens, the target is derived from that self-authored message's
+    /// OWN `To:` line (minus self) instead — the same set `otherRecipients`
+    /// already computes for the reply-all branch — for both plain reply
+    /// and reply-all alike, since there's no sender-distinct-from-To-line
+    /// case to make reply-all any wider here.
+    ///
     /// **Known gap:** the Store doesn't persist the original message's
     /// `Cc:` header (only `From`/`To` — see `messages` table, v1), so
     /// reply-all's `cc` is always empty here even when the original had
@@ -82,13 +97,17 @@ enum ReplyRecipients {
     /// a follow-up carry-forward can add it the same way `has_attachment`
     /// was added in migration v4.
     static func derive(newest: MessageRow, from: String, replyAll: Bool) -> (to: [String], cc: [String]) {
-        let senderAddress = bareAddress(newest.fromLine)
-        guard replyAll else { return (dedupCaseInsensitive([senderAddress]), []) }
-
         let selfAddress = bareAddress(from).lowercased()
+        let senderAddress = bareAddress(newest.fromLine)
         let otherRecipients = splitAddressList(newest.toLine)
             .map(bareAddress)
             .filter { !$0.isEmpty && $0.lowercased() != selfAddress }
+
+        guard senderAddress.lowercased() != selfAddress else {
+            return (dedupCaseInsensitive(otherRecipients), [])
+        }
+
+        guard replyAll else { return (dedupCaseInsensitive([senderAddress]), []) }
         return (dedupCaseInsensitive([senderAddress] + otherRecipients), [])
     }
 

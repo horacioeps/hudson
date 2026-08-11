@@ -270,10 +270,22 @@ public actor SyncEngine {
                         id: $0.attachmentID, filename: $0.filename,
                         mimeType: $0.mimeType, size: $0.size)
                 }
+                // M5 Task 5: `format: "full"` already carries the
+                // Message-ID/References headers — this is the actual
+                // hydrate-time write path spec §7.1 asks for (distinct
+                // from `SnapshotMapping`'s backfill/history metadata-fetch
+                // path, which never re-runs for an account whose backfill
+                // predates this migration). Routed through the same
+                // `SnapshotMapping.snapshot` mapper backfill/history use,
+                // so there's exactly one place that knows how to pull
+                // these headers off a `GmailMessage`.
+                let threadingSnapshot = SnapshotMapping.snapshot(from: message)
                 try await database.saveBody(
                     messageID: id, account: account,
                     body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText),
-                    attachments: attachments)
+                    attachments: attachments,
+                    rfc822MessageID: threadingSnapshot?.rfc822MessageID,
+                    referencesHeader: threadingSnapshot?.referencesHeader)
                 hydrated += 1
             } catch GmailError.invalidRequest(let status, _) where status == 404 {
                 // The message provably no longer exists server-side — unlike

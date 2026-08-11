@@ -107,6 +107,57 @@ private func seedThread(_ db: HudsonDatabase) async throws {
     #expect(reply.references == ["<solo@mail.example.com>"])
 }
 
+/// Regression: Sent mail shares the thread's `thread_id` too, and
+/// `threadMessages` doesn't filter by direction, so the thread's NEWEST
+/// message can legitimately be one the replying user sent themselves (a
+/// follow-up sent before the other side answered), not one from the
+/// correspondent. Before the fix, `derive` unconditionally used the
+/// newest message's From address as the reply target — which, here, IS
+/// the replying user — silently addressing the reply back to no one but
+/// themselves (plain reply) or self-CCing them alongside the real
+/// recipient (reply-all), and dropping/diluting the actual correspondent
+/// with no error signal.
+@Test func replyToOwnFollowUpTargetsTheOriginalCorrespondentNotSelf() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    // m1: Alice starts the thread, addressed to me.
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "m1", threadID: threadID, historyID: 1, internalDate: 1_000,
+            fromLine: "Alice <alice@example.com>", toLine: "me@hudson.test",
+            subject: "Trip planning", snippet: "Let's go to the mountains.",
+            labelIDs: ["INBOX"],
+            rfc822MessageID: "<m1@mail.example.com>", referencesHeader: nil),
+        account: account)
+    // m2 (newest): I follow up BEFORE Alice answers — Sent mail, same
+    // thread_id, authored by the replying user themselves.
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "m2", threadID: threadID, historyID: 2, internalDate: 2_000,
+            fromLine: "me@hudson.test", toLine: "alice@example.com",
+            subject: "Re: Trip planning", snippet: "Any thoughts?",
+            labelIDs: ["SENT"],
+            rfc822MessageID: "<m2@mail.example.com>", referencesHeader: "<m1@mail.example.com>"),
+        account: account)
+
+    let plainReply = try await replyMessage(
+        to: threadID, account: account, database: db, from: "me@hudson.test",
+        bodyText: "Following up again", bodyHTML: nil, replyAll: false)
+    // Must go to the real correspondent (Alice), never to self.
+    #expect(plainReply.to == ["alice@example.com"])
+    #expect(plainReply.cc == [])
+    // Threading headers still derive from the literal newest message.
+    #expect(plainReply.inReplyTo == "<m2@mail.example.com>")
+    #expect(plainReply.threadID == threadID)
+
+    let replyAll = try await replyMessage(
+        to: threadID, account: account, database: db, from: "me@hudson.test",
+        bodyText: "Following up again", bodyHTML: nil, replyAll: true)
+    // Reply-all must not self-CC the user alongside the real recipient.
+    #expect(replyAll.to == ["alice@example.com"])
+    #expect(replyAll.cc == [])
+}
+
 @Test func replyToEmptyOrUnknownThreadThrows() async throws {
     let db = try HudsonDatabase.inMemory()
     try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)

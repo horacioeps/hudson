@@ -37,9 +37,22 @@ extension HudsonDatabase {
     /// the real message has an attachment. `ThreadRollup.maintainHasAttachment`
     /// (Task 5) mirrors the same flag onto `thread_rollup` in the same
     /// transaction, so `inboxThreads` picks it up with zero join.
+    ///
+    /// `rfc822MessageID`/`referencesHeader` (M5 Task 5) let the CALLER pass
+    /// through the same threading headers a `format: "full"` hydration
+    /// fetch already carries — `SyncEngine.hydrateBodies` is the actual
+    /// hydrate-time write path spec §7.1 calls for, distinct from
+    /// `SnapshotMapping`'s backfill/history metadata-fetch path, which
+    /// never re-runs for an account whose backfill predates this migration.
+    /// Written with `COALESCE(new, existing)` rather than an unconditional
+    /// overwrite: a `nil` here only ever means "this particular fetch
+    /// didn't carry the header" (never "the header was removed"), so it
+    /// must not clobber a value an earlier metadata fetch already
+    /// persisted.
     public func saveBody(
         messageID: String, account: String, body: SanitizedBody,
-        attachments: [AttachmentMeta] = []
+        attachments: [AttachmentMeta] = [],
+        rfc822MessageID: String? = nil, referencesHeader: String? = nil
     ) async throws {
         let cids = String(decoding: try JSONEncoder().encode(body.cidReferences), as: UTF8.self)
         let urls = String(decoding: try JSONEncoder().encode(body.remoteURLs), as: UTF8.self)
@@ -61,8 +74,13 @@ extension HudsonDatabase {
                     body.sanitizerVersion, cids, urls,
                 ])
             try db.execute(
-                sql: "UPDATE messages SET has_body = 1 WHERE account_email = ? AND id = ?",
-                arguments: [account, messageID])
+                sql: """
+                    UPDATE messages SET has_body = 1,
+                        rfc822_message_id = COALESCE(?, rfc822_message_id),
+                        references_header = COALESCE(?, references_header)
+                    WHERE account_email = ? AND id = ?
+                    """,
+                arguments: [rfc822MessageID, referencesHeader, account, messageID])
             for attachment in attachments {
                 try db.execute(
                     sql: """

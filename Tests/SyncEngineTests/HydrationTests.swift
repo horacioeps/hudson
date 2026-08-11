@@ -38,6 +38,55 @@ import Testing
     #expect(second.bodiesHydrated == 0)
 }
 
+// M5 Task 5 review fix: the metadata-fetch path (`SnapshotMapping`, wired
+// into backfill/history) is NOT the only writer of
+// `rfc822_message_id`/`references_header` — `hydrateBodies` must ALSO
+// persist them, since it's the path spec §7.1's "at hydrate time" language
+// actually describes, and the metadata path never re-runs for an account
+// whose backfill already completed before this migration shipped.
+@Test func hydrateBodiesBackfillsThreadingHeadersForAnAlreadyBackfilledMessage() async throws {
+    let fixedNow = Date(timeIntervalSince1970: 1_700_000_000)
+    let threeDaysAgoMS = Int64((fixedNow.timeIntervalSince1970 - 3 * 86_400) * 1_000)
+
+    let database = try HudsonDatabase.inMemory()
+    try await database.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    // Simulates the pre-existing-user case: a message row inserted straight
+    // through `applySnapshot` (bypassing `SnapshotMapping`/the network
+    // entirely) with both threading columns NULL and no body yet — exactly
+    // what an account that finished backfill before this migration shipped
+    // looks like. Backfill is marked complete so `syncOnce` won't re-list.
+    _ = try await database.applySnapshot(
+        MessageSnapshot(
+            id: "m1", threadID: "t1", historyID: 90, internalDate: threeDaysAgoMS,
+            fromLine: "a@ex.com", toLine: "b@ex.com", subject: "s", snippet: "sn",
+            labelIDs: ["INBOX"]),
+        account: "x")
+    try await database.updateBackfill(email: "x", state: "complete", pageToken: nil, addedCount: 0)
+
+    let beforeHydration = try #require(try await database.message(id: "m1", account: "x")).row
+    #expect(beforeHydration.rfc822MessageID == nil)
+    #expect(beforeHydration.referencesHeader == nil)
+    #expect(!beforeHydration.hasBody)
+
+    // The user later opens/hydrates the message: `format: "full"` DOES
+    // carry the headers — exactly what a real Gmail response looks like.
+    let gmail = ScriptedGmail(messagesByID: [
+        "m1": testMessageWithBody(
+            id: "m1", historyID: "90", internalDate: String(threeDaysAgoMS),
+            plainText: "hello hydrated body",
+            messageID: "<m1@mail.example.com>", references: "<root@mail.example.com>")
+    ])
+    let engine = SyncEngine(api: gmail, database: database, account: "x", now: { fixedNow })
+
+    let report = try await engine.syncOnce()
+    #expect(report.bodiesHydrated == 1)
+
+    let afterHydration = try #require(try await database.message(id: "m1", account: "x")).row
+    #expect(afterHydration.rfc822MessageID == "<m1@mail.example.com>")
+    #expect(afterHydration.referencesHeader == "<root@mail.example.com>")
+    #expect(afterHydration.hasBody)
+}
+
 @Test func hydration404TombstonesVanishedMessageAndStillHydratesTheOther() async throws {
     // A message can vanish between the history poll that materialized its row
     // (has_body=0) and the follow-up hydration `getMessage(format: "full")` —
