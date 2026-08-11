@@ -486,5 +486,26 @@ let migrator: DatabaseMigrator = {
         }
     }
 
+    migrator.registerMigration("v9") { db in
+        // M5 Task 7 carry-forward: `mutation_queue_op_check` (v3) is a
+        // BEFORE-INSERT trigger, so it only ever guarded a NEW row — an
+        // UPDATE that corrupts `op`/`state` (e.g. a future bug in a
+        // flusher's transition SQL writing some other string) sailed
+        // through unguarded, unlike a real column-level CHECK constraint,
+        // which enforces on every write regardless of statement kind. This
+        // is the BEFORE-UPDATE twin, closing that gap the same way the v3
+        // trigger closed it for INSERT (SQLite can't add a CHECK constraint
+        // to an existing table without a full rebuild — see v3's comment —
+        // so this is a second trigger, not an ALTER).
+        try db.execute(sql: """
+            CREATE TRIGGER mutation_queue_op_check_update
+            BEFORE UPDATE ON mutation_queue
+            WHEN NEW.op NOT IN ('add', 'remove') OR NEW.state NOT IN ('pending', 'in_flight')
+            BEGIN
+                SELECT RAISE(ABORT, 'mutation_queue: invalid op/state');
+            END
+            """)
+    }
+
     return migrator
 }()
