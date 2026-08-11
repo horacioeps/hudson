@@ -518,6 +518,12 @@ public final class AppModel {
 
     // MARK: - Disconnect account (Task 5)
 
+    /// User-visible message shown via `syncBanner` — reusing `runSyncPass`'s
+    /// own banner mechanism, not a new one — when `disconnectAccount()`'s
+    /// purge only PARTIALLY completes. See that method's doc comment for why
+    /// a partial failure must never be reported as success.
+    private static let disconnectFailedBannerText = "Couldn't disconnect — try again."
+
     /// "Disconnect <email>" from Settings: removes this Mac's copy of the
     /// connected account — clears its Gmail OAuth tokens + BYO client secret
     /// from the Keychain (`tokenStore.deleteAll`), deletes its `accounts` row
@@ -527,6 +533,34 @@ public final class AppModel {
     /// `.onChange` mirror of Task 4's forward `.task` gate) reacts to that
     /// exact transition and brings `OnboardingView` back, so the app
     /// genuinely returns to first-launch, not just an emptied mailbox.
+    ///
+    /// Neither delete is `try?`'d away: a genuinely thrown error from EITHER
+    /// one aborts the disconnect, surfaces `syncBanner` (mirrors
+    /// `runSyncPass`'s own failure posture), and — crucially — leaves
+    /// `self.account` set. `needsOnboarding` therefore stays `false` and
+    /// Settings' "Disconnect" affordance stays up, so the app never lies
+    /// about having forgotten an account it still has a live trace of, and
+    /// the user can simply retry.
+    ///
+    /// The two deletes run in this order, DELIBERATELY, not concurrently:
+    ///
+    /// 1. Keychain (`tokenStore.deleteAll`) first. Both `TokenStore`
+    ///    implementations (`InMemoryTokenStore`, `KeychainTokenStore`) treat
+    ///    deleting an already-empty/missing entry as a no-op rather than an
+    ///    error, so if THIS step throws, nothing has changed yet — a retry
+    ///    (or simply relaunching, since the `accounts` row is still there)
+    ///    starts from the exact same state.
+    /// 2. The `accounts` row (`database.deleteAccount`) second, ONLY once the
+    ///    Keychain half is confirmed gone. Running these in the opposite
+    ///    order would risk the worse failure: the `accounts` row (the thing
+    ///    that flips `needsOnboarding` and hides "Disconnect") gone while a
+    ///    failed Keychain purge leaves the OAuth tokens/BYO secret orphaned —
+    ///    with no UI left to retry removing them, since there's no longer a
+    ///    connected account to run "Disconnect" against.
+    ///
+    /// If step 1 succeeds but step 2 throws, the Keychain half genuinely IS
+    /// clean — only the Store half still needs to land, and a retry's step 1
+    /// is then a cheap no-op.
     ///
     /// A no-op if there's no connected account to disconnect (mirrors
     /// `syncNow()`'s own "guard on account" posture) — nothing to clear, and
@@ -541,8 +575,21 @@ public final class AppModel {
     public func disconnectAccount() async {
         guard let account else { return }
         let email = account.email
-        try? tokenStore.deleteAll(account: email)
-        try? await database.deleteAccount(email: email)
+        syncBanner = nil
+
+        do {
+            try tokenStore.deleteAll(account: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
+        do {
+            try await database.deleteAccount(email: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
+
         autoSyncTask?.cancel()
         autoSyncTask = nil
         self.account = nil

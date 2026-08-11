@@ -431,3 +431,67 @@ import Testing
 
     #expect(model.account == nil)
 }
+
+/// A `TokenStore` double whose `deleteAll` always throws — stands in for a
+/// real Keychain failure (signing-identity drift on the ACL-bound items;
+/// see `KeychainTokenStore`'s doc comment) without ever touching the real
+/// Keychain from a test.
+private struct FailingTokenStore: TokenStore {
+    struct Failure: Error {}
+    func saveTokens(_ tokens: TokenSet, account: String) throws {}
+    func tokens(account: String) throws -> TokenSet? { nil }
+    func saveClientSecret(_ secret: String, account: String) throws {}
+    func clientSecret(account: String) throws -> String? { nil }
+    func deleteAll(account: String) throws { throw Failure() }
+}
+
+/// If the Keychain half throws, `disconnectAccount()` must NOT silently
+/// report success: `account` stays set (so `needsOnboarding` stays `false`
+/// and Settings' "Disconnect" survives to retry) and a `syncBanner` surfaces
+/// the failure — this is the regression test for the bug where both deletes
+/// were swallowed with bare `try?` and the account was cleared regardless.
+/// The Store half never runs (the `accounts` row survives untouched) since
+/// the Keychain half runs first and failed.
+@MainActor
+@Test func disconnectAccountSurfacesABannerAndKeepsTheAccountWhenTheKeychainDeleteFails() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "a@b.com", clientID: "cid", consentedAt: Date())
+    let account = try await db.account(email: "a@b.com")
+    let model = AppModel(database: db, account: account, tokenStore: FailingTokenStore())
+
+    await model.disconnectAccount()
+
+    #expect(model.account != nil)
+    #expect(!model.needsOnboarding)
+    #expect(model.syncBanner != nil)
+    #expect(try await db.account(email: "a@b.com") != nil)  // Store half never ran
+}
+
+/// If the Store half throws, `disconnectAccount()` must ALSO not silently
+/// report success — even though the Keychain half already succeeded (it
+/// runs first; see `disconnectAccount()`'s doc comment on the ordering).
+/// `account` stays set so "Disconnect" survives to retry; a retry's Keychain
+/// step is then a no-op (already empty) and only the Store half still needs
+/// to land. There's no Store-protocol seam to inject a throwing double, so
+/// this forces a genuine GRDB failure by dropping the `accounts` table out
+/// from under `database.deleteAccount` — safe because no other table has an
+/// FK on `accounts` (see `AccountStore.deleteAccount`'s doc comment), so it
+/// can't cascade-break the other queries `AppModel`'s init already kicked off.
+@MainActor
+@Test func disconnectAccountSurfacesABannerAndKeepsTheAccountWhenTheStoreDeleteFails() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "a@b.com", clientID: "cid", consentedAt: Date())
+    let account = try await db.account(email: "a@b.com")
+    let tokenStore = InMemoryTokenStore()
+    let tokens = TokenSet(accessToken: "at", refreshToken: "rt", expiresAt: .distantFuture)
+    try tokenStore.saveTokens(tokens, account: "a@b.com")
+    let model = AppModel(database: db, account: account, tokenStore: tokenStore)
+    try await db.writer.write { db in try db.execute(sql: "DROP TABLE accounts") }
+
+    await model.disconnectAccount()
+
+    #expect(model.account != nil)
+    #expect(!model.needsOnboarding)
+    #expect(model.syncBanner != nil)
+    #expect(try tokenStore.tokens(account: "a@b.com") == nil)  // Keychain half DID run
+}
