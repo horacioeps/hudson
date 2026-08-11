@@ -94,3 +94,30 @@ import Testing
         [HistoryChange(kind: .deleted(id: "m1"))], newCursor: 11, account: "x")
     #expect(try await database.recentMessages(account: "x", limit: 10).isEmpty)
 }
+
+// MARK: - M5 Task 7 carry-forward: orphaned mutation_queue rows on message delete
+
+@Test func deletedHistoryEventClearsThatMessagesPendingMutations() async throws {
+    // mutation_queue carries no FK to messages (unlike message_labels'
+    // cascading one) — so without an explicit delete, a pending optimistic
+    // triage mutation for a message Gmail reports deleted would linger in
+    // the queue forever: nothing will ever retire it (retirement waits for
+    // a history_cursor the delete's own event already IS), and the flusher
+    // would just keep trying to `messages.modify` an id that 404s.
+    let database = try HudsonDatabase.inMemory()
+    try await database.writer.write { db in
+        try db.execute(sql: "INSERT INTO accounts (email, client_id, consented_at) VALUES ('x','c',0)")
+    }
+    let added = MessageSnapshot(
+        id: "m1", threadID: "t1", historyID: 10, internalDate: 1_000,
+        fromLine: "f", toLine: "t", subject: "s", snippet: "sn", labelIDs: ["INBOX"])
+    _ = try await database.applyHistory(
+        [HistoryChange(kind: .added(added))], newCursor: 10, account: "x")
+    try await database.enqueueMutation(
+        messageID: "m1", labelID: "INBOX", op: .remove, account: "x", now: 1)
+    #expect(try await database.pendingMutations(account: "x").count == 1)
+
+    _ = try await database.applyHistory(
+        [HistoryChange(kind: .deleted(id: "m1"))], newCursor: 11, account: "x")
+    #expect(try await database.pendingMutations(account: "x").isEmpty)
+}

@@ -103,6 +103,22 @@ private func matchCount(_ db: HudsonDatabase, _ query: String) async throws -> I
     #expect(try await matchCount(db, "quarter*") == 0)
 }
 
+// MARK: - M5 Task 7 carry-forward: orphaned mutation_queue rows on message delete
+
+@Test func deleteVanishedMessageClearsThatMessagesPendingMutations() async throws {
+    // Identical concern as the `.deleted` history-event branch (see
+    // HistoryApplyTests' twin) — `deleteVanishedMessage` (the hydration-404
+    // path) is the other place a message row disappears without any FK
+    // cascade covering mutation_queue.
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    _ = try await db.applySnapshot(snap("m1", subject: "Quarterly report"), account: "x")
+    try await db.enqueueMutation(messageID: "m1", labelID: "INBOX", op: .remove, account: "x", now: 1)
+    #expect(try await db.pendingMutations(account: "x").count == 1)
+    try await db.deleteVanishedMessage(id: "m1", account: "x")
+    #expect(try await db.pendingMutations(account: "x").isEmpty)
+}
+
 // MARK: - M5 Task 7 carry-forward: reindexBody must not allocate an orphan seq
 
 @Test func reindexBodyDoesNotAllocateASeqForAMessageThatNoLongerExists() async throws {
