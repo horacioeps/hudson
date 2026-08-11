@@ -27,13 +27,19 @@ private actor FakeSendTransport: SendTransport {
 
 /// Builds a `ComposerModel` whose `makeService` hands back a real
 /// `SendService` layered over `transport`, plus the account email both share
-/// — the fixture every test below starts from.
+/// — the fixture every test below starts from. `undoHoldWindow` defaults to
+/// `ComposerModel`'s own default (15s); the undo-window timing tests below
+/// override it to a short duration so they can actually observe the
+/// auto-expiry/keyed-timer behavior without a real 15s sleep.
 @MainActor
 private func makeComposer(
-    database: HudsonDatabase, account: AccountRecord, transport: FakeSendTransport
+    database: HudsonDatabase, account: AccountRecord, transport: FakeSendTransport,
+    undoHoldWindow: Duration = .seconds(15)
 ) -> ComposerModel {
     let service = SendService(api: transport, database: database, account: account.email)
-    return ComposerModel(database: database, account: account, makeService: { service })
+    return ComposerModel(
+        database: database, account: account, makeService: { service },
+        undoHoldWindow: undoHoldWindow)
 }
 
 // MARK: - Send
@@ -88,6 +94,88 @@ private func makeComposer(
     #expect(try await db.sendJob(id: jobID, account: email) == nil)  // row deleted by cancel
     #expect(model.justSentUndoJobID == nil)
     #expect(await transport.timesSent() == 0)  // undo beat the wire — nothing ever sent
+}
+
+// MARK: - Undo-window auto-expiry
+
+/// Once the undo hold elapses on its own — nobody tapped Undo — the model
+/// clears its own `justSentUndoJobID` handle (`scheduleUndoExpiry`), so
+/// `ComposerView.bottomToast` (a pure function of that property) hides
+/// itself without needing any view-local timer. The underlying job row is
+/// untouched — only the UI-facing handle expires, not the send itself
+/// (that's still `SendService.claimSendable`'s call once a real flush pass
+/// runs past `hold_until`, unrelated to this in-process timer).
+@MainActor
+@Test func justSentUndoJobIDAutoClearsAfterHoldWindowElapses() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let email = "compose-expiry-\(UUID().uuidString)@example.com"
+    try await db.upsertAccount(email: email, clientID: "test-client", consentedAt: Date())
+    let account = try #require(try await db.account(email: email))
+    let transport = FakeSendTransport()
+    let model = makeComposer(
+        database: db, account: account, transport: transport, undoHoldWindow: .milliseconds(60))
+
+    model.startNew()
+    model.to = "friend@example.com"
+    model.subject = "Lunch?"
+    model.bodyText = "Are you free Thursday?"
+    await model.send()
+    let jobID = try #require(model.justSentUndoJobID)
+
+    try await Task.sleep(for: .milliseconds(220))  // well past the 60ms hold
+
+    #expect(model.justSentUndoJobID == nil)  // handle auto-cleared, no `undo()` call needed
+    let job = try #require(try await db.sendJob(id: jobID, account: email))
+    #expect(job.state == .pending)  // the row itself is untouched by the local timer
+    #expect(await transport.timesSent() == 0)  // and nothing was ever sent
+}
+
+/// Regression test for the exact bug this fix-loop closed: a SECOND send
+/// from the same reused `ComposerModel`, started while the FIRST job's undo
+/// hold is still open, must not have its own (still-valid) undo handle
+/// wiped out early when the first job's timer reaches ITS original
+/// deadline. Before `scheduleUndoExpiry` re-checked `justSentUndoJobID ==
+/// jobID` (keying the clear to the specific job it was scheduled for), an
+/// un-cancelled/un-keyed timer would have cleared whatever
+/// `justSentUndoJobID` held at that moment — including a newer, still-valid
+/// job's handle — hiding a real undo affordance early.
+@MainActor
+@Test func secondSendsUndoHandleSurvivesTheFirstSendsOriginalDeadline() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let email = "compose-expiry2-\(UUID().uuidString)@example.com"
+    try await db.upsertAccount(email: email, clientID: "test-client", consentedAt: Date())
+    let account = try #require(try await db.account(email: email))
+    let transport = FakeSendTransport()
+    let model = makeComposer(
+        database: db, account: account, transport: transport, undoHoldWindow: .milliseconds(150))
+
+    model.startNew()
+    model.to = "friend@example.com"
+    model.subject = "First"
+    model.bodyText = "First message"
+    await model.send()
+    let firstJobID = try #require(model.justSentUndoJobID)
+
+    try await Task.sleep(for: .milliseconds(50))  // well within the first job's 150ms hold
+
+    model.startNew()
+    model.to = "friend@example.com"
+    model.subject = "Second"
+    model.bodyText = "Second message"
+    await model.send()
+    let secondJobID = try #require(model.justSentUndoJobID)
+    #expect(secondJobID != firstJobID)
+
+    // Past the FIRST job's original deadline (150ms after it was sent, i.e.
+    // ~100ms from here) but well before the SECOND job's own deadline
+    // (150ms after IT was sent, i.e. ~200ms from here) — this is the exact
+    // window the bug would have cleared the handle early in.
+    try await Task.sleep(for: .milliseconds(120))
+    #expect(model.justSentUndoJobID == secondJobID)  // still valid — not stomped by job 1's timer
+
+    // Now past the second job's own deadline too.
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(model.justSentUndoJobID == nil)
 }
 
 /// No account/no service: `send()` must never crash — it surfaces a

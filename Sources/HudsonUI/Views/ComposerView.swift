@@ -38,14 +38,6 @@ public struct ComposerView: View {
     /// isn't surprised by a hidden, already-populated field.
     @State private var isCcVisible: Bool
 
-    /// True for the duration `justSentUndoJobID` is both non-nil AND still
-    /// inside its undo hold — separate from the model's own `justSentUndoJobID`
-    /// because the model has no notion of "hold elapsed" (`SendService`
-    /// doesn't expose a countdown, only enqueue/cancel), so this view times
-    /// its own visibility window locally, exactly like `ThreadView`'s local
-    /// `toastText` auto-clear.
-    @State private var isUndoToastVisible = false
-
     /// Feedback text for a non-functional placeholder tap (the AI Draft
     /// chip) — same local-toast pattern `ThreadView.showToast` uses for its
     /// own placeholders (Snooze, "⋯ more").
@@ -82,9 +74,6 @@ public struct ComposerView: View {
         .overlay(alignment: .bottom) {
             bottomToast
                 .padding(.bottom, Metrics.unit * 6)
-        }
-        .onChange(of: composer.justSentUndoJobID) {
-            handleUndoJobIDChanged()
         }
     }
 
@@ -223,12 +212,48 @@ public struct ComposerView: View {
 
     // MARK: - Toasts (undo-send + placeholder feedback)
 
+    /// `true` exactly when `bottomToast` renders the undo toast — a PURE
+    /// function of `composer.justSentUndoJobID`, no view-local visibility
+    /// flag or timer of its own. That's deliberate: `ComposerModel` already
+    /// auto-clears `justSentUndoJobID` once its own hold window elapses
+    /// (`ComposerModel.scheduleUndoExpiry`), so `justSentUndoJobID != nil`
+    /// is always an accurate "undo is still possible" signal — including
+    /// for a `ComposerView` instance that's mounted AFTER a send already
+    /// happened (e.g. `RenderSmokeTests.composerViewRendersUndoToastAfterSend`),
+    /// which a separate `.onChange`-driven flag would miss, since
+    /// `.onChange` only fires on a transition witnessed while mounted, never
+    /// for a value already set at first appearance.
+    ///
+    /// Deliberately not `private`: exposed so `RenderSmokeTests` can assert
+    /// on this exact condition via `@testable import` — the render-smoke
+    /// suite hosts real `NSHostingView`s but has no reliable way to
+    /// introspect their rendered TEXT (`NSView.accessibilityChildren()`
+    /// comes back empty under `swift test`'s windowless environment,
+    /// verified empirically), so this boolean is the closest thing to "is
+    /// the toast actually on screen" that a test can check without
+    /// duplicating `bottomToast`'s condition as a second, driftable copy.
+    ///
+    /// **Open question for Task 4:** this view only RENDERS the toast while
+    /// it's mounted — `ComposerModel.send()` fires `onClose?()` synchronously
+    /// right after enqueueing, and if the presenter (`RootView`) responds by
+    /// unmounting `ComposerView` on that callback, the toast disappears with
+    /// it even though `justSentUndoJobID` (and thus the real undo window) is
+    /// still open — `ComposerModel`'s own doc comment on `justSentUndoJobID`
+    /// is explicit that the handle deliberately outlives the sheet closing.
+    /// Because this condition is nothing more than
+    /// `composer.justSentUndoJobID != nil`, Task 4 can trivially render the
+    /// same toast from a level that outlives this view (e.g. `RootView`,
+    /// keyed off `AppModel.composer.justSentUndoJobID`) if it needs the
+    /// affordance to survive dismissal — no `ComposerView`-local state to
+    /// migrate.
+    var isUndoToastShown: Bool { composer.justSentUndoJobID != nil }
+
     /// Which toast (if either) sits above the footer right now. The undo
     /// toast takes priority — a just-sent draft's undo window is the more
     /// important thing on screen than a placeholder tap's feedback.
     @ViewBuilder
     private var bottomToast: some View {
-        if isUndoToastVisible, composer.justSentUndoJobID != nil {
+        if isUndoToastShown {
             undoToast
         } else if let placeholderToastText {
             Toast(text: placeholderToastText)
@@ -246,22 +271,6 @@ public struct ComposerView: View {
         .buttonStyle(.plain)
     }
 
-    /// Mirrors a `send()` succeeding (`justSentUndoJobID` going non-nil) by
-    /// opening the undo toast for the hold window, then auto-hiding it — a
-    /// successful `undo()` also clears `justSentUndoJobID`, which re-fires
-    /// this and hides the toast immediately via the `nil` branch below.
-    private func handleUndoJobIDChanged() {
-        guard composer.justSentUndoJobID != nil else {
-            isUndoToastVisible = false
-            return
-        }
-        isUndoToastVisible = true
-        Task {
-            try? await Task.sleep(for: Self.undoToastHoldWindow)
-            isUndoToastVisible = false
-        }
-    }
-
     private func showPlaceholderToast(_ text: String) {
         placeholderToastText = text
         Task {
@@ -271,14 +280,6 @@ public struct ComposerView: View {
             }
         }
     }
-
-    /// How long the undo toast stays up — mirrors `SendService.enqueue`'s
-    /// own `undoHold` DEFAULT (`.seconds(15)`, `Sources/Outbox/
-    /// SendService.swift`). `ComposerModel.send()` calls `enqueue` without
-    /// overriding that default, so this constant and the real hold window
-    /// are the same value; there's no shared symbol to import instead
-    /// (`undoHold` is a parameter default, not a public constant).
-    private static let undoToastHoldWindow: Duration = .seconds(15)
 
     // MARK: - Field bindings
 

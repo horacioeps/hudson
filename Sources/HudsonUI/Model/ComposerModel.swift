@@ -60,13 +60,28 @@ public final class ComposerModel {
 
     /// The id of the job the last successful `send()` enqueued, exposed for
     /// the undo affordance for as long as its hold is open. `nil` before any
-    /// send and after a successful `undo()`. The undo toast (Task 3) shows
-    /// exactly while this is non-nil.
+    /// send, after a successful `undo()`, AND once `undoHoldWindow` elapses
+    /// on its own (via `scheduleUndoExpiry`) — so `justSentUndoJobID != nil`
+    /// is always an accurate "undo is still possible" signal, never a stale
+    /// one a caller has to separately time out. The undo toast (Task 3) is a
+    /// PURE function of this property (`ComposerView.bottomToast`) — it
+    /// carries no view-local visibility state of its own, precisely so the
+    /// toast reads correctly regardless of when/whether the view showing it
+    /// was mounted relative to the send.
     public private(set) var justSentUndoJobID: Int64?
 
     /// The `SendService` the last `send()` used, retained so `undo()` cancels
     /// through the SAME service instance that enqueued the job.
     private var lastSendService: SendService?
+
+    /// Auto-clears `justSentUndoJobID` once `undoHoldWindow` elapses —
+    /// see `scheduleUndoExpiry`. Stored (not fire-and-forget) so a NEWER
+    /// send/undo/reset can cancel an EARLIER job's still-pending timer:
+    /// without this, two sends in quick succession from the same reused
+    /// `ComposerModel` would let the first job's timer fire at the first
+    /// job's deadline and blindly clear whatever `justSentUndoJobID` holds
+    /// at that moment — including a second, still-valid job's handle.
+    private var undoExpiryTask: Task<Void, Never>?
 
     /// True from tapping Send until the enqueue resolves — guards against a
     /// double-tap enqueuing the same draft twice.
@@ -86,6 +101,26 @@ public final class ComposerModel {
     /// identically wherever the user hits it.
     private static let connectAccountBannerText = "Connect an account in Terminal: `hudson auth`"
 
+    /// How long a just-sent job's undo handle stays valid before this model
+    /// auto-clears it (`scheduleUndoExpiry`) — the SAME duration `send()`
+    /// passes to `SendService.enqueue`'s own `undoHold` parameter, so the
+    /// model's local auto-clear and the real, durable hold it mirrors can
+    /// never drift apart (a single value, injected once here, rather than
+    /// two independently-maintained constants). Defaults to `enqueue`'s own
+    /// default (`.seconds(15)`, `Sources/Outbox/SendService.swift`);
+    /// production callers omit it, tests inject a short duration so the
+    /// auto-expiry/keyed-timer behavior is checkable without a real 15s
+    /// sleep (see `ComposerModelTests`' undo-window tests).
+    private let undoHoldWindow: Duration
+
+    /// Only `pendingCountTask`-style stored `Task`s need cancelling here —
+    /// matches `AppModel`/`InboxModel`'s own `isolated deinit` convention
+    /// (SE-0371): `undoExpiryTask` is `@MainActor`-isolated storage, so a
+    /// plain `nonisolated deinit` couldn't touch it.
+    isolated deinit {
+        undoExpiryTask?.cancel()
+    }
+
     /// `makeService` is optional-with-nil rather than a defaulted closure
     /// because a default argument expression can't capture the sibling
     /// `database`/`account` parameters — so the real `SendBootstrap` default
@@ -94,7 +129,8 @@ public final class ComposerModel {
     public init(
         database: HudsonDatabase,
         account: AccountRecord?,
-        makeService: (() -> SendService?)? = nil
+        makeService: (() -> SendService?)? = nil,
+        undoHoldWindow: Duration = .seconds(15)
     ) {
         self.database = database
         self.account = account
@@ -102,6 +138,7 @@ public final class ComposerModel {
             guard let account else { return nil }
             return SendBootstrap.makeService(database: database, account: account)
         }
+        self.undoHoldWindow = undoHoldWindow
     }
 
     // MARK: - Draft lifecycle
@@ -116,6 +153,8 @@ public final class ComposerModel {
         subject = ""
         bodyText = ""
         banner = nil
+        undoExpiryTask?.cancel()
+        undoExpiryTask = nil
         justSentUndoJobID = nil
     }
 
@@ -142,6 +181,8 @@ public final class ComposerModel {
             subject = scaffold.subject
             bodyText = await quotedReplyPrefill(threadID: threadID)
             banner = nil
+            undoExpiryTask?.cancel()
+            undoExpiryTask = nil
             justSentUndoJobID = nil
         } catch {
             // The only failure `replyMessage` throws is `emptyThread` (a
@@ -174,9 +215,10 @@ public final class ComposerModel {
 
         let now = Self.nowMilliseconds()
         do {
-            let jobID = try await service.enqueue(message, now: now)
+            let jobID = try await service.enqueue(message, undoHold: undoHoldWindow, now: now)
             lastSendService = service
             justSentUndoJobID = jobID
+            scheduleUndoExpiry(forJobID: jobID)
             // Kick a flush pass, but it deliberately delivers nothing yet: the
             // job is still inside its undo hold, so `claimSendable` skips it.
             // The pass exists to resolve any crash-stranded jobs; the actual
@@ -201,6 +243,8 @@ public final class ComposerModel {
         do {
             let cancelled = try await service.cancel(jobID: jobID, now: now)
             if cancelled {
+                undoExpiryTask?.cancel()
+                undoExpiryTask = nil
                 justSentUndoJobID = nil
                 banner = "Send cancelled."
             } else {
@@ -277,6 +321,35 @@ public final class ComposerModel {
         bodyText = ""
         replyScaffold = nil
         mode = .new
+    }
+
+    // MARK: - Undo-hold timing
+
+    /// Schedules `justSentUndoJobID` to self-clear after `undoHoldWindow`,
+    /// so a view rendering the undo toast as a pure function of that
+    /// property (`ComposerView.bottomToast`) needs no timer of its own.
+    /// Cancels any still-pending timer from an earlier job first — see
+    /// `undoExpiryTask`'s doc comment — and the scheduled closure itself
+    /// re-checks `justSentUndoJobID == jobID` right before clearing, so
+    /// even a task that already slipped past cancellation (a race between
+    /// `Task.cancel()` and the sleep resolving) can't stomp a newer job's
+    /// still-valid handle, nor fire after `undo()` already cleared this
+    /// one.
+    private func scheduleUndoExpiry(forJobID jobID: Int64) {
+        undoExpiryTask?.cancel()
+        // Captured by value (it's a `let`) rather than read off `self`
+        // inside the `Task` — `self` is only weakly captured below, so
+        // reading an instance property off it would need an extra
+        // `self?.` hop that's pointless for an immutable value already
+        // known here.
+        let holdWindow = undoHoldWindow
+        undoExpiryTask = Task { [weak self] in
+            try? await Task.sleep(for: holdWindow)
+            guard let self, !Task.isCancelled else { return }
+            if self.justSentUndoJobID == jobID {
+                self.justSentUndoJobID = nil
+            }
+        }
     }
 
     // MARK: - Helpers

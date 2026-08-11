@@ -198,6 +198,38 @@ private actor RenderSmokeSendTransport: SendTransport {
 /// Drives a REAL `send()` through a fake-transport-backed `SendService`
 /// (`RenderSmokeSendTransport`) so this render state is reached the same
 /// way the real app reaches it, not synthesized by poking private state.
+///
+/// Hosts the view BEFORE calling `send()` — mirroring the real app, where
+/// the Send button lives inside the already-mounted `ComposerView` — then
+/// re-`layout()`s after `send()` resolves, so the `nil` → jobID transition
+/// happens while this exact instance is live and observing `composer`.
+/// Getting this order backwards (build the view AFTER `send()` already
+/// flipped `justSentUndoJobID`) previously made this test vacuous with an
+/// EARLIER `ComposerView` implementation that opened the toast via
+/// `.onChange(of:)` — that overload only fires on a transition witnessed
+/// while mounted, so a value already non-nil at first appearance never
+/// fired it. `ComposerView.bottomToast` no longer depends on watching a
+/// transition at all (it's a pure function of `composer.justSentUndoJobID`,
+/// see that property's doc comment), which is what actually makes the order
+/// here safe either way now — but hosting first still matches how a real
+/// user reaches this state, so the recipe stays in that order.
+///
+/// Beyond the model-level `justSentUndoJobID != nil` fixture-sanity check,
+/// this also asserts `view.isUndoToastShown` — the EXACT boolean
+/// `ComposerView.bottomToast` branches on to decide whether to render the
+/// undo toast (exposed non-`private` specifically for this assertion via
+/// `@testable import`) — so a regression that breaks the toast/undo wiring
+/// (e.g. `bottomToast` reverting to a stale view-local flag, or the
+/// condition being deleted/inverted) fails this test, not just a generic
+/// non-zero `NSHostingView` fitting-size check (which stays true either
+/// way and can't tell the toast branch apart from the placeholder-toast or
+/// no-toast branches). Asserting on rendered TEXT content instead was
+/// evaluated and dropped: `NSView.accessibilityChildren()` on a hosted
+/// SwiftUI tree comes back empty under `swift test`'s windowless
+/// environment (verified empirically, including with the host parented
+/// into a real `NSWindow`), so there is no reliable way to introspect
+/// rendered text here — `isUndoToastShown` is the closest thing to "the
+/// toast is on screen" this environment can actually assert on.
 @MainActor
 @Test func composerViewRendersUndoToastAfterSend() async throws {
     let db = try HudsonDatabase.inMemory()
@@ -212,12 +244,18 @@ private actor RenderSmokeSendTransport: SendTransport {
     model.to = "friend@example.com"
     model.subject = "Lunch?"
     model.bodyText = "Are you free Thursday?"
-    await model.send()
-    #expect(model.justSentUndoJobID != nil)  // fixture sanity — the toast condition is real
 
     let view = ComposerView(composer: model, onClose: {})
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 640, height: 560)
     host.layout()
+    assertRendered(host.fittingSize)
+    #expect(!view.isUndoToastShown)  // nothing sent yet — no toast to show
+
+    await model.send()
+    #expect(model.justSentUndoJobID != nil)  // fixture sanity — the toast condition is real
+    host.layout()
+
+    #expect(view.isUndoToastShown)  // the ACTUAL condition `bottomToast` renders on
     assertRendered(host.fittingSize)
 }
