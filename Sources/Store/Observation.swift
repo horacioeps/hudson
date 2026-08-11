@@ -86,4 +86,24 @@ extension HudsonDatabase {
             }
             .values(in: writer)
     }
+
+    /// Live count of unread threads across the WHOLE inbox (every split), for
+    /// the sidebar's "Inbox" badge. Deliberately NOT filtered by `split_key`:
+    /// the badge is a mailbox-wide total, so it must stay constant as the user
+    /// switches the inbox list's split tabs — unlike `observeInboxThreads`,
+    /// whose row set (and any count derived from it) is scoped to the active
+    /// split. Re-emits whenever a triage flips a thread's `unread`/`in_inbox`.
+    public func observeInboxUnreadCount(account: String) -> AsyncValueObservation<Int> {
+        ValueObservation
+            .tracking { db in
+                try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT COUNT(*) FROM thread_rollup
+                        WHERE account_email = ? AND in_inbox = 1 AND unread = 1
+                        """,
+                    arguments: [account]) ?? 0
+            }
+            .values(in: writer)
+    }
 }
