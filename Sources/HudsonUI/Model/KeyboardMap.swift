@@ -56,6 +56,7 @@ public enum KeyAction: Sendable, Equatable {
     case clearSelection
     case togglePalette
     case toggleSearch
+    case composeNew
 }
 
 /// Hudson's global keymap, as a single pure function: `(context, key) ->
@@ -122,6 +123,7 @@ public enum KeyRouter {
             switch characters {
             case "k": return .togglePalette
             case "f": return .toggleSearch
+            case "n": return .composeNew
             default: return nil
             }
         }

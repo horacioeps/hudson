@@ -83,29 +83,33 @@ enum SenderInfo {
 /// mutation (expand/collapse) happens by calling into that model; this view
 /// makes no Store calls of its own.
 ///
-/// Archive/Star are the two triage actions wired LIVE this milestone, via
+/// Archive/Star/Reply are the triage/compose actions wired LIVE, via
 /// caller-supplied closures — `ThreadModel` itself has no triage methods
-/// (that lives on `InboxModel`, which a later task's host view already
-/// owns), so this view stays agnostic of exactly how those two actions are
-/// performed. Snooze and "⋯ more" are placeholders (M6), and the AI-summary
-/// chip and the reply bar are NON-FUNCTIONAL placeholders (M7/M5): tapping
-/// either only shows a `Toast` naming the milestone it arrives in — zero
-/// network egress, zero sending, per this milestone's privacy constraint.
+/// (that lives on `InboxModel`) and no compose methods (that lives on
+/// `AppModel.composer`, Task 4's `replyToOpenThread()`), so this view stays
+/// agnostic of exactly how any of the three are performed. Snooze and "⋯
+/// more" are still placeholders (M6), and the AI-summary chip is still a
+/// NON-FUNCTIONAL placeholder (M7): tapping either only shows a `Toast`
+/// naming the milestone it arrives in — zero network egress, per this
+/// milestone's privacy constraint.
 public struct ThreadView: View {
     private let thread: ThreadModel
     private let onArchive: () -> Void
     private let onToggleStar: () -> Void
+    private let onReply: () -> Void
 
     /// Toast text currently shown above the reply bar, or `nil` when none is
     /// visible. Cleared automatically a couple seconds after `showToast`.
     @State private var toastText: String?
 
     public init(
-        thread: ThreadModel, onArchive: @escaping () -> Void, onToggleStar: @escaping () -> Void
+        thread: ThreadModel, onArchive: @escaping () -> Void, onToggleStar: @escaping () -> Void,
+        onReply: @escaping () -> Void
     ) {
         self.thread = thread
         self.onArchive = onArchive
         self.onToggleStar = onToggleStar
+        self.onReply = onReply
     }
 
     public var body: some View {
@@ -350,11 +354,11 @@ public struct ThreadView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Reply bar (non-functional — composer is M5)
+    // MARK: - Reply bar
 
     private var replyBar: some View {
         HStack {
-            QuietButton(title: "Reply", action: { showToast("Sending arrives with M5") })
+            QuietButton(title: "Reply", action: onReply)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, Metrics.unit * 4)
@@ -384,6 +388,6 @@ public struct ThreadView: View {
     // thread instead (see `RenderSmokeTests.threadViewRendersWithSeededThread`).
     let db = try! HudsonDatabase.inMemory()
     let model = ThreadModel(database: db, account: "you@hudson.app")
-    return ThreadView(thread: model, onArchive: {}, onToggleStar: {})
+    return ThreadView(thread: model, onArchive: {}, onToggleStar: {}, onReply: {})
         .frame(width: 760, height: 700)
 }

@@ -93,7 +93,7 @@ struct SnapshotHarness {
             InboxListView(inbox: model.inbox, onOpen: { _ in })
                 .frame(width: Metrics.listWidth)
 
-            ThreadView(thread: model.thread, onArchive: {}, onToggleStar: {})
+            ThreadView(thread: model.thread, onArchive: {}, onToggleStar: {}, onReply: {})
                 .frame(maxWidth: .infinity)
         }
         .background(Palette.bgApp)

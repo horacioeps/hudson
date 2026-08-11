@@ -3,8 +3,9 @@ import Store
 
 /// The root of the app's object graph. Owns the open database, the active
 /// account, and every child view model (`inbox`/`thread`/`command`/
-/// `search`), plus the app-level presentation state (which overlay is
-/// showing) and keyboard routing (`apply(_:)`, driven by `KeyboardMonitor`).
+/// `search`/`composer`), plus the app-level presentation state (which
+/// overlay is showing) and keyboard routing (`apply(_:)`, driven by
+/// `KeyboardMonitor`).
 /// `@MainActor` because every view model in Hudson is main-actor — SwiftUI
 /// reads them on the main thread and Store access is via async APIs, so
 /// nothing here ever blocks a cooperative-pool thread.
@@ -18,6 +19,7 @@ public final class AppModel {
     public let thread: ThreadModel
     public let command: CommandModel
     public let search: SearchModel
+    public let composer: ComposerModel
 
     /// The sidebar's "LABELS" section — a one-shot read at launch (Store has
     /// no `observeLabels` twin the way inbox rows/split rules do, and this
@@ -41,6 +43,12 @@ public final class AppModel {
     public var isPaletteVisible = false
     /// Whether the ⌘F/`/` search overlay is showing.
     public var isSearchVisible = false
+    /// Whether the compose sheet (`ComposerView`, bound to `composer`) is
+    /// showing — opened by `composeNew()`/`replyToOpenThread()`, and closed
+    /// either by the sheet's own Cancel/Esc (`RootView` sets this back to
+    /// `false` directly) or by a SUCCESSFUL send, via `composer.onClose`
+    /// (wired in both initializers below) — see `wireComposerDismissal`.
+    public var isComposerVisible = false
 
     /// A user-visible strip for app-level sync state (offline, no account
     /// connected, a failed pass) — `nil` when there's nothing to show.
@@ -66,10 +74,12 @@ public final class AppModel {
         self.thread = ThreadModel(database: database, account: email)
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
+        self.composer = ComposerModel(database: database, account: account)
         await inbox.start()
         await refreshLabels()
         subscribeToPendingCount()
         subscribeToUnreadCount()
+        wireComposerDismissal()
     }
 
     /// Direct-injection initializer for tests and previews (seeded
@@ -87,11 +97,13 @@ public final class AppModel {
         self.thread = ThreadModel(database: database, account: email)
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
+        self.composer = ComposerModel(database: database, account: account)
         let inbox = self.inbox
         Task { await inbox.start() }
         Task { [weak self] in await self?.refreshLabels() }
         subscribeToPendingCount()
         subscribeToUnreadCount()
+        wireComposerDismissal()
     }
 
     /// The demo mailbox's account — matches `DemoData.seed`'s default so
@@ -172,6 +184,25 @@ public final class AppModel {
         labels = (try? await database.labels(account: account.email)) ?? []
     }
 
+    /// Lets a successful send dismiss the compose sheet from HERE, not from
+    /// the view: `ComposerModel.send()` fires `onClose?()` synchronously
+    /// right after enqueueing (see its doc comment), so wiring that straight
+    /// to `isComposerVisible = false` is the same "model owns the dismissal"
+    /// shape `togglePalette`/`toggleSearch` already use for the other two
+    /// overlays. Called once, at the end of each initializer, after every
+    /// stored property (including `composer` itself) has a value — matches
+    /// `subscribeToPendingCount`/`subscribeToUnreadCount`'s own established
+    /// "capture self weakly once fully initialized" convention, just for a
+    /// callback assignment rather than a `Task`.
+    ///
+    /// The compose sheet closing does NOT drop the just-sent draft's undo
+    /// affordance — `ComposerModel.justSentUndoJobID` deliberately outlives
+    /// `onClose` firing, so `RootView` renders that toast independently of
+    /// whether the sheet itself is still mounted (see `RootView.assembled`).
+    private func wireComposerDismissal() {
+        composer.onClose = { [weak self] in self?.isComposerVisible = false }
+    }
+
     // MARK: - Navigation
 
     /// Selects `threadID` in the inbox list and loads it into the reading
@@ -182,6 +213,35 @@ public final class AppModel {
     public func openThread(_ threadID: String) {
         inbox.selectedThreadID = threadID
         Task { await thread.open(threadID: threadID) }
+    }
+
+    // MARK: - Compose / reply (see `ComposerModel`; ⌘N and the reply bar both funnel here)
+
+    /// Opens the compose sheet with a blank draft — the ⌘N shortcut
+    /// (`KeyAction.composeNew`) funnels through here. Synchronous:
+    /// `ComposerModel.startNew()` does no async work (see its doc comment),
+    /// so there's nothing to await before showing the sheet.
+    public func composeNew() {
+        composer.startNew()
+        isComposerVisible = true
+    }
+
+    /// Opens the compose sheet pre-filled as a reply to whichever thread is
+    /// currently open (`inbox.selectedThreadID` — the same id `openThread(_:)`
+    /// sets and `ThreadView`'s reading pane is showing) — `ThreadView`'s
+    /// Reply bar funnels through here. A no-op, defensively, if nothing is
+    /// selected: `RootView` only mounts the Reply bar once a thread is open,
+    /// but this doesn't trust that invariant rather than risk showing an
+    /// untethered sheet. `ComposerModel.startReply` is async (it reads the
+    /// thread to build the real threading scaffold via `ReplyBuilder`), so
+    /// the sheet is shown only AFTER it resolves — the draft is already
+    /// fully prefilled the instant it appears, no empty-to-populated flash.
+    public func replyToOpenThread() {
+        guard let threadID = inbox.selectedThreadID else { return }
+        Task { [weak self] in
+            await self?.composer.startReply(threadID: threadID)
+            self?.isComposerVisible = true
+        }
     }
 
     // MARK: - Palette / search presentation
@@ -270,18 +330,15 @@ public final class AppModel {
         case .clearSelection: inbox.selectedThreadID = nil
         case .togglePalette: togglePalette()
         case .toggleSearch: toggleSearch()
+        case .composeNew: composeNew()
         }
     }
 
     // MARK: - Sync (the ONLY network path in the app — see Privacy #1: user-initiated, never automatic)
 
-    /// TODO(sync-wire): nothing in this milestone's UI calls this yet — the
-    /// sidebar's settings gear is still a placeholder (Task 9's doc
-    /// comment), and per Privacy #1 sync must stay user-initiated, so it's
-    /// deliberately never called automatically (e.g. on launch) either. The
-    /// implementation below is real and tested at the "no account/no
-    /// credentials" guard (`AppModelTests`); a future task wires an actual
-    /// "Sync now" affordance to call it.
+    /// Wired to the sidebar footer's "Sync now" button (`RootView` ->
+    /// `SidebarView.onSyncNow`) — per Privacy #1 this stays the ONLY way
+    /// sync ever runs; it is never called automatically (e.g. on launch).
     ///
     /// Best-effort and fully guarded: builds the network stack from the
     /// Keychain (mirrors `HudsonCLI/Runtime.bootstrap()`, via

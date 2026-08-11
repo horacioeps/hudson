@@ -48,6 +48,22 @@ import Testing
     assertRendered(listHost.fittingSize)
 }
 
+/// `SidebarView` in its "sync in flight, with an error banner queued from a
+/// prior failed pass" state — Task 4's new `isSyncing`/`syncBanner`/
+/// `onSyncNow` surface, seeded independent of `AppModel`/Store since neither
+/// param needs a live database.
+@MainActor
+@Test func sidebarRendersSyncingStateWithBanner() {
+    let sidebar = SidebarView(
+        accountEmail: "you@hudson.app", unreadCount: 3, labels: [], pendingCount: 2,
+        isSyncing: true, syncBanner: "Sync failed — check your connection.",
+        selection: .inbox, onSelect: { _ in }, onSyncNow: {})
+    let host = NSHostingView(rootView: sidebar)
+    host.frame = .init(x: 0, y: 0, width: Metrics.sidebarWidth, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
 /// A `.zero` fitting size means this environment can't lay out an
 /// `NSHostingView` at all (no window server) — nothing to assert either way,
 /// so this no-ops rather than failing a headless run. Any other size is a
@@ -71,7 +87,7 @@ private func assertRendered(_ size: NSSize) {
     await thread.open(threadID: "t01")
     try await Task.sleep(for: .milliseconds(50))
 
-    let view = ThreadView(thread: thread, onArchive: {}, onToggleStar: {})
+    let view = ThreadView(thread: thread, onArchive: {}, onToggleStar: {}, onReply: {})
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 760, height: 700)
     host.layout()
@@ -129,6 +145,22 @@ private func assertRendered(_ size: NSSize) {
     // `Task`) land their first emission before hosting — matches every
     // other test in this file's "seed, sleep, then render" recipe.
     try await Task.sleep(for: .milliseconds(100))
+
+    let view = RootView(model: appModel)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `RootView` with the compose sheet showing (`AppModel.composeNew()`, ⌘N's
+/// path) — exercises Task 4's new overlay branch alongside the
+/// already-covered three-pane/palette/search branches above.
+@MainActor
+@Test func rootViewRendersWithComposerVisible() async throws {
+    let appModel = try await AppModel.demo()
+    try await Task.sleep(for: .milliseconds(100))
+    appModel.composeNew()
 
     let view = RootView(model: appModel)
     let host = NSHostingView(rootView: view)

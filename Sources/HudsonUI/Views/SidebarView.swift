@@ -18,21 +18,38 @@ public struct SidebarView: View {
     private let unreadCount: Int
     private let labels: [LabelRecord]
     private let pendingCount: Int
+    /// True while `AppModel.syncNow()` has a pass in flight — disables the
+    /// footer's "Sync now" button (no double-tap into an overlapping pass;
+    /// `AppModel.syncNow()` itself already guards this too, but disabling
+    /// the button is the visible half of that guard) and swaps the status
+    /// text to "Syncing…".
+    private let isSyncing: Bool
+    /// `AppModel.syncBanner` — non-`nil` for "no account connected" or "the
+    /// last pass failed". Surfaced right next to the button that would fix
+    /// it (in place of the pending-count text) rather than only at
+    /// `RootView`'s top-pinned strip, so the reason a tap didn't do anything
+    /// obvious is never more than a glance away.
+    private let syncBanner: String?
     private let selection: Selection
     private let onSelect: (Selection) -> Void
+    private let onSyncNow: () -> Void
     private let onSettings: () -> Void
 
     public init(
         accountEmail: String?, unreadCount: Int, labels: [LabelRecord], pendingCount: Int,
+        isSyncing: Bool = false, syncBanner: String? = nil,
         selection: Selection, onSelect: @escaping (Selection) -> Void,
-        onSettings: @escaping () -> Void = {}
+        onSyncNow: @escaping () -> Void = {}, onSettings: @escaping () -> Void = {}
     ) {
         self.accountEmail = accountEmail
         self.unreadCount = unreadCount
         self.labels = labels
         self.pendingCount = pendingCount
+        self.isSyncing = isSyncing
+        self.syncBanner = syncBanner
         self.selection = selection
         self.onSelect = onSelect
+        self.onSyncNow = onSyncNow
         self.onSettings = onSettings
     }
 
@@ -110,11 +127,12 @@ public struct SidebarView: View {
 
     private var footer: some View {
         HStack(spacing: Metrics.unit * 2) {
-            Text(pendingCount > 0 ? "\(pendingCount) pending" : "All synced")
+            Text(footerStatusText)
                 .font(Typography.ui(11))
-                .foregroundStyle(Palette.inkTertiary)
+                .foregroundStyle(syncBanner != nil ? Palette.danger : Palette.inkTertiary)
                 .lineLimit(1)
             Spacer(minLength: Metrics.unit)
+            syncNowButton
             // Non-functional placeholder — a settings scene lands in a later task.
             Button(action: onSettings) {
                 Image(systemName: "gearshape")
@@ -127,6 +145,32 @@ public struct SidebarView: View {
         .overlay(alignment: .top) {
             Rectangle().fill(Palette.border).frame(height: 1)
         }
+    }
+
+    /// The footer's single line of sync status, in priority order: a
+    /// `syncBanner` (something needs the user's attention — no account, or
+    /// the last pass failed) beats `isSyncing` (a pass is in flight) beats
+    /// the ordinary pending-mutations count. One line, one truth, rather
+    /// than three separately-toggled pieces of footer chrome.
+    private var footerStatusText: String {
+        if let syncBanner { return syncBanner }
+        if isSyncing { return "Syncing…" }
+        return pendingCount > 0 ? "\(pendingCount) pending" : "All synced"
+    }
+
+    /// A small text button (matching this footer's own compact 11pt scale,
+    /// not the app-wide `PrimaryButton`/`QuietButton` — those are sized for
+    /// a sheet's footer, not a narrow sidebar strip) that fires
+    /// `AppModel.syncNow()` via `onSyncNow`. Disabled while `isSyncing` so a
+    /// double-click can't queue two overlapping passes.
+    private var syncNowButton: some View {
+        Button(action: onSyncNow) {
+            Text("Sync now")
+                .font(Typography.ui(11, .medium))
+                .foregroundStyle(isSyncing ? Palette.inkTertiary : Palette.accent)
+        }
+        .buttonStyle(.plain)
+        .disabled(isSyncing)
     }
 }
 
