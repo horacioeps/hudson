@@ -337,6 +337,10 @@ public final class AppModel {
     /// event — derived, never stored, so it can never drift from the
     /// overlay flags that actually drive what's on screen.
     var keyboardContext: KeyboardContext {
+        // The composer is a text-entry modal — it takes keyboard priority so
+        // the list's single-letter triage shortcuts never eat characters you're
+        // typing into an email.
+        if isComposerVisible { return .composer }
         if isPaletteVisible { return .palette }
         if isSearchVisible { return .search }
         return .list
@@ -362,6 +366,7 @@ public final class AppModel {
         case .togglePalette: togglePalette()
         case .toggleSearch: toggleSearch()
         case .composeNew: composeNew()
+        case .closeComposer: isComposerVisible = false
         }
     }
 

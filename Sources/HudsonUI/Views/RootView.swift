@@ -148,7 +148,8 @@ public struct RootView: View {
                         break
                     }
                 },
-                onSyncNow: { Task { await model.syncNow() } })
+                onSyncNow: { Task { await model.syncNow() } },
+                onCompose: { model.composeNew() })
                 .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)
 
             InboxListView(inbox: model.inbox, onOpen: { model.openThread($0) })
