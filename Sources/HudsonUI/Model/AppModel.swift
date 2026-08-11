@@ -30,6 +30,13 @@ public final class AppModel {
     public private(set) var pendingCount: Int = 0
     private var pendingCountTask: Task<Void, Never>?
 
+    /// Unread threads across the WHOLE inbox — backs the sidebar's "Inbox"
+    /// badge. Observed independently of `inbox` (whose rows are scoped to the
+    /// active split), so the badge shows the mailbox total and stays put when
+    /// the user switches split tabs.
+    public private(set) var totalUnread: Int = 0
+    private var unreadCountTask: Task<Void, Never>?
+
     /// Whether the ⌘K command palette overlay is showing.
     public var isPaletteVisible = false
     /// Whether the ⌘F/`/` search overlay is showing.
@@ -62,6 +69,7 @@ public final class AppModel {
         await inbox.start()
         await refreshLabels()
         subscribeToPendingCount()
+        subscribeToUnreadCount()
     }
 
     /// Direct-injection initializer for tests and previews (seeded
@@ -83,6 +91,7 @@ public final class AppModel {
         Task { await inbox.start() }
         Task { [weak self] in await self?.refreshLabels() }
         subscribeToPendingCount()
+        subscribeToUnreadCount()
     }
 
     /// The demo mailbox's account — matches `DemoData.seed`'s default so
@@ -120,6 +129,7 @@ public final class AppModel {
     /// storage, so a plain `nonisolated deinit` can't touch it).
     isolated deinit {
         pendingCountTask?.cancel()
+        unreadCountTask?.cancel()
     }
 
     private func subscribeToPendingCount() {
@@ -136,6 +146,23 @@ public final class AppModel {
                 // Matches `InboxModel`'s subscriptions: a genuine Store
                 // failure here has no recovery beyond the next launch —
                 // nothing user-actionable to surface differently.
+            }
+        }
+    }
+
+    private func subscribeToUnreadCount() {
+        guard let account else { return }
+        let email = account.email
+        let database = self.database
+        unreadCountTask = Task { [weak self] in
+            do {
+                for try await count in database.observeInboxUnreadCount(account: email) {
+                    guard let self, !Task.isCancelled else { return }
+                    self.totalUnread = count
+                }
+            } catch {
+                // Same posture as the pending-count subscription: a genuine
+                // Store failure here has no recovery beyond the next launch.
             }
         }
     }

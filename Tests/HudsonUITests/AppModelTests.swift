@@ -18,6 +18,28 @@ import Testing
     #expect(model.thread.subject == "Re: Dinner Friday?")
 }
 
+/// The sidebar "Inbox" badge counts unread across the WHOLE mailbox and does
+/// not change when the inbox list switches split tabs (the fast-follow fix —
+/// it used to be derived from `inbox.rows`, which is scoped to the active split).
+@MainActor
+@Test func totalUnreadIsMailboxWideAndConstantAcrossSplitSwitches() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let model = AppModel(database: db, account: try await db.primaryAccount())
+    try await Task.sleep(for: .milliseconds(100))
+
+    let mailboxWideUnread = try await db
+        .inboxThreads(account: AppModel.demoAccount, split: nil, limit: 500)
+        .count { $0.unread }
+    #expect(mailboxWideUnread > 0)
+    #expect(model.totalUnread == mailboxWideUnread)
+
+    // Narrowing the inbox list to one split must leave the badge unchanged.
+    model.inbox.activeSplit = "important"
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(model.totalUnread == mailboxWideUnread)
+}
+
 // MARK: - Palette / search presentation
 
 @MainActor

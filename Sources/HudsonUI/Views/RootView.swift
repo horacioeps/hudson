@@ -108,7 +108,7 @@ public struct RootView: View {
         NavigationSplitView {
             SidebarView(
                 accountEmail: model.account?.email,
-                unreadCount: model.inbox.rows.count { $0.unread },
+                unreadCount: model.totalUnread,
                 labels: model.labels,
                 pendingCount: model.pendingCount,
                 // Only "Inbox" is wired to a real Store-backed filter this
