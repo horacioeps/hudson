@@ -131,13 +131,28 @@ public struct RootView: View {
                         break
                     }
                 })
+                // Draggable, within sane bounds — replaces the sidebar's old
+                // hard `.frame(width:)` so its divider actually resizes.
+                .navigationSplitViewColumnWidth(min: 200, ideal: Metrics.sidebarWidth, max: 320)
         } content: {
             InboxListView(inbox: model.inbox, onOpen: { model.openThread($0) })
+                // Draggable list column — replaces the inbox list's old hard
+                // `.frame(width:)`. The detail (reading) pane takes whatever
+                // space is left and resizes with this divider.
+                .navigationSplitViewColumnWidth(min: 320, ideal: Metrics.listWidth, max: 560)
         } detail: {
-            ThreadView(
-                thread: model.thread,
-                onArchive: { Task { try? await model.inbox.archiveSelected() } },
-                onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } })
+            // Only mount the full ThreadView (toolbar + reply bar + body) once
+            // a thread is actually open. With nothing selected we show a bare
+            // centered empty state instead, so the reading pane never presents
+            // dead chrome (a Reply bar with nothing to reply to, etc.).
+            if model.inbox.selectedThreadID != nil && !model.thread.messages.isEmpty {
+                ThreadView(
+                    thread: model.thread,
+                    onArchive: { Task { try? await model.inbox.archiveSelected() } },
+                    onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } })
+            } else {
+                readingPaneEmptyState
+            }
         }
         // The design has no sidebar-collapse affordance (SidebarView's own
         // comment: the hidden-title-bar window reserves the traffic-light
@@ -145,6 +160,23 @@ public struct RootView: View {
         // the toolbar automatically.
         .toolbar(removing: .sidebarToggle)
         .background(Palette.bgApp)
+    }
+
+    /// Shown in the detail pane when no thread is open — a subtle, centered
+    /// prompt on the reading pane's own surface, with none of `ThreadView`'s
+    /// chrome. Sits on `Palette.bgSurface` (the reading pane's background) so
+    /// switching to a real thread doesn't shift the backdrop.
+    private var readingPaneEmptyState: some View {
+        VStack(spacing: Metrics.unit * 3) {
+            Image(systemName: "envelope")
+                .font(Typography.ui(34))
+                .foregroundStyle(Palette.inkTertiary)
+            Text("Select a conversation")
+                .font(Typography.ui(15))
+                .foregroundStyle(Palette.inkTertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Palette.bgSurface)
     }
 
     /// A dimmed, click-to-dismiss backdrop behind a centered modal —
