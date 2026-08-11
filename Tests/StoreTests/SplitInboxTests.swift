@@ -34,19 +34,22 @@ private final class SplitRulesQueryCounter: @unchecked Sendable {
 
 // MARK: - computeSplit: pure function
 
-@Test func computeSplitMapsGmailCategoryLabelsToFriendlyNamesWithNoRulesConfigured() {
-    let cases: [(String, String)] = [
-        ("CATEGORY_PROMOTIONS", "promotions"),
-        ("CATEGORY_SOCIAL", "social"),
-        ("CATEGORY_UPDATES", "updates"),
-        ("CATEGORY_FORUMS", "forums"),
-        ("CATEGORY_PERSONAL", "personal"),
+@Test func computeSplitMapsGmailCategoryLabelsToSplitTabsWithNoRulesConfigured() {
+    // (label, category, splitKey). Gmail categories become split tabs for
+    // free — EXCEPT CATEGORY_PERSONAL, which IS Gmail's Primary tab, so it
+    // routes to the "primary" split while its `category` stays "personal".
+    let cases: [(String, String, String)] = [
+        ("CATEGORY_PROMOTIONS", "promotions", "promotions"),
+        ("CATEGORY_SOCIAL", "social", "social"),
+        ("CATEGORY_UPDATES", "updates", "updates"),
+        ("CATEGORY_FORUMS", "forums", "forums"),
+        ("CATEGORY_PERSONAL", "personal", "primary"),
     ]
-    for (label, friendlyName) in cases {
+    for (label, category, splitKey) in cases {
         let result = SplitInbox.computeSplit(
             fromLine: "ada@x.com", listID: nil, categoryLabels: ["INBOX", label], rules: [])
-        #expect(result.category == friendlyName)
-        #expect(result.splitKey == friendlyName)  // Gmail categories become split tabs for free
+        #expect(result.category == category)
+        #expect(result.splitKey == splitKey)
     }
 }
 

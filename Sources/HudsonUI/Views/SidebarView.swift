@@ -24,6 +24,10 @@ public struct SidebarView: View {
     /// the button is the visible half of that guard) and swaps the status
     /// text to "Syncing…".
     private let isSyncing: Bool
+    /// True while the initial backfill/body-hydration is still catching up —
+    /// drives the footer's "Getting your mail…" line (a fresh account isn't
+    /// told "All synced" while bodies are still streaming in).
+    private let isCatchingUp: Bool
     /// `AppModel.syncBanner` — non-`nil` for "no account connected" or "the
     /// last pass failed". Surfaced right next to the button that would fix
     /// it (in place of the pending-count text) rather than only at
@@ -38,7 +42,7 @@ public struct SidebarView: View {
 
     public init(
         accountEmail: String?, unreadCount: Int, labels: [LabelRecord], pendingCount: Int,
-        isSyncing: Bool = false, syncBanner: String? = nil,
+        isSyncing: Bool = false, isCatchingUp: Bool = false, syncBanner: String? = nil,
         selection: Selection, onSelect: @escaping (Selection) -> Void,
         onSyncNow: @escaping () -> Void = {}, onSettings: @escaping () -> Void = {},
         onCompose: @escaping () -> Void = {}
@@ -48,6 +52,7 @@ public struct SidebarView: View {
         self.labels = labels
         self.pendingCount = pendingCount
         self.isSyncing = isSyncing
+        self.isCatchingUp = isCatchingUp
         self.syncBanner = syncBanner
         self.selection = selection
         self.onSelect = onSelect
@@ -170,6 +175,7 @@ public struct SidebarView: View {
     private var footerStatusText: String {
         if let syncBanner { return syncBanner }
         if isSyncing { return "Syncing…" }
+        if isCatchingUp { return "Getting your mail…" }
         return pendingCount > 0 ? "\(pendingCount) pending" : "All synced"
     }
 

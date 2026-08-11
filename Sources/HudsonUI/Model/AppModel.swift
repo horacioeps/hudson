@@ -99,6 +99,12 @@ public final class AppModel {
     /// overlapping passes from a double-tap of whatever future UI calls it.
     public private(set) var isSyncing = false
 
+    /// True while the initial backfill / body-hydration is still catching up
+    /// (the auto-sync loop saw an incomplete backfill or hydrated bodies this
+    /// pass). Drives the footer's "Getting your mail…" line so a fresh account
+    /// isn't told "All synced" while bodies are still streaming in.
+    public private(set) var isCatchingUp = false
+
     private static let connectAccountBannerText = "Connect an account in Terminal: `hudson auth`"
 
     /// Opens the store at `databaseURL`, loads the primary account, and
@@ -466,14 +472,26 @@ public final class AppModel {
             // "said Sent but never sent" bug.
             let sendService = SendBootstrap.makeService(database: database, account: account)
             while !Task.isCancelled {
-                _ = try? await stack.engine.syncOnce()
+                let report = try? await stack.engine.syncOnce()
                 _ = try? await stack.flusher.flushOnce()
                 if let sendService {
                     _ = try? await sendService.flushOnce(now: Int64(Date().timeIntervalSince1970 * 1000))
                 }
                 await self?.refreshLabels()
-                try? await Task.sleep(for: interval)
+                // Initial backfill + body hydration run in bounded per-pass
+                // batches. While there's still work — the backfill isn't
+                // complete, or this pass hydrated bodies (so more likely
+                // remain) — loop back after a short beat so a fresh account's
+                // mail fills in ~a minute instead of ~15, then relax to the
+                // full interval once caught up. The same signal keeps the
+                // footer honest (isCatchingUp) rather than claiming "All
+                // synced" mid-hydration.
+                let catchingUp =
+                    (report?.backfillComplete == false) || ((report?.bodiesHydrated ?? 0) > 0)
+                self?.isCatchingUp = catchingUp
+                try? await Task.sleep(for: catchingUp ? .seconds(2) : interval)
             }
+            self?.isCatchingUp = false
         }
     }
 

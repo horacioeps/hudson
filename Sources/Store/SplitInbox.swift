@@ -157,7 +157,13 @@ enum SplitInbox {
                 return (rule.splitName, category)
             }
         }
-        return (category.isEmpty ? "primary" : category, category)
+        // Gmail's Primary tab IS CATEGORY_PERSONAL, and category-less mail
+        // belongs there too — route both to the "primary" split so they land
+        // in the always-present Primary tab. Otherwise every real Gmail
+        // account (whose inbox mail all carries a CATEGORY_* label) shows an
+        // empty Primary while its actual primary mail hides under "personal".
+        let fallbackKey = (category.isEmpty || category == "personal") ? "primary" : category
+        return (fallbackKey, category)
     }
 
     /// Extracts the domain from a (lowercased) raw `From:` header — whatever

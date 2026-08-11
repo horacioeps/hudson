@@ -258,6 +258,7 @@ public struct RootView: View {
                 labels: model.labels,
                 pendingCount: model.pendingCount,
                 isSyncing: model.isSyncing,
+                isCatchingUp: model.isCatchingUp,
                 syncBanner: model.syncBanner,
                 selection: model.sidebarSelection,
                 onSelect: { model.selectFolder($0) },
