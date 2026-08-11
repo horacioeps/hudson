@@ -13,6 +13,15 @@ public struct ThreadMessage: Identifiable, Sendable, Equatable {
     /// value here is cached for good; `ThreadModel` never re-fetches an id
     /// that already has one.
     public var bodyText: String?
+    /// The message's raw, sender-authored HTML, once hydrated. When non-empty
+    /// the reading pane renders it in a privacy-sandboxed WKWebView (remote
+    /// loads blocked by default); otherwise it falls back to `bodyText`. `nil`
+    /// until fetched — same lazy-load-and-cache contract as `bodyText`.
+    public var rawHTML: Data?
+    /// The remote URLs the sanitizer catalogued in this body. The HTML
+    /// renderer keeps every one of them blocked until the user explicitly taps
+    /// "Load remote images" — so an unopened tracking pixel never phones home.
+    public var remoteURLs: [String]
     public var isExpanded: Bool
 
     public var id: String { row.id }
@@ -100,9 +109,13 @@ public final class ThreadModel {
         let newestID = freshMessages.max(by: { $0.internalDate < $1.internalDate })?.id
         messages = freshMessages.map { row in
             if let existing = existingByID[row.id] {
-                return ThreadMessage(row: row, bodyText: existing.bodyText, isExpanded: existing.isExpanded)
+                return ThreadMessage(
+                    row: row, bodyText: existing.bodyText, rawHTML: existing.rawHTML,
+                    remoteURLs: existing.remoteURLs, isExpanded: existing.isExpanded)
             }
-            return ThreadMessage(row: row, bodyText: nil, isExpanded: row.id == newestID)
+            return ThreadMessage(
+                row: row, bodyText: nil, rawHTML: nil, remoteURLs: [],
+                isExpanded: row.id == newestID)
         }
     }
 
@@ -117,9 +130,14 @@ public final class ThreadModel {
         let idsNeedingBody = messages.filter { $0.isExpanded && $0.bodyText == nil }.map(\.id)
         for id in idsNeedingBody {
             guard !Task.isCancelled else { return }
-            guard let fetched = try? await database.message(id: id, account: account) else { continue }
+            // `messageBody` returns nil only when no body row exists yet (not
+            // hydrated) — that's left uncached so the next re-emit/expand
+            // retries it, exactly as before.
+            guard let fetched = try? await database.messageBody(id: id, account: account) else { continue }
             guard !Task.isCancelled, let index = messages.firstIndex(where: { $0.id == id }) else { continue }
             messages[index].bodyText = fetched.plainText
+            messages[index].rawHTML = fetched.rawHTML
+            messages[index].remoteURLs = fetched.remoteURLs
         }
     }
 
@@ -141,9 +159,11 @@ public final class ThreadModel {
         let database = self.database
         let account = self.account
         Task { [weak self] in
-            guard let fetched = try? await database.message(id: id, account: account) else { return }
+            guard let fetched = try? await database.messageBody(id: id, account: account) else { return }
             guard let self, let currentIndex = self.messages.firstIndex(where: { $0.id == id }) else { return }
             self.messages[currentIndex].bodyText = fetched.plainText
+            self.messages[currentIndex].rawHTML = fetched.rawHTML
+            self.messages[currentIndex].remoteURLs = fetched.remoteURLs
         }
     }
 

@@ -1,3 +1,4 @@
+import Foundation
 import Store
 import Testing
 
@@ -106,6 +107,36 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
     // ...but expand state for both still-present messages was preserved.
     #expect(model.messages[0].isExpanded == true)
     #expect(model.messages[1].isExpanded == true)
+}
+
+/// The reading pane can only render real HTML mail if `ThreadModel` carries
+/// the raw HTML (and the sanitizer's remote-URL inventory) through to the
+/// view — this proves an HTML body's `rawHTML`/`remoteURLs` reach `messages`
+/// after `open`, eagerly, for the newest (auto-expanded) message.
+@MainActor
+@Test func openExposesRawHTMLAndRemoteURLsForHTMLBody() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "th3-m0", threadID: "th3", historyID: 1, internalDate: 1000,
+            fromLine: "Sale <deals@shop.example>", toLine: account, subject: "Sale",
+            snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+    let html = Data("<p>Hi</p><img src=\"https://cdn.shop.example/hero.png\">".utf8)
+    try await db.saveBody(
+        messageID: "th3-m0", account: account,
+        body: Sanitizer.sanitize(html: html, plainText: nil), attachments: [])
+
+    let model = ThreadModel(database: db, account: account)
+    await model.open(threadID: "th3")
+    try await Task.sleep(for: .milliseconds(50))
+
+    let message = try #require(model.messages.first)
+    #expect(message.isExpanded)  // newest -> auto-expanded -> body fetched eagerly
+    #expect(message.rawHTML == html)
+    #expect(message.remoteURLs.contains("https://cdn.shop.example/hero.png"))
 }
 
 @MainActor
