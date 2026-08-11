@@ -118,6 +118,22 @@ private func decodedBody(_ data: Data, afterContentTypePrefix prefix: String) th
     #expect(headers["Bcc"] == "hidden@example.com")
 }
 
+@Test func buildOmitsToHeaderWhenEmpty() throws {
+    // RFC 5322 permits a message to originate via `Bcc:` alone. `To:` must
+    // follow the same omission pattern as `Cc:`/`Bcc:` — an empty `to`
+    // must NOT produce a blank `To: ` header line (that's what this test
+    // guards against; it previously did).
+    let message = OutboxMessage(
+        from: "me@example.com", to: [], bcc: ["hidden@example.com"], subject: "hi", bodyText: "hi")
+    let built = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    let headers = try parseHeaders(built)
+    #expect(headers["To"] == nil)
+    #expect(headers["Bcc"] == "hidden@example.com")
+    let headerBlock = String(decoding: built, as: UTF8.self)
+        .components(separatedBy: "\r\n\r\n")[0]
+    #expect(!headerBlock.components(separatedBy: "\r\n").contains { $0.hasPrefix("To:") })
+}
+
 @Test func buildSetsInReplyToAndReferencesOnlyWhenPresent() throws {
     let plain = OutboxMessage(from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "hi")
     let built = try MimeBuilder.build(plain, messageID: fixedMessageID, date: fixedDate)
@@ -229,4 +245,120 @@ private func decodedBody(_ data: Data, afterContentTypePrefix prefix: String) th
     let message = OutboxMessage(from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "small")
     let built = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
     #expect(built.count < MimeBuilder.maxEncodedBytes)
+}
+
+@Test func maxEncodedBytesBoundsBuiltDocumentNotWirePayload() throws {
+    // `maxEncodedBytes` bounds `build()`'s OWN output size — the RFC 5322
+    // document itself — NOT the HTTP request body `GmailKit`'s
+    // `SendEndpoints.sendRawMessage` eventually sends, which base64url-
+    // encodes this entire document again for the JSON `raw` field. This
+    // test codifies that distinction (see the doc comment on
+    // `maxEncodedBytes`) so a future change that silently conflates the two
+    // doesn't go unnoticed: the wire-equivalent size of a document sized
+    // right at the cap is reliably LARGER than the cap itself.
+    let mimeSizedAtCap = MimeBuilder.maxEncodedBytes
+    let base64WireEquivalentSize = ((mimeSizedAtCap + 2) / 3) * 4
+    #expect(base64WireEquivalentSize > MimeBuilder.maxEncodedBytes)
+}
+
+// MARK: - Header-value sanitization (CR/LF injection, spec §7.1's raw MIME)
+
+// A raw CR/LF embedded in any value that lands on a header line would let a
+// caller — or, once Task 5 wires reply Subjects from an external thread's
+// incoming mail, an attacker-controlled Subject — inject an entirely new
+// header line (e.g. a stealth `Bcc:`) into the outgoing send. Every field
+// below must throw `OutboxError.invalidHeaderValue` rather than write the
+// CR/LF through verbatim.
+
+@Test func buildThrowsOnCRLFInjectionInSubject() throws {
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"],
+        subject: "hi\r\nBcc: attacker@evil.com", bodyText: "hi")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "subject")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInFrom() throws {
+    let message = OutboxMessage(
+        from: "me@example.com\r\nBcc: attacker@evil.com", to: ["a@example.com"],
+        subject: "hi", bodyText: "hi")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "from")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInTo() throws {
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com\r\nBcc: attacker@evil.com"],
+        subject: "hi", bodyText: "hi")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "to")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInCc() throws {
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], cc: ["b@example.com\nBcc: attacker@evil.com"],
+        subject: "hi", bodyText: "hi")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "cc")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInBcc() throws {
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], bcc: ["b@example.com\r\nX-Injected: yes"],
+        subject: "hi", bodyText: "hi")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "bcc")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInThreadingHeaders() throws {
+    let badInReplyTo = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "hi",
+        inReplyTo: "<orig@x>\r\nBcc: attacker@evil.com")
+    #expect(throws: OutboxError.invalidHeaderValue(field: "inReplyTo")) {
+        _ = try MimeBuilder.build(badInReplyTo, messageID: fixedMessageID, date: fixedDate)
+    }
+
+    let badReferences = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "hi",
+        references: ["<orig@x>\r\nBcc: attacker@evil.com"])
+    #expect(throws: OutboxError.invalidHeaderValue(field: "references")) {
+        _ = try MimeBuilder.build(badReferences, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInAttachmentFilename() throws {
+    let attachment = Attachment(
+        filename: "notes.txt\r\nBcc: attacker@evil.com", mimeType: "text/plain", data: Data("x".utf8))
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "hi", attachments: [attachment])
+    #expect(throws: OutboxError.invalidHeaderValue(field: "attachment.filename")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildThrowsOnCRLFInjectionInAttachmentMimeType() throws {
+    let attachment = Attachment(
+        filename: "notes.txt", mimeType: "text/plain\r\nBcc: attacker@evil.com", data: Data("x".utf8))
+    let message = OutboxMessage(
+        from: "me@example.com", to: ["a@example.com"], subject: "hi", bodyText: "hi", attachments: [attachment])
+    #expect(throws: OutboxError.invalidHeaderValue(field: "attachment.mimeType")) {
+        _ = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    }
+}
+
+@Test func buildAllowsOrdinaryAddressesAndSubjectWithColonsAndPunctuation() throws {
+    // A sanity check that the sanitizer is CR/LF-specific and doesn't
+    // over-reject ordinary header-safe values (colons, commas within a
+    // quoted display name, etc.).
+    let message = OutboxMessage(
+        from: "\"Doe, Jane\" <jane@example.com>", to: ["a@example.com"],
+        subject: "Re: budget: Q3 numbers, final", bodyText: "hi")
+    let built = try MimeBuilder.build(message, messageID: fixedMessageID, date: fixedDate)
+    let headers = try parseHeaders(built)
+    #expect(headers["Subject"] == "Re: budget: Q3 numbers, final")
 }

@@ -8,6 +8,16 @@ import Foundation
 public enum OutboxError: Error, Equatable {
     /// The fully built MIME payload exceeded `MimeBuilder.maxEncodedBytes`.
     case tooLarge(encodedBytes: Int)
+    /// A value destined for a single header line (Subject/From/To/Cc/Bcc/
+    /// In-Reply-To/References/attachment filename/mimeType) contained a raw
+    /// CR or LF. Thrown at build time — the same "catch it at compose/
+    /// enqueue time, not later" posture as `tooLarge` — because an embedded
+    /// newline there is not inert text: this builder writes header lines
+    /// without any folding support, so a CR/LF inside a value does not
+    /// become a continuation of the SAME header, it starts an entirely NEW
+    /// header line the caller never asked for (e.g. a stealth `Bcc:`).
+    /// `field` names which value failed, for a caller-facing error message.
+    case invalidHeaderValue(field: String)
 }
 
 /// Builds RFC 5322 messages from an `OutboxMessage` (spec §7.1):
@@ -27,8 +37,24 @@ public enum OutboxError: Error, Equatable {
 public enum MimeBuilder {
     /// The 35 MB MIME cap from spec §7.1 (~25 MB effective attachments
     /// after base64 inflation). Measured against the FULLY built message
-    /// (headers + structure + base64 bodies), matching what actually rides
-    /// over the wire in `sendRawMessage`'s JSON `raw` field.
+    /// `build()` returns — headers + MIME structure + the already-base64
+    /// bodies/attachments — which is what Gmail's documented message-size
+    /// limit is actually about (the email itself, not any one particular
+    /// wire encoding of it).
+    ///
+    /// This is deliberately NOT the same byte count as the HTTP request
+    /// body `GmailKit`'s `SendEndpoints.sendRawMessage` ends up sending:
+    /// that call base64url-encodes THIS WHOLE DOCUMENT AGAIN to populate
+    /// the JSON `raw` field, so the actual wire payload runs roughly 4/3
+    /// the size checked here (a message built at, say, 34 MB produces a
+    /// ~45 MB request body). That inflation is an artifact of the JSON
+    /// transport Gmail's API happens to use for `messages.send`, not
+    /// additional message content, so bounding the wire-transport size
+    /// HERE instead would shrink the effective attachment allowance well
+    /// below the ~25 MB spec §7.1 promises — see
+    /// `maxEncodedBytesBoundsBuiltDocumentNotWirePayload` in
+    /// `MimeBuilderTests.swift` for the codified version of this
+    /// distinction.
     public static let maxEncodedBytes = 35 * 1024 * 1024
 
     public static func build(_ message: OutboxMessage, messageID: String, date: Date) throws -> Data {
@@ -40,12 +66,12 @@ public enum MimeBuilder {
         if message.attachments.isEmpty {
             contentBlock = bodyPart
         } else {
-            let attachmentParts = message.attachments.map(attachmentPart)
+            let attachmentParts = try message.attachments.map(attachmentPart)
             contentBlock = renderMultipart(
                 type: "multipart/mixed", boundary: mixedBoundary, parts: [bodyPart] + attachmentParts)
         }
 
-        var mime = topHeaders(message, messageID: messageID, date: date)
+        var mime = try topHeaders(message, messageID: messageID, date: date)
         mime.append(contentBlock)
 
         guard mime.count <= maxEncodedBytes else {
@@ -61,28 +87,65 @@ public enum MimeBuilder {
     /// then `MIME-Version` as the last line before the content block's own
     /// `Content-Type` header picks up. Address/threading headers that are
     /// empty on the input are omitted entirely, not written blank — an
-    /// empty `Cc:` header is a needless artifact some mail parsers treat
-    /// oddly, and a bare `In-Reply-To:`/`References:` with nothing after it
-    /// would actively lie about this being a reply.
-    private static func topHeaders(_ message: OutboxMessage, messageID: String, date: Date) -> Data {
+    /// empty `Cc:`/`To:` header is a needless artifact some mail parsers
+    /// treat oddly (RFC 5322 permits a message to originate via `Bcc:`
+    /// alone), and a bare `In-Reply-To:`/`References:` with nothing after
+    /// it would actively lie about this being a reply.
+    ///
+    /// Every value here is passed through `requireHeaderSafe` first: these
+    /// are all attacker-reachable in the general case (Task 5 wires reply
+    /// Subjects from an external thread's incoming mail; From/To/Cc/Bcc
+    /// come straight from the compose caller), so a raw CR/LF anywhere in
+    /// them must fail the build rather than silently inject an extra
+    /// header line into the raw MIME.
+    private static func topHeaders(_ message: OutboxMessage, messageID: String, date: Date) throws -> Data {
         var lines: [String] = []
         lines.append("Message-ID: \(messageID)")
         lines.append("Date: \(rfc2822(date))")
-        lines.append("From: \(message.from)")
-        lines.append("To: \(message.to.joined(separator: ", "))")
-        if !message.cc.isEmpty { lines.append("Cc: \(message.cc.joined(separator: ", "))") }
+        lines.append("From: \(try requireHeaderSafe(message.from, field: "from"))")
+        if !message.to.isEmpty {
+            lines.append("To: \(try requireHeaderSafe(message.to.joined(separator: ", "), field: "to"))")
+        }
+        if !message.cc.isEmpty {
+            lines.append("Cc: \(try requireHeaderSafe(message.cc.joined(separator: ", "), field: "cc"))")
+        }
         // Gmail's raw-send endpoint reads Bcc out of the raw MIME and
         // strips it before delivering to other recipients — omitting this
         // header would mean bcc'd recipients silently never receive the
         // mail at all, not just that they're visible to others.
-        if !message.bcc.isEmpty { lines.append("Bcc: \(message.bcc.joined(separator: ", "))") }
-        lines.append("Subject: \(message.subject)")
-        if let inReplyTo = message.inReplyTo { lines.append("In-Reply-To: \(inReplyTo)") }
+        if !message.bcc.isEmpty {
+            lines.append("Bcc: \(try requireHeaderSafe(message.bcc.joined(separator: ", "), field: "bcc"))")
+        }
+        lines.append("Subject: \(try requireHeaderSafe(message.subject, field: "subject"))")
+        if let inReplyTo = message.inReplyTo {
+            lines.append("In-Reply-To: \(try requireHeaderSafe(inReplyTo, field: "inReplyTo"))")
+        }
         if !message.references.isEmpty {
-            lines.append("References: \(message.references.joined(separator: " "))")
+            let references = try requireHeaderSafe(
+                message.references.joined(separator: " "), field: "references")
+            lines.append("References: \(references)")
         }
         lines.append("MIME-Version: 1.0")
         return Data((lines.joined(separator: "\r\n") + "\r\n").utf8)
+    }
+
+    /// Rejects (rather than silently stripping) any header-destined value
+    /// containing a raw CR or LF — see `OutboxError.invalidHeaderValue` for
+    /// why this must throw instead of quietly sanitizing.
+    ///
+    /// Checks `unicodeScalars`, NOT `Character`-level `contains`: Swift's
+    /// `String` treats a CR immediately followed by LF as a SINGLE extended
+    /// grapheme cluster, so `"hi\r\nBcc: x".contains("\r")` — and
+    /// `.contains("\n")` — both evaluate to `false` (neither a bare `"\r"`
+    /// nor a bare `"\n"` Character occurs in that string; only the combined
+    /// `"\r\n"` Character does). Scanning Unicode scalars sidesteps
+    /// grapheme clustering entirely and reliably catches CR and LF whether
+    /// they appear alone or paired.
+    private static func requireHeaderSafe(_ value: String, field: String) throws -> String {
+        guard !value.unicodeScalars.contains(where: { $0 == "\r" || $0 == "\n" }) else {
+            throw OutboxError.invalidHeaderValue(field: field)
+        }
+        return value
     }
 
     /// RFC 5322 §3.3 date-time, formatted in a FIXED locale/timezone
@@ -114,10 +177,14 @@ public enum MimeBuilder {
         return renderMultipart(type: "multipart/alternative", boundary: altBoundary, parts: [plainPart, htmlPart])
     }
 
-    private static func attachmentPart(_ attachment: Attachment) -> Data {
-        leafPart(
-            contentType: "\(attachment.mimeType); name=\"\(attachment.filename)\"",
-            extraHeaders: ["Content-Disposition: attachment; filename=\"\(attachment.filename)\""],
+    private static func attachmentPart(_ attachment: Attachment) throws -> Data {
+        // filename/mimeType land in a header line just like the top-level
+        // address headers do — same CR/LF injection risk, same fix.
+        let mimeType = try requireHeaderSafe(attachment.mimeType, field: "attachment.mimeType")
+        let filename = try requireHeaderSafe(attachment.filename, field: "attachment.filename")
+        return leafPart(
+            contentType: "\(mimeType); name=\"\(filename)\"",
+            extraHeaders: ["Content-Disposition: attachment; filename=\"\(filename)\""],
             rawBytes: attachment.data)
     }
 
