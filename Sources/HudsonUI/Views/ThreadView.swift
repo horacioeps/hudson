@@ -88,28 +88,37 @@ enum SenderInfo {
 /// (that lives on `InboxModel`) and no compose methods (that lives on
 /// `AppModel.composer`, Task 4's `replyToOpenThread()`), so this view stays
 /// agnostic of exactly how any of the three are performed. Snooze and "⋯
-/// more" are still placeholders (M6), and the AI-summary chip is still a
-/// NON-FUNCTIONAL placeholder (M7): tapping either only shows a `Toast`
-/// naming the milestone it arrives in — zero network egress, per this
-/// milestone's privacy constraint.
+/// more" are still placeholders (M6).
+///
+/// The AI-summary chip is LIVE (Task 5): tapping it runs `onSummarize`, which
+/// funnels to `SummaryModel.summarize` — the ONE explicit user action that
+/// mints the `.summarize` `Invocation`. The chip renders the streamed summary
+/// (or the "turn AI on" banner when the feature isn't opted in) from the bound
+/// `summary` model. It NEVER runs on its own — no summarize-on-open or
+/// -on-scroll — per this milestone's Privacy #1 constraint.
 public struct ThreadView: View {
     private let thread: ThreadModel
+    private let summary: SummaryModel
     private let onArchive: () -> Void
     private let onToggleStar: () -> Void
     private let onReply: () -> Void
+    private let onSummarize: () -> Void
 
     /// Toast text currently shown above the reply bar, or `nil` when none is
     /// visible. Cleared automatically a couple seconds after `showToast`.
     @State private var toastText: String?
 
     public init(
-        thread: ThreadModel, onArchive: @escaping () -> Void, onToggleStar: @escaping () -> Void,
-        onReply: @escaping () -> Void
+        thread: ThreadModel, summary: SummaryModel, onArchive: @escaping () -> Void,
+        onToggleStar: @escaping () -> Void, onReply: @escaping () -> Void,
+        onSummarize: @escaping () -> Void
     ) {
         self.thread = thread
+        self.summary = summary
         self.onArchive = onArchive
         self.onToggleStar = onToggleStar
         self.onReply = onReply
+        self.onSummarize = onSummarize
     }
 
     public var body: some View {
@@ -213,19 +222,57 @@ public struct ThreadView: View {
             )
     }
 
-    // MARK: - AI summary placeholder
+    // MARK: - AI summary (live — explicit tap only, opt-in gated)
 
+    /// The amber chip plus, below it, whatever the bound `SummaryModel`
+    /// currently holds: the streamed summary, the "turn AI on" setup banner
+    /// (not opted in), or a failure banner. All three sit in the same
+    /// `aiBg`/`aiInk` treatment as the chip, and NONE of it appears until the
+    /// user taps — no summarize-on-open, per Privacy #1.
     private var summaryChip: some View {
-        Button(action: { showToast("AI summaries arrive with M7") }) {
-            Text("✦ Summarize thread")
-                .font(Typography.ui(12, .medium))
-                .foregroundStyle(Palette.aiInk)
+        VStack(alignment: .leading, spacing: Metrics.unit * 3) {
+            Button(action: onSummarize) {
+                HStack(spacing: Metrics.unit) {
+                    Text(summary.isStreaming ? "✦ Summarizing…" : "✦ Summarize thread")
+                        .font(Typography.ui(12, .medium))
+                        .foregroundStyle(Palette.aiInk)
+                }
                 .padding(.vertical, Metrics.unit * 2)
                 .padding(.horizontal, Metrics.unit * 3)
                 .background(Palette.aiBg)
                 .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
+            }
+            .buttonStyle(.plain)
+            .disabled(summary.isStreaming)
+
+            if summary.needsSetup {
+                summaryNote(SummaryModel.setupBannerText)
+            } else if let banner = summary.banner {
+                summaryNote(banner)
+            } else if !summary.text.isEmpty {
+                Text(summary.text)
+                    .font(Typography.serif(14))
+                    .foregroundStyle(Palette.aiInk)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: 680, alignment: .leading)
+                    .padding(Metrics.unit * 3)
+                    .background(Palette.aiBg)
+                    .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
+            }
         }
-        .buttonStyle(.plain)
+    }
+
+    /// A compact note under the chip — the setup incantation or a failure
+    /// message — in the same AI treatment, slightly dimmed.
+    private func summaryNote(_ message: String) -> some View {
+        Text(message)
+            .font(Typography.ui(12))
+            .foregroundStyle(Palette.aiInk)
+            .textSelection(.enabled)
+            .frame(maxWidth: 680, alignment: .leading)
+            .padding(Metrics.unit * 3)
+            .background(Palette.aiBg)
+            .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
     }
 
     // MARK: - Messages (newest expanded, older collapsed)
@@ -388,6 +435,9 @@ public struct ThreadView: View {
     // thread instead (see `RenderSmokeTests.threadViewRendersWithSeededThread`).
     let db = try! HudsonDatabase.inMemory()
     let model = ThreadModel(database: db, account: "you@hudson.app")
-    return ThreadView(thread: model, onArchive: {}, onToggleStar: {}, onReply: {})
+    let summary = SummaryModel(database: db, account: "you@hudson.app")
+    return ThreadView(
+        thread: model, summary: summary, onArchive: {}, onToggleStar: {}, onReply: {},
+        onSummarize: {})
         .frame(width: 760, height: 700)
 }

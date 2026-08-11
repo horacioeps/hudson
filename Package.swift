@@ -41,12 +41,12 @@ let package = Package(
         .testTarget(name: "SyncEngineTests", dependencies: ["SyncEngine"]),
         .target(
             name: "HudsonUI",
-            dependencies: ["GmailKit", "Store", "SyncEngine", "Outbox",
+            dependencies: ["GmailKit", "Store", "SyncEngine", "Outbox", "AIKit",
                            .product(name: "GRDB", package: "GRDB.swift")],
             resources: [.process("Resources")]
         ),
         .executableTarget(name: "HudsonApp", dependencies: ["HudsonUI"]),
-        .testTarget(name: "HudsonUITests", dependencies: ["HudsonUI", "Store"]),
+        .testTarget(name: "HudsonUITests", dependencies: ["HudsonUI", "Store", "AIKit"]),
         // MIME building + send state machine (spec §7). Depends on GmailKit
         // for the `SentMessage`/`SendTransport` shapes SendService sends
         // through, and Store for the `send_jobs` durable queue it persists to.

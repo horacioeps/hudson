@@ -159,9 +159,11 @@ public struct RootView: View {
                 if model.inbox.selectedThreadID != nil && !model.thread.messages.isEmpty {
                     ThreadView(
                         thread: model.thread,
+                        summary: model.summary,
                         onArchive: { Task { try? await model.inbox.archiveSelected() } },
                         onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } },
-                        onReply: { model.replyToOpenThread() })
+                        onReply: { model.replyToOpenThread() },
+                        onSummarize: { model.summarizeOpenThread() })
                 } else {
                     readingPaneEmptyState
                 }

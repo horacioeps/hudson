@@ -21,6 +21,12 @@ public final class AppModel {
     public let search: SearchModel
     public let composer: ComposerModel
 
+    /// The Summarize chip's view model for the OPEN thread. Reset on every
+    /// `openThread` so it never carries one thread's summary over to another,
+    /// and driven ONLY by `summarizeOpenThread()` — the explicit tap. Per
+    /// Privacy #1 it never runs on its own (no summarize-on-open).
+    public let summary: SummaryModel
+
     /// The sidebar's "LABELS" section — a one-shot read at launch (Store has
     /// no `observeLabels` twin the way inbox rows/split rules do, and this
     /// milestone ships no label-management UI that would need it to be
@@ -75,6 +81,7 @@ public final class AppModel {
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.composer = ComposerModel(database: database, account: account)
+        self.summary = SummaryModel(database: database, account: email)
         await inbox.start()
         await refreshLabels()
         subscribeToPendingCount()
@@ -98,6 +105,7 @@ public final class AppModel {
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
         self.composer = ComposerModel(database: database, account: account)
+        self.summary = SummaryModel(database: database, account: email)
         let inbox = self.inbox
         Task { await inbox.start() }
         Task { [weak self] in await self?.refreshLabels() }
@@ -212,7 +220,25 @@ public final class AppModel {
     /// first emission either (see its doc comment), so this doesn't need to.
     public func openThread(_ threadID: String) {
         inbox.selectedThreadID = threadID
+        // Drop the previous thread's summary so the chip resets to its
+        // untapped state — a summary is per-thread and must never bleed across
+        // a switch. This clears local state only; it never triggers a new
+        // summarize (that stays an explicit tap — Privacy #1, no auto-run).
+        summary.reset()
         Task { await thread.open(threadID: threadID) }
+    }
+
+    /// Runs the Summarize chip for whichever thread is open
+    /// (`inbox.selectedThreadID`, the same id the reading pane shows) —
+    /// `ThreadView`'s chip funnels through here. This is the explicit user
+    /// action the `.summarize` `Invocation` stands for; it egresses ONLY if
+    /// the feature is opted in (the gate lives under `SummaryModel` →
+    /// `AIBootstrap`/`EgressGuard`). A no-op, defensively, when nothing is
+    /// selected. Synchronous like the other chrome actions: `summarize` is
+    /// async, so it runs in its own `Task`.
+    public func summarizeOpenThread() {
+        guard let threadID = inbox.selectedThreadID else { return }
+        Task { [weak self] in await self?.summary.summarize(threadID: threadID) }
     }
 
     // MARK: - Compose / reply (see `ComposerModel`; ⌘N and the reply bar both funnel here)

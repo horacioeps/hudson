@@ -4,7 +4,24 @@ import Outbox
 import Store
 import SwiftUI
 import Testing
+@testable import AIKit
 @testable import HudsonUI
+
+/// A minimal scripted `LLMProvider` for the streamed-summary render smoke
+/// test — file-scoped here (a different file than `SummaryModelTests`' own
+/// private copy, so the shared name is no conflict), replaying a fixed script
+/// with no network so `SummaryModel.summarize` populates `text`.
+private final class RenderSmokeScriptedProvider: LLMProvider, @unchecked Sendable {
+    private let script: [LLMEvent]
+    init(script: [LLMEvent]) { self.script = script }
+    func stream(_ request: LLMRequest) -> AsyncThrowingStream<LLMEvent, Error> {
+        let script = self.script
+        return AsyncThrowingStream { continuation in
+            for event in script { continuation.yield(event) }
+            continuation.finish()
+        }
+    }
+}
 
 /// Hosting-view render smoke tests for `SidebarView`/`InboxListView`: build
 /// each with a seeded in-memory `AppModel`/`InboxModel`, wrap it in an
@@ -87,11 +104,47 @@ private func assertRendered(_ size: NSSize) {
     await thread.open(threadID: "t01")
     try await Task.sleep(for: .milliseconds(50))
 
-    let view = ThreadView(thread: thread, onArchive: {}, onToggleStar: {}, onReply: {})
+    let summary = SummaryModel(database: db, account: AppModel.demoAccount)
+    let view = ThreadView(
+        thread: thread, summary: summary, onArchive: {}, onToggleStar: {}, onReply: {},
+        onSummarize: {})
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 760, height: 700)
     host.layout()
     assertRendered(host.fittingSize)
+}
+
+/// `ThreadView` with the Summarize chip in its STREAMED state — drives a real
+/// `SummaryModel.summarize` over a scripted-provider-backed `Summarize` (opt-in
+/// row set, no network) so `summary.text` is populated, then hosts the view to
+/// exercise the new streamed-summary rendering branch alongside the chip.
+@MainActor
+@Test func threadViewRendersStreamedSummary() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db)
+    let thread = ThreadModel(database: db, account: AppModel.demoAccount)
+    await thread.open(threadID: "t01")
+    try await Task.sleep(for: .milliseconds(50))
+
+    try await db.setAIConfig(
+        feature: "summarize", model: "claude-haiku-4-5", baseURL: "anthropic", optIn: true,
+        account: AppModel.demoAccount)
+    let provider = RenderSmokeScriptedProvider(
+        script: [.textDelta("A short thread summary."), .stopped])
+    let egressGuard = EgressGuard(provider: provider, database: db, account: AppModel.demoAccount)
+    let summarizer = Summarize(guard: egressGuard, database: db, account: AppModel.demoAccount)
+    let summary = SummaryModel(
+        database: db, account: AppModel.demoAccount, makeSummarize: { summarizer })
+    await summary.summarize(threadID: "t01")
+
+    let view = ThreadView(
+        thread: thread, summary: summary, onArchive: {}, onToggleStar: {}, onReply: {},
+        onSummarize: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 760, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+    #expect(summary.text == "A short thread summary.")  // fixture sanity — the branch is real
 }
 
 /// `CommandPaletteView` hosted against a `CommandModel` reloaded with a
