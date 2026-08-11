@@ -55,6 +55,17 @@ public final class SummaryModel {
         "Enable AI first: hudson ai config --feature summarize --provider anthropic "
         + "--model claude-haiku-4-5 --opt-in"
 
+    /// A monotonically-increasing generation token. Every `summarize` run
+    /// captures the value at its start; `reset()` (thread switch) and each new
+    /// `summarize` bump it, superseding any in-flight run. A stream that was
+    /// started for one thread compares its captured token against this before
+    /// EVERY mutation of `text`/`isStreaming`/`needsSetup`/`banner`, so a run
+    /// for a thread the user has switched away from silently stops writing —
+    /// a summary is per-thread and must NEVER bleed across a switch. The run's
+    /// `Task` isn't retained/cancelled; it simply becomes a no-op that drains
+    /// its own stream in the background and mutates nothing.
+    private var runToken = 0
+
     /// `makeSummarize` is optional-with-nil rather than a defaulted closure
     /// because a default argument can't capture the sibling `database`/
     /// `account` params — so the real `AIBootstrap` default is assembled in
@@ -80,6 +91,14 @@ public final class SummaryModel {
     public func summarize(threadID: String) async {
         guard !isStreaming else { return }
 
+        // Open a new generation and capture it — every mutation below is
+        // guarded by `token == runToken`, so a `reset()` (thread switch) or a
+        // later `summarize` that bumps `runToken` turns THIS run into a silent
+        // no-op that can no longer write another thread's summary into `text`
+        // or strand `isStreaming`.
+        runToken += 1
+        let token = runToken
+
         // Fresh run: clear any prior thread's summary/state so the chip never
         // shows a stale summary or a banner from a previous tap.
         text = ""
@@ -88,13 +107,18 @@ public final class SummaryModel {
 
         guard let summarize = await makeSummarize() else {
             // Fail closed — the feature isn't opted in, so there is nothing to
-            // build and nothing egresses.
+            // build and nothing egresses. Skip if superseded during the build.
+            guard token == runToken else { return }
             needsSetup = true
             return
         }
+        // Superseded while the factory was building (thread switch) — drop it.
+        guard token == runToken else { return }
 
         isStreaming = true
-        defer { isStreaming = false }
+        // Only the CURRENT generation may clear `isStreaming` — a superseded
+        // run must not touch the flag a newer run now owns.
+        defer { if token == runToken { isStreaming = false } }
         do {
             // The chip tap IS the explicit invocation — the ONLY `Invocation`
             // minted anywhere in the UI. `EgressGuard` still re-checks the
@@ -102,17 +126,23 @@ public final class SummaryModel {
             let stream = try await summarize.summarize(
                 threadID: threadID, invocation: .userInvoked(.summarize))
             for try await delta in stream {
+                // Stop the instant we've been superseded: the deltas belong to
+                // a thread the user has switched away from and must not land in
+                // the now-reset model.
+                guard token == runToken else { return }
                 text += delta
             }
         } catch AIError.notOptedIn(_) {
             // Opt-in was revoked between the factory build and now — the guard
             // threw before the provider was called, so nothing left the
             // machine. Present it as needs-setup, same as a nil factory.
+            guard token == runToken else { return }
             needsSetup = true
             text = ""
         } catch {
             // An empty/unknown thread, or a provider/transport error — surface
             // it without pretending a summary exists.
+            guard token == runToken else { return }
             banner = "Couldn't summarize this thread."
             text = ""
         }
@@ -123,8 +153,19 @@ public final class SummaryModel {
     /// untapped "Summarize thread" state rather than carrying the previous
     /// thread's summary over.
     public func reset() {
+        // Bump the generation so any in-flight `summarize` is superseded: its
+        // captured token no longer matches `runToken`, so it stops appending
+        // deltas and stops owning `isStreaming`. Without this, a summarize
+        // begun for the previous thread would keep streaming that thread's text
+        // into the now-cleared model and leave the new thread's chip stuck
+        // "Summarizing…" — the cross-thread bleed this reset exists to prevent.
+        runToken += 1
         text = ""
         needsSetup = false
         banner = nil
+        // The prior run (if any) no longer owns the flag; clear it so the new
+        // thread's chip is immediately tappable rather than waiting for that
+        // superseded run's network stream to drain.
+        isStreaming = false
     }
 }

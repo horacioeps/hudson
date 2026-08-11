@@ -36,6 +36,44 @@ private final class ScriptedProvider: LLMProvider, @unchecked Sendable {
     }
 }
 
+/// A test-double `LLMProvider` whose stream is driven by the test, one event
+/// at a time, so a `summarize` run can be paused mid-stream while the test
+/// switches threads (`reset()`). It captures the stream's continuation on the
+/// first `stream` call; `emit`/`finish` push events through it on demand. Used
+/// only by the cross-thread-bleed tests, where deterministic control over WHEN
+/// each delta arrives is the whole point.
+private final class GatedProvider: LLMProvider, @unchecked Sendable {
+    private let cont = Mutex<AsyncThrowingStream<LLMEvent, Error>.Continuation?>(nil)
+
+    func stream(_ request: LLMRequest) -> AsyncThrowingStream<LLMEvent, Error> {
+        AsyncThrowingStream { continuation in
+            cont.withLock { $0 = continuation }
+        }
+    }
+
+    /// True once `stream` has been called and the continuation is captured.
+    var isStreaming: Bool { cont.withLock { $0 != nil } }
+
+    func emit(_ event: LLMEvent) { cont.withLock { _ = $0?.yield(event) } }
+    func finish() { cont.withLock { $0?.finish() } }
+}
+
+/// Spins the cooperative scheduler until `predicate` holds or the (generous)
+/// bound is hit — the async hops between provider → `EgressGuard` → `Summarize`
+/// → `SummaryModel` mean an emitted delta lands a few `Task.yield`s later, and
+/// this waits for that propagation without a wall-clock sleep.
+@MainActor
+private func until(
+    _ predicate: () -> Bool, _ message: @autoclosure () -> String,
+    file: StaticString = #filePath, line: UInt = #line
+) async {
+    for _ in 0..<10_000 {
+        if predicate() { return }
+        await Task.yield()
+    }
+    Issue.record("timed out waiting: \(message())")
+}
+
 /// Seeds one message into `threadID` so `Summarize` has a thread to read
 /// (it throws `emptyThread` otherwise) — mirrors `SummarizeTests.snap`'s
 /// shape, kept local per this codebase's per-file-fixture convention.
@@ -164,4 +202,102 @@ private let account = "you@hudson.app"
         database: db, account: account, keyStore: InMemoryLLMKeyStore())
 
     #expect(summarize != nil)
+}
+
+// MARK: - Cross-thread bleed: a switch mid-stream must supersede the old run
+
+/// The invariant `openThread`'s `reset()` exists to protect: a summarize begun
+/// for one thread must NOT keep writing into the model after the user switches
+/// away. Streams thread `t1`'s first delta, then simulates the thread switch by
+/// calling `reset()` while the stream is still open, then delivers the REST of
+/// `t1`'s deltas. Post-reset deltas must land NOWHERE (`text` stays empty) and
+/// `isStreaming` must be false so the new thread's chip is immediately usable —
+/// not stranded "Summarizing…" until the old network stream drains.
+@MainActor
+@Test func switchMidStreamDropsOldThreadDeltas() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await seedThread(db, threadID: "t1", account: account)
+    try await db.setAIConfig(
+        feature: "summarize", model: "claude-haiku-4-5", baseURL: "anthropic", optIn: true,
+        account: account)
+    let provider = GatedProvider()
+    let egressGuard = EgressGuard(provider: provider, database: db, account: account)
+    let summarize = Summarize(guard: egressGuard, database: db, account: account)
+    let model = SummaryModel(database: db, account: account, makeSummarize: { summarize })
+
+    // Kick off the (paused) summarize for t1 and let its first delta land.
+    let run = Task { await model.summarize(threadID: "t1") }
+    await until({ provider.isStreaming }, "provider stream never opened")
+    provider.emit(.textDelta("OLD-A"))
+    await until({ model.text == "OLD-A" }, "first delta never streamed into text")
+    #expect(model.isStreaming == true)
+
+    // The user switches threads: reset() supersedes the in-flight run.
+    model.reset()
+    #expect(model.text.isEmpty)
+    #expect(model.isStreaming == false)  // new thread's chip must be tappable now
+
+    // The OLD run's remaining deltas arrive AFTER the switch — they must be
+    // dropped, never appended into the now-reset model.
+    provider.emit(.textDelta("OLD-B"))
+    provider.emit(.stopped)
+    provider.finish()
+    await run.value
+
+    #expect(model.text.isEmpty)  // no cross-thread bleed
+    #expect(model.isStreaming == false)
+    #expect(model.needsSetup == false)
+    #expect(model.banner == nil)
+}
+
+/// After a mid-stream switch, a fresh summarize for the NEW thread runs
+/// cleanly — its token owns `isStreaming`, and the superseded old run finishing
+/// afterward neither reopens the flag nor overwrites the new summary. Guards
+/// the supersede-then-restart path `openThread` + an explicit tap produce.
+@MainActor
+@Test func newSummarizeAfterSwitchIsUnaffectedByOldRun() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await seedThread(db, threadID: "t1", account: account)
+    try await seedThread(db, threadID: "t2", account: account)
+    try await db.setAIConfig(
+        feature: "summarize", model: "claude-haiku-4-5", baseURL: "anthropic", optIn: true,
+        account: account)
+
+    let oldProvider = GatedProvider()
+    let newProvider = ScriptedProvider(script: [.textDelta("NEW summary"), .stopped])
+    // The factory hands out the paused provider first, the scripted one after —
+    // one Summarize per tap, mirroring how `makeSummarize` is rebuilt per run.
+    let calls = Mutex<Int>(0)
+    let makeSummarize: () async -> Summarize? = {
+        let n = calls.withLock { c -> Int in defer { c += 1 }; return c }
+        let p: any LLMProvider = n == 0 ? oldProvider : newProvider
+        return Summarize(
+            guard: EgressGuard(provider: p, database: db, account: account),
+            database: db, account: account)
+    }
+    let model = SummaryModel(database: db, account: account, makeSummarize: makeSummarize)
+
+    // Start t1, land its first delta, then switch away (reset).
+    let oldRun = Task { await model.summarize(threadID: "t1") }
+    await until({ oldProvider.isStreaming }, "old provider never opened")
+    oldProvider.emit(.textDelta("OLD"))
+    await until({ model.text == "OLD" }, "old delta never landed")
+    model.reset()
+
+    // Summarize the NEW thread — a fully independent run.
+    await model.summarize(threadID: "t2")
+    #expect(model.text == "NEW summary")
+    #expect(model.isStreaming == false)
+
+    // The old run drains AFTER the new summary is in place — it must not
+    // reopen `isStreaming` or clobber the new thread's text.
+    oldProvider.emit(.textDelta("-STALE"))
+    oldProvider.emit(.stopped)
+    oldProvider.finish()
+    await oldRun.value
+
+    #expect(model.text == "NEW summary")
+    #expect(model.isStreaming == false)
+    #expect(model.banner == nil)
+    #expect(model.needsSetup == false)
 }
