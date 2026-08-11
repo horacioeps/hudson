@@ -75,6 +75,14 @@ import Testing
         KeyRouter.route(KeyDescriptor(characters: "f", command: true), context: .list) == .toggleSearch)
 }
 
+/// ⌘N opens the compose sheet — Task 4's wiring. Scoped to the list context
+/// only, same as ⌘K/⌘F above (see `routeInList`'s doc comment on why the
+/// palette/search overlays don't re-route their own ⌘-combos).
+@Test func listCommandNOpensComposer() {
+    #expect(
+        KeyRouter.route(KeyDescriptor(characters: "n", command: true), context: .list) == .composeNew)
+}
+
 /// Shortcuts are case-insensitive — `charactersIgnoringModifiers` still
 /// applies Shift, so a Shift-held "J" must route the same as plain "j".
 @Test func listShortcutsAreCaseInsensitive() {

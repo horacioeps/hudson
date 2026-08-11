@@ -162,6 +162,75 @@ import Testing
     #expect(!model.isPaletteVisible)
 }
 
+// MARK: - Compose / reply (Task 4: ⌘N and the reply bar both funnel through here)
+
+/// `composeNew()` resets the shared `composer` to a blank draft and shows
+/// the sheet — the ⌘N path.
+@MainActor
+@Test func composeNewStartsBlankDraftAndShowsComposer() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+    model.composer.to = "leftover@example.com"  // simulate a stale draft left over from earlier
+
+    model.composeNew()
+
+    #expect(model.isComposerVisible)
+    #expect(model.composer.to.isEmpty)  // startNew() cleared it
+    #expect(model.composer.mode == .new)
+}
+
+/// `replyToOpenThread()` prefills the composer from the SELECTED thread
+/// (`inbox.selectedThreadID` — the same id `openThread(_:)` sets) and only
+/// shows the sheet once that prefill has actually landed.
+@MainActor
+@Test func replyToOpenThreadPrefillsFromSelectedThreadAndShowsComposer() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let model = AppModel(database: db, account: try await db.primaryAccount())
+    try await Task.sleep(for: .milliseconds(50))
+    model.openThread("t01")
+    try await Task.sleep(for: .milliseconds(50))
+
+    model.replyToOpenThread()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.isComposerVisible)
+    guard case .reply(let threadID) = model.composer.mode else {
+        Issue.record("expected reply mode after replyToOpenThread")
+        return
+    }
+    #expect(threadID == "t01")
+    #expect(model.composer.subject == "Re: Dinner Friday?")
+}
+
+/// Nothing selected — a defensive no-op, never shows an untethered sheet.
+@MainActor
+@Test func replyToOpenThreadWithNoSelectionDoesNothing() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+
+    model.replyToOpenThread()
+
+    #expect(!model.isComposerVisible)
+}
+
+/// `AppModel` wires `composer.onClose` (fired by `ComposerModel.send()`
+/// synchronously right after a SUCCESSFUL enqueue, see its doc comment) to
+/// dismiss the sheet — the fix for `ComposerView`'s own "open question for
+/// Task 4" doc comment (the undo toast then has to live at `RootView`
+/// level to survive this dismissal — see `RootView.sentUndoToast`).
+@MainActor
+@Test func composerOnCloseDismissesTheSheet() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+    model.composeNew()
+    #expect(model.isComposerVisible)
+
+    model.composer.onClose?()
+
+    #expect(!model.isComposerVisible)
+}
+
 // MARK: - Keyboard routing seam (`keyboardContext`/`apply(_:)` — see `KeyboardMapTests` for `KeyRouter` itself)
 
 @MainActor
@@ -195,6 +264,14 @@ import Testing
     let model = AppModel(database: db, account: nil)
     model.apply(.togglePalette)
     #expect(model.isPaletteVisible)
+}
+
+@MainActor
+@Test func applyComposeNewOpensComposer() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+    model.apply(.composeNew)
+    #expect(model.isComposerVisible)
 }
 
 @MainActor

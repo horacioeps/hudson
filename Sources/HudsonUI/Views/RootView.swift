@@ -98,6 +98,17 @@ public struct RootView: View {
                     model.isSearchVisible = false
                 }
             }
+
+            if model.isComposerVisible {
+                overlay {
+                    ComposerView(
+                        composer: model.composer, onClose: { model.isComposerVisible = false })
+                } onDismiss: {
+                    model.isComposerVisible = false
+                }
+            }
+
+            sentUndoToast(model)
         }
         // Invisible — installs the app-wide `NSEvent` monitor that drives
         // every keyboard shortcut (see `KeyboardMonitor`/`KeyRouter`).
@@ -117,6 +128,8 @@ public struct RootView: View {
                 unreadCount: model.totalUnread,
                 labels: model.labels,
                 pendingCount: model.pendingCount,
+                isSyncing: model.isSyncing,
+                syncBanner: model.syncBanner,
                 // Only "Inbox" is wired to a real Store-backed filter this
                 // milestone; pinning the highlight there avoids a misleading
                 // "selected but does nothing" affordance for the rest.
@@ -128,10 +141,11 @@ public struct RootView: View {
                     case .starred, .snoozed, .sent, .label:
                         // Non-functional this milestone (no Store query backs
                         // them yet) — a deliberate gap, like ThreadView's
-                        // AI-summary / reply-bar placeholders.
+                        // AI-summary placeholder.
                         break
                     }
-                })
+                },
+                onSyncNow: { Task { await model.syncNow() } })
                 .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)
 
             InboxListView(inbox: model.inbox, onOpen: { model.openThread($0) })
@@ -145,8 +159,11 @@ public struct RootView: View {
                 if model.inbox.selectedThreadID != nil && !model.thread.messages.isEmpty {
                     ThreadView(
                         thread: model.thread,
+                        summary: model.summary,
                         onArchive: { Task { try? await model.inbox.archiveSelected() } },
-                        onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } })
+                        onToggleStar: { Task { try? await model.inbox.toggleStarSelected() } },
+                        onReply: { model.replyToOpenThread() },
+                        onSummarize: { model.summarizeOpenThread() })
                 } else {
                     readingPaneEmptyState
                 }
@@ -171,6 +188,32 @@ public struct RootView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.bgSurface)
+    }
+
+    /// The "Sent · Undo" toast, rendered at THIS level rather than inside
+    /// `ComposerView` itself — resolves `ComposerView`'s own "open question
+    /// for Task 4" doc comment. `ComposerModel.send()` fires `onClose?()`
+    /// synchronously right after enqueueing, which `AppModel` wires to
+    /// `isComposerVisible = false` (`wireComposerDismissal`) — so the sheet
+    /// is already gone by the time this toast needs to show. Keying this
+    /// off `composer.justSentUndoJobID` directly (the same pure condition
+    /// `ComposerView.isUndoToastShown` uses) means the undo affordance
+    /// survives the sheet's dismissal instead of disappearing with it: the
+    /// job is still durably held in `send_jobs` for the rest of its undo
+    /// window regardless of whether any view is showing it, and this is
+    /// what keeps that real window visibly actionable.
+    @ViewBuilder
+    private func sentUndoToast(_ model: AppModel) -> some View {
+        if model.composer.justSentUndoJobID != nil {
+            VStack {
+                Spacer(minLength: 0)
+                Button(action: { Task { await model.composer.undo() } }) {
+                    Toast(text: "Sent · Undo")
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, Metrics.unit * 8)
+            }
+        }
     }
 
     /// A dimmed, click-to-dismiss backdrop behind a centered modal —
