@@ -1,3 +1,5 @@
+import Foundation
+import GmailKit
 import Store
 import Testing
 @testable import HudsonUI
@@ -384,4 +386,48 @@ import Testing
     #expect(model.keyboardContext == .list)
     model.isComposerVisible = true
     #expect(model.keyboardContext == .composer)
+}
+
+// MARK: - disconnectAccount() — "Disconnect account" (Task 5)
+
+/// The full disconnect: the Keychain half (`tokenStore.deleteAll`, verified
+/// behaviorally through an injected `InMemoryTokenStore` since production
+/// never touches the real Keychain in tests) AND the Store half
+/// (`database.deleteAccount`), plus the visible effect both exist for —
+/// `needsOnboarding` flipping `true` so `RootView`'s reverse gate can bring
+/// `OnboardingView` back. A second account's tokens are seeded too, to prove
+/// `deleteAll` runs against the RIGHT email only (mirrors
+/// `TokenStoreTests.deleteAllRemovesEverythingForOneAccountOnly`).
+@MainActor
+@Test func disconnectAccountClearsTokensRemovesTheAccountRowAndFlipsNeedsOnboarding() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "a@b.com", clientID: "cid", consentedAt: Date())
+    let account = try await db.account(email: "a@b.com")
+    let tokenStore = InMemoryTokenStore()
+    let tokens = TokenSet(accessToken: "at", refreshToken: "rt", expiresAt: .distantFuture)
+    try tokenStore.saveTokens(tokens, account: "a@b.com")
+    try tokenStore.saveTokens(tokens, account: "other@b.com")  // must survive
+    let model = AppModel(database: db, account: account, tokenStore: tokenStore)
+    #expect(!model.needsOnboarding)  // precondition: starts connected
+
+    await model.disconnectAccount()
+
+    #expect(model.account == nil)
+    #expect(model.needsOnboarding)
+    #expect(try tokenStore.tokens(account: "a@b.com") == nil)
+    #expect(try tokenStore.tokens(account: "other@b.com") != nil)  // untouched
+    #expect(try await db.account(email: "a@b.com") == nil)
+}
+
+/// No account connected at all — a defensive no-op, never touches the token
+/// store or crashes (mirrors `syncNow()`'s own "guard on account" posture).
+@MainActor
+@Test func disconnectAccountWithNoAccountIsANoOp() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let tokenStore = InMemoryTokenStore()
+    let model = AppModel(database: db, account: nil, tokenStore: tokenStore)
+
+    await model.disconnectAccount()
+
+    #expect(model.account == nil)
 }

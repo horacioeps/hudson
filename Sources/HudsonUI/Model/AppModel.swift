@@ -1,4 +1,5 @@
 import Foundation
+import GmailKit
 import Store
 
 /// The root of the app's object graph. Owns the open database, the active
@@ -14,6 +15,13 @@ import Store
 public final class AppModel {
     public let database: HudsonDatabase
     public private(set) var account: AccountRecord?
+
+    /// Where Gmail OAuth tokens + the BYO client secret live — injected so
+    /// `disconnectAccount()` (Task 5's "Disconnect account") is testable
+    /// without ever touching the real Keychain, mirroring how
+    /// `SettingsModel` injects `keyStore`. `KeychainTokenStore` in
+    /// production; an `InMemoryTokenStore` in tests.
+    private let tokenStore: any TokenStore
 
     /// Whether this instance is the `--demo`/`HUDSON_DEMO=1` synthetic
     /// mailbox (`AppModel.demo()`) rather than a real one. Only `demo()`
@@ -97,12 +105,13 @@ public final class AppModel {
     /// builds every child model. Never touches the Keychain or the network
     /// — the app is read-and-triage until the user explicitly triggers
     /// `syncNow()`.
-    public init(databaseURL: URL) async throws {
+    public init(databaseURL: URL, tokenStore: (any TokenStore)? = nil) async throws {
         let database = try HudsonDatabase.open(at: databaseURL)
         self.database = database
         let account = try await database.primaryAccount()
         self.account = account
         self.isDemo = false
+        self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -127,10 +136,14 @@ public final class AppModel {
     /// its first emission to land. `isDemo` defaults `false` — only `demo()`
     /// passes `true`; every other caller (tests, `RootView`'s post-onboarding
     /// rebuild) gets the real, non-demo `needsOnboarding` semantics.
-    public init(database: HudsonDatabase, account: AccountRecord?, isDemo: Bool = false) {
+    public init(
+        database: HudsonDatabase, account: AccountRecord?, isDemo: Bool = false,
+        tokenStore: (any TokenStore)? = nil
+    ) {
         self.database = database
         self.account = account
         self.isDemo = isDemo
+        self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
         self.thread = ThreadModel(database: database, account: email)
@@ -501,5 +514,37 @@ public final class AppModel {
         } catch {
             syncBanner = "Sync failed — check your connection."
         }
+    }
+
+    // MARK: - Disconnect account (Task 5)
+
+    /// "Disconnect <email>" from Settings: removes this Mac's copy of the
+    /// connected account — clears its Gmail OAuth tokens + BYO client secret
+    /// from the Keychain (`tokenStore.deleteAll`), deletes its `accounts` row
+    /// (`database.deleteAccount`), stops the now-pointless background
+    /// auto-sync loop, and clears `account`. That last write is what flips
+    /// `needsOnboarding` back to `true` — `RootView`'s reverse gate (the
+    /// `.onChange` mirror of Task 4's forward `.task` gate) reacts to that
+    /// exact transition and brings `OnboardingView` back, so the app
+    /// genuinely returns to first-launch, not just an emptied mailbox.
+    ///
+    /// A no-op if there's no connected account to disconnect (mirrors
+    /// `syncNow()`'s own "guard on account" posture) — nothing to clear, and
+    /// crucially nothing that could flip `needsOnboarding` for the demo
+    /// mailbox (`isDemo` alone keeps that gate shut regardless, but this
+    /// guard means a stray call here never even touches the Keychain/Store
+    /// for a mailbox with no real account).
+    ///
+    /// Deliberately does NOT touch already-synced mail (`messages`/
+    /// `threads`, ...) — see `AccountStore.deleteAccount`'s doc comment.
+    /// "Disconnect" forgets the CONNECTION; it isn't a full data wipe.
+    public func disconnectAccount() async {
+        guard let account else { return }
+        let email = account.email
+        try? tokenStore.deleteAll(account: email)
+        try? await database.deleteAccount(email: email)
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
+        self.account = nil
     }
 }
