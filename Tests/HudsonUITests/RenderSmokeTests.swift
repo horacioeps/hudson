@@ -1,4 +1,6 @@
 import AppKit
+import GmailKit
+import Outbox
 import Store
 import SwiftUI
 import Testing
@@ -131,6 +133,91 @@ private func assertRendered(_ size: NSSize) {
     let view = RootView(model: appModel)
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+// MARK: - ComposerView (Task 3)
+
+/// A scriptable `SendTransport` double, scoped to this file only — mirrors
+/// `ComposerModelTests`' own private fixture (file-private, so the same name
+/// in a different file is no conflict) so `composerViewRendersUndoToast`
+/// below can drive a REAL `SendService`/`ComposerModel.send()` without a
+/// network or Keychain, purely to reach the undo-toast-visible render state.
+private actor RenderSmokeSendTransport: SendTransport {
+    func sendRawMessage(_ rawMIME: Data, threadID: String?) async throws -> SentMessage {
+        SentMessage(id: "sent-1", threadId: threadID ?? "t", labelIds: ["SENT"])
+    }
+
+    func findSentMessageID(rfc822MessageID: String) async throws -> String? { nil }
+}
+
+/// `ComposerView` hosted in fresh `.new`-compose mode with fields filled —
+/// exercises the To/Cc-toggle-hidden/Subject header, the serif `TextEditor`
+/// body, and the footer WITHOUT the reply-only AI Draft placeholder chip.
+@MainActor
+@Test func composerViewRendersNewCompose() async throws {
+    let db = try HudsonDatabase.inMemory()
+    // `makeService: { nil }` — this test only checks rendering, never calls
+    // `send()`, so there's no need for even a fake-backed `SendService`; nil
+    // also matches the "must never touch the real Keychain" test rule.
+    let model = ComposerModel(database: db, account: nil, makeService: { nil })
+    model.startNew()
+    model.to = "friend@example.com"
+    model.subject = "Lunch?"
+    model.bodyText = "Are you free Thursday?"
+
+    let view = ComposerView(composer: model, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 640, height: 560)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `ComposerView` hosted in reply mode against a real seeded thread (`t01`,
+/// same fixture `ComposerModelTests.startReplyPrefillsSubjectAndRecipientFromThread`
+/// uses) — exercises the prefilled To/Subject/quoted-body header+editor AND
+/// the reply-only AI Draft placeholder chip in the footer.
+@MainActor
+@Test func composerViewRendersReply() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let account = try #require(try await db.account(email: AppModel.demoAccount))
+    let model = ComposerModel(database: db, account: account, makeService: { nil })
+    await model.startReply(threadID: "t01")
+
+    let view = ComposerView(composer: model, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 640, height: 560)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `ComposerView` right after a successful send — `justSentUndoJobID` is
+/// non-nil, so the tappable "Sent · Undo" toast overlay is on screen.
+/// Drives a REAL `send()` through a fake-transport-backed `SendService`
+/// (`RenderSmokeSendTransport`) so this render state is reached the same
+/// way the real app reaches it, not synthesized by poking private state.
+@MainActor
+@Test func composerViewRendersUndoToastAfterSend() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let email = "composer-render-\(UUID().uuidString)@example.com"
+    try await db.upsertAccount(email: email, clientID: "test-client", consentedAt: Date())
+    let account = try #require(try await db.account(email: email))
+    let transport = RenderSmokeSendTransport()
+    let service = SendService(api: transport, database: db, account: account.email)
+    let model = ComposerModel(database: db, account: account, makeService: { service })
+
+    model.startNew()
+    model.to = "friend@example.com"
+    model.subject = "Lunch?"
+    model.bodyText = "Are you free Thursday?"
+    await model.send()
+    #expect(model.justSentUndoJobID != nil)  // fixture sanity — the toast condition is real
+
+    let view = ComposerView(composer: model, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 640, height: 560)
     host.layout()
     assertRendered(host.fittingSize)
 }
