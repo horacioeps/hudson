@@ -41,7 +41,7 @@ let package = Package(
         .testTarget(name: "SyncEngineTests", dependencies: ["SyncEngine"]),
         .target(
             name: "HudsonUI",
-            dependencies: ["GmailKit", "Store", "SyncEngine",
+            dependencies: ["GmailKit", "Store", "SyncEngine", "Outbox",
                            .product(name: "GRDB", package: "GRDB.swift")],
             resources: [.process("Resources")]
         ),
