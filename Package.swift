@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "hudson", targets: ["HudsonCLI"]),
         .library(name: "HudsonUI", targets: ["HudsonUI"]),
         .executable(name: "HudsonApp", targets: ["HudsonApp"]),
+        .library(name: "AIKit", targets: ["AIKit"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
@@ -43,5 +44,10 @@ let package = Package(
         ),
         .executableTarget(name: "HudsonApp", dependencies: ["HudsonUI"]),
         .testTarget(name: "HudsonUITests", dependencies: ["HudsonUI", "Store"]),
+        // AIKit composes ONLY Store (retrieval/cache/config) + GmailKit for the
+        // LLMKeyStore secret seam — never GmailKit's network client (spec §8:
+        // "Uses Store and its own providers. Never touches GmailKit").
+        .target(name: "AIKit", dependencies: ["Store", "GmailKit"]),
+        .testTarget(name: "AIKitTests", dependencies: ["AIKit", "Store"]),
     ]
 )
