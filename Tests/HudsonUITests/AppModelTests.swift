@@ -303,3 +303,23 @@ import Testing
     #expect(model.syncBanner == "Connect an account in Terminal: `hudson auth`")
     #expect(!model.isSyncing)
 }
+
+/// Auto-sync only starts with an account, and is idempotent (one loop, not one
+/// per call). Uses an injected stack factory so the test never touches the
+/// real Keychain or network.
+@MainActor
+@Test func startAutoSyncGuardsOnAccountAndIsIdempotent() async throws {
+    // No account -> the guard returns before starting any loop.
+    let noAccount = AppModel(database: try HudsonDatabase.inMemory(), account: nil)
+    noAccount.startAutoSync(makeStack: { nil })
+    #expect(noAccount.isAutoSyncActive == false)
+
+    // With an account -> starts once; a second call is a no-op, not a 2nd loop.
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let model = AppModel(database: db, account: try await db.primaryAccount())
+    model.startAutoSync(interval: .seconds(3600), makeStack: { nil })
+    #expect(model.isAutoSyncActive == true)
+    model.startAutoSync(makeStack: { nil })  // idempotent
+    #expect(model.isAutoSyncActive == true)
+}

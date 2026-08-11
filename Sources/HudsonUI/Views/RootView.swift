@@ -49,6 +49,9 @@ public struct RootView: View {
         .task {
             guard model == nil, let databaseURL else { return }
             model = try? await (isDemo ? AppModel.demo() : AppModel(databaseURL: databaseURL))
+            // Keep the mailbox live automatically — a no-op without creds
+            // (e.g. `--demo`), so it costs nothing there.
+            model?.startAutoSync()
         }
     }
 
