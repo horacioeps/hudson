@@ -3,75 +3,86 @@ import Foundation
 import GmailKit
 import Store
 
-/// Builds a `Summarize` from whatever `ai_config` + Keychain hold for
-/// `account` — the UI-side seam `SummaryModel` runs the Summarize chip
+/// Builds AIKit features from whatever `ai_config` + Keychain hold for
+/// `account` — the UI-side seam the Summarize chip / composer Draft button run
 /// through, mirroring `SendBootstrap`/`SyncBootstrap`'s "Keychain → engine"
-/// shape. Fail-closed by construction: if the feature isn't opted in this
-/// returns `nil` and no provider is ever built, so the chip degrades to a
-/// "turn AI on" banner instead of egressing.
+/// shape. Fail-closed by construction: if a feature isn't opted in this returns
+/// `nil` and no provider is ever built, so the surface degrades to a "turn AI
+/// on" affordance instead of egressing.
 ///
-/// This duplicates a handful of lines from `HudsonCLI`'s `AIRuntime.bootstrap`
-/// rather than sharing them: `HudsonUI` cannot depend on `HudsonCLI`
-/// (dependencies only run executable → library, never the reverse) — the same
-/// reason `SyncBootstrap`/`SendBootstrap` re-derive their own `GmailClient`
-/// wiring. `hudson ai config` (CLI) stays the SOLE writer of `ai_config`, and
-/// the source of truth for the `base_url` provider encoding decoded below.
+/// Duplicates a few lines of `HudsonCLI`'s wiring rather than sharing them:
+/// `HudsonUI` can't depend on `HudsonCLI` (dependencies run executable →
+/// library, never the reverse). The `base_url` provider encoding decoded below
+/// mirrors what `hudson ai config` writes.
 enum AIBootstrap {
-    /// Reads `summarize`'s `ai_config` row and, only if it is opted in,
-    /// assembles the provider (`base_url` names which — see
-    /// `SummarizeProviderSelection`), the stored API key
-    /// (`KeychainLLMKeyStore`, keyed by provider kind), an `EgressGuard` over
-    /// that provider, and the `Summarize` on top. Returns `nil` when the
-    /// feature has no row or `opt_in != true` — the fail-closed default that
-    /// matches `EgressGuard`'s own gate, so a not-opted-in feature can't even
-    /// reach a built provider.
-    ///
-    /// `keyStore`/`http` default to the real Keychain/URLSession seams in
-    /// production but are injectable so tests exercise the opt-in gating
-    /// without touching the macOS Keychain or the network (spec §6.3, the
-    /// same rule every other `LLMKeyStore` consumer follows).
+    /// The summarize chip's engine — nil unless `.summarize` is opted in.
     static func makeSummarize(
-        database: HudsonDatabase,
-        account: String,
+        database: HudsonDatabase, account: String,
         keyStore: any LLMKeyStore = KeychainLLMKeyStore(),
         http: any LLMHTTP = URLSessionLLMHTTP()
     ) async -> Summarize? {
-        // Fail closed on ANY read failure too, not just a missing/opt-out row:
-        // a Store error must never be the reason content leaks, so `try?` +
-        // the `optIn` guard both have to hold before a provider is built.
         guard
-            let config = try? await database.aiConfig(
-                feature: AIFeature.summarize.rawValue, account: account),
+            let egressGuard = await makeEgressGuard(
+                feature: .summarize,
+                database: database, account: account, keyStore: keyStore, http: http)
+        else { return nil }
+        return Summarize(guard: egressGuard, database: database, account: account)
+    }
+
+    /// The composer's Draft-in-voice engine — nil unless `.draft` is opted in.
+    /// The returned `EgressGuard` also serves the draft's own `.voiceProfile`
+    /// sub-invocation (each `EgressGuard.run` checks the invocation's OWN
+    /// feature opt-in), so `.voiceProfile` must be opted in too — the Settings
+    /// sheet opts both in together. The voice profile is distilled from the
+    /// user's SENT mail, so drafts read the way they actually write.
+    static func makeDraft(
+        database: HudsonDatabase, account: String,
+        keyStore: any LLMKeyStore = KeychainLLMKeyStore(),
+        http: any LLMHTTP = URLSessionLLMHTTP()
+    ) async -> Draft? {
+        guard
+            let egressGuard = await makeEgressGuard(
+                feature: .draft, database: database, account: account, keyStore: keyStore, http: http)
+        else { return nil }
+        let voiceProfile = VoiceProfile(guard: egressGuard, database: database, account: account)
+        return Draft(
+            guard: egressGuard, voiceProfile: voiceProfile, database: database, account: account)
+    }
+
+    /// Reads `feature`'s `ai_config` row and, only if opted in, assembles the
+    /// provider (`base_url` names which — see `ProviderSelection`), the stored
+    /// key (`LLMKeyStore`, keyed by provider kind), and an `EgressGuard` over
+    /// it. `nil` on a missing row, `opt_in != true`, OR any read failure —
+    /// fail-closed so a Store error can never be the reason content leaks.
+    private static func makeEgressGuard(
+        feature: AIFeature, database: HudsonDatabase, account: String,
+        keyStore: any LLMKeyStore, http: any LLMHTTP
+    ) async -> EgressGuard? {
+        guard
+            let config = try? await database.aiConfig(feature: feature.rawValue, account: account),
             config.optIn
         else { return nil }
-
-        let selection = SummarizeProviderSelection.decode(config.baseURL)
+        let selection = ProviderSelection.decode(config.baseURL)
         // A keyless local provider (Ollama/LM Studio) is valid: an absent
-        // Keychain entry degrades to "", never a thrown error — matching
-        // `AIRuntime.bootstrap`'s "tolerate an empty key" contract.
+        // Keychain entry degrades to "", never a thrown error.
         let apiKey = (try? keyStore.key(provider: selection.keychainProvider)) ?? ""
         let provider = selection.buildProvider(http: http, apiKey: apiKey)
-        let egressGuard = EgressGuard(provider: provider, database: database, account: account)
-        return Summarize(guard: egressGuard, database: database, account: account)
+        return EgressGuard(provider: provider, database: database, account: account)
     }
 }
 
 /// Which LLM backend a stored `ai_config` row selects, decoded from the
-/// `base_url` column. No AIKit feature reads `base_url`, so `hudson ai config`
-/// repurposes it as an opaque `"<kind>"` / `"<kind>|<url>"` encoding of
-/// "which provider, and any base-URL override" (see `AICommands`'
-/// `AIProviderConfig`, the encoder). HudsonUI can't import HudsonCLI to reuse
-/// that decoder (see `AIBootstrap`'s doc comment), so the read side is
-/// mirrored here — deliberately lenient: anything unrecognized or hand-edited
-/// falls back to `.anthropic` with no override, an inert default that can't
-/// itself cause egress (the opt-in gate, not this decode, is what blocks it).
-private enum SummarizeProviderSelection {
+/// `base_url` column (`"anthropic"` / `"openai-compat"` / `"openai-compat|<url>"`
+/// — the encoding `hudson ai config` and `SettingsModel` both write). Lenient:
+/// anything unrecognized falls back to `.anthropic`, an inert default that
+/// can't itself cause egress (the opt-in gate, not this decode, blocks that).
+private enum ProviderSelection {
     case anthropic
     case openAICompat(baseURL: URL?)
 
     private static let separator: Character = "|"
 
-    static func decode(_ raw: String?) -> SummarizeProviderSelection {
+    static func decode(_ raw: String?) -> ProviderSelection {
         guard let raw, !raw.isEmpty else { return .anthropic }
         let parts = raw.split(separator: Self.separator, maxSplits: 1)
         guard let kind = parts.first else { return .anthropic }
@@ -80,13 +91,10 @@ private enum SummarizeProviderSelection {
             let override = parts.count > 1 ? URL(string: String(parts[1])) : nil
             return .openAICompat(baseURL: override)
         default:
-            // "anthropic" or any stale/hand-edited value — inert default.
             return .anthropic
         }
     }
 
-    /// The `provider` key `KeychainLLMKeyStore` filed this backend's API key
-    /// under (`ai config` writes it keyed by this same raw value).
     var keychainProvider: String {
         switch self {
         case .anthropic: return "anthropic"
@@ -94,11 +102,6 @@ private enum SummarizeProviderSelection {
         }
     }
 
-    /// Builds the live provider. Construction is pure (no I/O — see the
-    /// providers' own doc comments), so building one for a feature that turns
-    /// out not to egress is harmless. `.anthropic` never honors a base-URL
-    /// override (there is none to pass); `.openAICompat` uses the configured
-    /// URL when present, else the provider's OpenAI default.
     func buildProvider(http: any LLMHTTP, apiKey: String) -> any LLMProvider {
         switch self {
         case .anthropic:
