@@ -117,8 +117,17 @@ public final class SearchModel {
             do {
                 results = try await database.searchMessages(
                     account: account, query: trimmed, limit: Self.resultLimit, scope: scope)
+            } catch is CancellationError {
+                return  // a newer keystroke won the race — that task owns `isSearching` now
             } catch {
-                return  // cancelled mid-query, or a genuine Store failure — either way nothing to assign
+                // A genuine Store/SQLite failure (disk full, corruption, …). There is no
+                // error surface in the UI yet (matching InboxModel's deferred error-UI stance),
+                // but we MUST clear the spinner: this is the last, non-superseded search, so if
+                // nothing flips `isSearching` back it stays stuck true forever. Guarded so a
+                // simultaneously-cancelled task defers to whichever newer task is now running.
+                guard !Task.isCancelled, let self else { return }
+                self.isSearching = false
+                return
             }
 
             guard !Task.isCancelled, let self else { return }
