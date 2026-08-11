@@ -7,6 +7,25 @@ already-synced mail; syncing itself still happens from the CLI (`hudson
 sync`) until a later milestone wires a "Sync now" affordance into this UI
 (see [Stubbed / deferred](#stubbed--deferred-until-a-later-milestone) below).
 
+## Screenshots
+
+Rendered from the `--demo` mailbox (synthetic data — no real mail):
+
+| Main window | Command palette (⌘K) | Search |
+|---|---|---|
+| ![Three-pane main window](screenshots/main-window.png) | ![Command palette](screenshots/command-palette.png) | ![Full-text search](screenshots/search.png) |
+
+Regenerate them with the offscreen render harness (no display / screen-recording
+permission needed — it captures each view's own backing store):
+
+```bash
+HUDSON_SNAPSHOT=1 HUDSON_SNAPSHOT_DIR=docs/ui/screenshots \
+  swift test --filter SnapshotHarness
+```
+
+The harness (`Tests/HudsonUITests/SnapshotHarness.swift`) is a no-op unless
+`HUDSON_SNAPSHOT=1`, so it never runs in the normal suite.
+
 ## Build and run
 
 Requires macOS 15+ and Xcode 16+ (same prerequisites as the CLI — see the
