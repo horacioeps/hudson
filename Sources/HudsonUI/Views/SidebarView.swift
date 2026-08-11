@@ -34,12 +34,14 @@ public struct SidebarView: View {
     private let onSelect: (Selection) -> Void
     private let onSyncNow: () -> Void
     private let onSettings: () -> Void
+    private let onCompose: () -> Void
 
     public init(
         accountEmail: String?, unreadCount: Int, labels: [LabelRecord], pendingCount: Int,
         isSyncing: Bool = false, syncBanner: String? = nil,
         selection: Selection, onSelect: @escaping (Selection) -> Void,
-        onSyncNow: @escaping () -> Void = {}, onSettings: @escaping () -> Void = {}
+        onSyncNow: @escaping () -> Void = {}, onSettings: @escaping () -> Void = {},
+        onCompose: @escaping () -> Void = {}
     ) {
         self.accountEmail = accountEmail
         self.unreadCount = unreadCount
@@ -51,6 +53,7 @@ public struct SidebarView: View {
         self.onSelect = onSelect
         self.onSyncNow = onSyncNow
         self.onSettings = onSettings
+        self.onCompose = onCompose
     }
 
     public var body: some View {
@@ -64,6 +67,12 @@ public struct SidebarView: View {
                 .foregroundStyle(Palette.ink)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .padding(.horizontal, Metrics.unit * 3)
+                .padding(.bottom, Metrics.unit * 3)
+
+            // The primary "start a new email" affordance (also ⌘N). Was
+            // missing — you could reply but not compose from scratch.
+            PrimaryButton(title: "New message", action: onCompose)
                 .padding(.horizontal, Metrics.unit * 3)
                 .padding(.bottom, Metrics.unit * 4)
 

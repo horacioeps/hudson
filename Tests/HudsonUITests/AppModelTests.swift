@@ -323,3 +323,14 @@ import Testing
     model.startAutoSync(makeStack: { nil })  // idempotent
     #expect(model.isAutoSyncActive == true)
 }
+
+/// When the composer is visible, keyboard routing switches to the `.composer`
+/// context (so triage letters don't eat what you're typing).
+@MainActor
+@Test func keyboardContextIsComposerWhenComposerVisible() {
+    let db = try! HudsonDatabase.inMemory()
+    let model = AppModel(database: db, account: nil)
+    #expect(model.keyboardContext == .list)
+    model.isComposerVisible = true
+    #expect(model.keyboardContext == .composer)
+}

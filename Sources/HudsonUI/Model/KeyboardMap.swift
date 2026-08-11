@@ -7,6 +7,11 @@ import Foundation
 public enum KeyboardContext: Sendable, Equatable {
     case palette
     case search
+    /// The compose/reply sheet is open and owns the keyboard: EVERY key is
+    /// typed into the body (only Esc is special), so the list's single-letter
+    /// triage shortcuts (j/k/e/s/u/o) must NOT fire — otherwise you can't type
+    /// those letters in an email.
+    case composer
     case list
 }
 
@@ -57,6 +62,7 @@ public enum KeyAction: Sendable, Equatable {
     case togglePalette
     case toggleSearch
     case composeNew
+    case closeComposer
 }
 
 /// Hudson's global keymap, as a single pure function: `(context, key) ->
@@ -79,8 +85,18 @@ public enum KeyRouter {
         switch context {
         case .palette: return routeInPalette(event)
         case .search: return routeInSearch(event)
+        case .composer: return routeInComposer(event)
         case .list: return routeInList(event)
         }
+    }
+
+    /// The compose/reply sheet owns the keyboard entirely: only Esc is routed
+    /// (to close the sheet); EVERYTHING else — every letter, including j/k/e/s/
+    /// u/o — passes straight through to the body field. Without this, the
+    /// list's single-letter triage shortcuts would eat those letters and you
+    /// couldn't type them in an email.
+    private static func routeInComposer(_ event: KeyDescriptor) -> KeyAction? {
+        event.special == .escape ? .closeComposer : nil
     }
 
     /// Arrow/Return/Esc drive the palette's highlight and dismissal; every

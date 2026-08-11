@@ -100,3 +100,15 @@ import Testing
     #expect(KeyRouter.route(KeyDescriptor(special: .upArrow), context: .list) == nil)
     #expect(KeyRouter.route(KeyDescriptor(special: .downArrow), context: .list) == nil)
 }
+
+/// Regression: the compose/reply sheet owns the keyboard. Single letters that
+/// are list triage shortcuts (s/o/k/j/e/u) MUST pass through so you can type
+/// them into an email — only Esc is routed (to close the sheet). This is the
+/// "can't type s/o/k when replying" bug.
+@Test func composerContextLetsTypingThroughAndOnlyEscCloses() {
+    for letter in ["s", "o", "k", "j", "e", "u", "a", "z"] {
+        #expect(KeyRouter.route(KeyDescriptor(characters: letter), context: .composer) == nil)
+    }
+    #expect(KeyRouter.route(KeyDescriptor(special: .return), context: .composer) == nil)
+    #expect(KeyRouter.route(KeyDescriptor(special: .escape), context: .composer) == .closeComposer)
+}
