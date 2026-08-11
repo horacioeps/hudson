@@ -70,6 +70,74 @@ import Testing
     #expect(isUnreadNow == !wasUnread)
 }
 
+/// Regression test: archiving a MULTI-message thread must clear `INBOX`
+/// from every message that carries it, not just the newest
+/// (`lastMessageID`) — `thread_rollup.in_inbox` is an OR-aggregate across
+/// the whole thread (`ThreadRollup.recomputeThreadFlags`), so removing
+/// `INBOX` from only the newest message silently no-ops whenever an older
+/// message (e.g. the conversation's opening message) still carries it.
+/// Every multi-message thread in `DemoData` (t01/t09/t17/t22) has exactly
+/// this shape — the opening message keeps `INBOX`, only "you"'s own SENT
+/// replies drop it — so picking the first one present in `rows` is enough;
+/// no need to hardcode a specific thread id.
+@MainActor
+@Test func archiveSelectedOnMultiMessageThreadLeavesInbox() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: "you@hudson.app")
+    let model = InboxModel(database: db, account: "you@hudson.app")
+    await model.start()
+    try await Task.sleep(for: .milliseconds(50))
+
+    let target = try #require(model.rows.first { $0.messageCount > 1 })
+    model.selectedThreadID = target.threadID
+
+    try await model.archiveSelected()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.rows.contains { $0.threadID == target.threadID } == false)
+}
+
+/// Same OR-aggregate bug, for `unread`: a two-message thread whose OLDER
+/// message is unread and whose NEWER message is already read. Marking only
+/// `lastMessageID` read (as the buggy version did) would leave the older
+/// message's `UNREAD` in place and the rollup would recompute right back to
+/// `unread == true`. Seeded directly via `Store`'s write API (matching
+/// `ObservationTests.swift`'s pattern) since `DemoData`'s multi-message
+/// threads all carry their `UNREAD`/`STARRED` labels on the NEWEST message
+/// instead, which wouldn't exercise this shape.
+@MainActor
+@Test func toggleReadSelectedOnMultiMessageThreadClearsUnreadThreadWide() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "multi-m0", threadID: "multi", historyID: 1, internalDate: 1,
+            fromLine: "sender@example.com", toLine: account, subject: "Hello",
+            snippet: "first", labelIDs: ["INBOX", "UNREAD"]),
+        account: account)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "multi-m1", threadID: "multi", historyID: 2, internalDate: 2,
+            fromLine: "sender@example.com", toLine: account, subject: "Re: Hello",
+            snippet: "second", labelIDs: ["INBOX"]),
+        account: account)
+
+    let model = InboxModel(database: db, account: account)
+    await model.start()
+    try await Task.sleep(for: .milliseconds(50))
+
+    let target = try #require(model.rows.first { $0.threadID == "multi" })
+    #expect(target.unread)
+    model.selectedThreadID = target.threadID
+
+    try await model.toggleReadSelected()
+    try await Task.sleep(for: .milliseconds(50))
+
+    let updated = try #require(model.rows.first { $0.threadID == "multi" })
+    #expect(!updated.unread)
+}
+
 /// An empty (unseeded) account has no threads and no split rules — `rows`
 /// stays empty and `tabs` is exactly the always-present "Primary" tab at
 /// count 0, both before AND after `start()`'s first emission lands.

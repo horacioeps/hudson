@@ -253,15 +253,19 @@ public final class InboxModel {
 
     // MARK: - Optimistic triage
 
-    /// Archives the selected thread's newest message — Gmail's own "leave
-    /// the inbox" semantics. We never remove the row from `rows` ourselves:
-    /// `Triage.archive` enqueues the mutation, `enqueueMutation` recomputes
+    /// Archives the selected thread — Gmail's own "leave the inbox"
+    /// semantics, applied thread-wide (`Triage.archiveThread`), not just to
+    /// the newest message: `thread_rollup.in_inbox` is an OR across every
+    /// message in the thread, so archiving only `lastMessageID` would
+    /// silently no-op whenever an older message still carries `INBOX` (the
+    /// common shape for any real multi-message conversation). We never
+    /// remove the row from `rows` ourselves: `enqueueMutation` recomputes
     /// `thread_rollup` in the same transaction, and `rowsTask`'s
     /// observation re-emits without this thread moments later — see
     /// `Triage`'s doc comment.
     public func archiveSelected() async throws {
         guard let selectedRow else { return }
-        try await Triage.archive(messageID: selectedRow.lastMessageID, account: account, database: database)
+        try await Triage.archiveThread(threadID: selectedRow.threadID, account: account, database: database)
     }
 
     /// Stars the selected thread's newest message, or unstars it if
@@ -281,17 +285,23 @@ public final class InboxModel {
         }
     }
 
-    /// Marks the selected thread's newest message read, or unread if it's
-    /// currently unread. `ThreadRow.unread` is already the thread's
-    /// effective state (overlay-composed by `thread_rollup`), so — unlike
-    /// star — no extra read is needed to pick the direction.
+    /// Marks the selected thread read (thread-wide, `Triage.markReadThread`
+    /// — `thread_rollup.unread` is likewise an OR across every message, so
+    /// clearing `UNREAD` on only `lastMessageID` would no-op whenever an
+    /// older message is still unread), or marks just the newest message
+    /// unread if the thread is currently read. Marking unread IS a
+    /// single-message action in Gmail itself (there's no "mark whole
+    /// thread unread" affordance to mirror), so that direction stays
+    /// scoped to `lastMessageID`. `ThreadRow.unread` is already the
+    /// thread's effective state (overlay-composed by `thread_rollup`), so —
+    /// unlike star — no extra read is needed to pick the direction.
     public func toggleReadSelected() async throws {
         guard let selectedRow else { return }
-        let messageID = selectedRow.lastMessageID
         if selectedRow.unread {
-            try await Triage.markRead(messageID: messageID, account: account, database: database)
+            try await Triage.markReadThread(threadID: selectedRow.threadID, account: account, database: database)
         } else {
-            try await Triage.markUnread(messageID: messageID, account: account, database: database)
+            try await Triage.markUnread(
+                messageID: selectedRow.lastMessageID, account: account, database: database)
         }
     }
 }
