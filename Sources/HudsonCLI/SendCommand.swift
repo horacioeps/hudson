@@ -140,9 +140,15 @@ enum SendCLI {
     /// exactly like `SyncCommand` flushes the mutation queue. Reports the
     /// job's resulting state afterward: the sent Gmail id, or — since the
     /// undo-send hold usually still has the whole job on hold at this
-    /// point — the still-open undo window, so the user knows the message
-    /// hasn't left yet and how to make it go (run again, or wait for a
-    /// later flush).
+    /// point — the still-open undo window.
+    ///
+    /// `flushOnce` drains EVERY claimable job on the account, not just the
+    /// one just enqueued here — so on M5 (no daemon/scheduler) this
+    /// piggybacked flush is the ONLY thing that can ever drain a job an
+    /// EARLIER `hudson send`/`hudson reply` left `held`, once its own undo
+    /// window has since elapsed. Its return value (`confirmedThisPass`) is
+    /// threaded into `report` so that silent side-effect send is surfaced
+    /// rather than buried behind this call's own job id — see `reportLine`.
     static func enqueueFlushAndReport(_ message: OutboxMessage, runtime: Runtime) async throws {
         let service = SendService(api: runtime.client, database: runtime.database, account: runtime.account.email)
         let jobID = try await service.enqueue(message, now: Self.nowMilliseconds())
@@ -151,8 +157,9 @@ enum SendCLI {
         let safeTo = message.to.map { Sanitizer.terminalSafe($0, singleLine: true) }.joined(separator: ", ")
         print("queued \"\(safeSubject)\" to \(safeTo)")
 
+        let confirmedThisPass: Int
         do {
-            _ = try await service.flushOnce(now: Self.nowMilliseconds())
+            confirmedThisPass = try await service.flushOnce(now: Self.nowMilliseconds())
         } catch let error as GmailError {
             // Mirrors `TriageRunner.flush`'s swallow-and-report contract:
             // the local durable enqueue above already succeeded, so a
@@ -167,35 +174,67 @@ enum SendCLI {
             print("held locally, will retry (\(type(of: error)))")
             return
         }
-        await report(jobID: jobID, database: runtime.database, account: runtime.account.email)
+        await report(
+            jobID: jobID, database: runtime.database, account: runtime.account.email,
+            confirmedThisPass: confirmedThisPass)
     }
 
     /// Prints this specific job's post-flush state. `flushOnce`'s return
     /// value is an aggregate count across every job it touched this pass
-    /// (including unrelated stranded jobs from a prior run), so it can't
-    /// answer "did THIS job send" — this reads the row back by id instead
-    /// (`HudsonDatabase.sendJob`).
-    private static func report(jobID: Int64, database: HudsonDatabase, account: String) async {
+    /// (including unrelated stranded jobs from a prior run), so it can't by
+    /// itself answer "did THIS job send" — this reads the row back by id
+    /// instead (`HudsonDatabase.sendJob`) and hands both to `reportLine`.
+    private static func report(
+        jobID: Int64, database: HudsonDatabase, account: String, confirmedThisPass: Int
+    ) async {
         guard let job = try? await database.sendJob(id: jobID, account: account) else {
             // Shouldn't happen (we just inserted it) — fail soft rather
             // than crash the whole command over a report-only read.
             print("(job \(jobID) — unable to read back its status)")
             return
         }
+        print(reportLine(job: job, jobID: jobID, confirmedThisPass: confirmedThisPass, now: Self.nowMilliseconds()))
+    }
+
+    /// Pure formatting for `report`'s output — no `Runtime`/database
+    /// involved, so it's directly unit-testable against a `SendJob` read
+    /// back from a temp DB.
+    ///
+    /// `confirmedThisPass` is `flushOnce`'s aggregate count for the WHOLE
+    /// pass it just ran, across every job it touched — not just `job`. The
+    /// row passed in as `job` is the one just enqueued by THIS command
+    /// invocation, so it could only have become `.sent` via THIS pass;
+    /// subtracting one for that case isolates how many OTHER,
+    /// previously-queued jobs this same flush ALSO delivered as a side
+    /// effect. M5 has no daemon/scheduler — this piggybacked flush is the
+    /// only thing that can ever drain a job an earlier invocation left
+    /// `held` — so that count must be surfaced, never silently dropped:
+    /// otherwise a user re-running `hudson send` sees only their new job's
+    /// state while an earlier one silently went out underneath them, and
+    /// may resend identical content believing the first attempt never left.
+    static func reportLine(job: SendJob, jobID: Int64, confirmedThisPass: Int, now: Int64) -> String {
+        let otherConfirmed = max(0, confirmedThisPass - (job.state == .sent ? 1 : 0))
+        let sideNote = otherConfirmed > 0
+            ? " (also delivered \(otherConfirmed) other previously-queued message(s) this pass)"
+            : ""
         switch job.state {
         case .sent:
-            print("sent — Gmail id \(job.sentMessageID ?? "unknown")")
+            return "sent — Gmail id \(job.sentMessageID ?? "unknown")\(sideNote)"
         case .pending, .held:
-            let secondsLeft = max(0, (job.holdUntil - Self.nowMilliseconds()) / 1_000)
-            print(
-                "queued — undo window open for ~\(secondsLeft)s (job \(jobID)); "
-                + "run `hudson send`/`hudson reply` again, or wait, to deliver it.")
+            // No daemon/scheduler exists in M5 to drain this in the
+            // background — waiting alone will never deliver it. Only a
+            // LATER `hudson send`/`hudson reply` invocation's own
+            // piggybacked flush can, once this job's hold has elapsed.
+            let secondsLeft = max(0, (job.holdUntil - now) / 1_000)
+            return "queued — undo window open for ~\(secondsLeft)s (job \(jobID)); "
+                + "it is delivered only by a LATER `hudson send`/`hudson reply` call — "
+                + "nothing sends it in the background, so waiting alone will not.\(sideNote)"
         case .inFlight:
             // Reached the wire but the outcome isn't confirmed yet (spec
             // §7.3's ambiguous-probe-miss case) — never resent automatically.
-            print("sending — delivery not yet confirmed; run again to resolve (job \(jobID)).")
+            return "sending — delivery not yet confirmed; run again to resolve (job \(jobID)).\(sideNote)"
         case .failed:
-            print("send failed (job \(jobID)).")
+            return "send failed (job \(jobID)).\(sideNote)"
         }
     }
 

@@ -33,6 +33,22 @@ struct UnusedSendTransport: SendTransport {
     }
 }
 
+/// A `SendTransport` double that actually "sends" — used by the
+/// `reportLine`/`flushOnce` interplay tests below, which (unlike the
+/// dry-run enqueue tests) need a real flush pass to happen against a temp
+/// DB. Every send succeeds with a fresh id; the probe path is never
+/// exercised by those tests, so it's a plain miss.
+actor AlwaysSucceedsSendTransport: SendTransport {
+    private var nextID = 0
+
+    func sendRawMessage(_ rawMIME: Data, threadID: String?) async throws -> SentMessage {
+        nextID += 1
+        return SentMessage(id: "sent-\(nextID)", threadId: threadID ?? "t-\(nextID)", labelIds: ["SENT"])
+    }
+
+    func findSentMessageID(rfc822MessageID: String) async throws -> String? { nil }
+}
+
 // MARK: - `hudson send` argument parsing
 
 @Test func sendCommandParsesToSubjectBodyAndAttach() throws {
@@ -167,4 +183,96 @@ struct UnusedSendTransport: SendTransport {
 
     #expect(job != nil)
     #expect(job?.threadID == "t1")
+}
+
+// MARK: - `SendCLI.reportLine` — post-flush report (regression: piggybacked
+// flush must never silently deliver an earlier held job without saying so,
+// and the still-held branch must never claim waiting alone will deliver it)
+
+@Test func reportLineForAHeldJobDoesNotClaimWaitingWillDeliverIt() async throws {
+    let database = try HudsonDatabase.inMemory()
+    let account = "me@hudson.test"
+    let transport = AlwaysSucceedsSendTransport()
+    let service = SendService(api: transport, database: database, account: account)
+
+    let message = OutboxMessage(
+        from: account, to: ["you@example.com"], subject: "Hi", bodyText: "Hello")
+    let jobID = try await service.enqueue(message, undoHold: .seconds(15), now: 1_000)
+    let job = try await database.sendJob(id: jobID, account: account)
+
+    let line = SendCLI.reportLine(job: job!, jobID: jobID, confirmedThisPass: 0, now: 1_000)
+
+    // The old text falsely implied a background process would eventually
+    // deliver a held job on its own — nothing in M5 does.
+    #expect(!line.contains("or wait"))
+    #expect(line.contains("queued"))
+    #expect(line.contains("hudson send"))
+    // No other jobs were confirmed, so no side-note should appear.
+    #expect(!line.contains("also delivered"))
+}
+
+@Test func reportLineSurfacesAnEarlierHeldJobDeliveredAsASideEffectOfThisFlush() async throws {
+    // Reproduces the exact scenario the fix targets: an EARLIER `hudson
+    // send` left job1 queued past its undo hold (simulated here via
+    // `undoHold: .zero`). By the time a SECOND `hudson send` runs — and
+    // enqueues job2, still inside ITS OWN fresh 15s undo hold — job2's
+    // piggybacked `flushOnce` pass claims and sends job1 as a side effect.
+    // The report on job2 must say so; it must not stay silent about job1.
+    let database = try HudsonDatabase.inMemory()
+    let account = "me@hudson.test"
+    let transport = AlwaysSucceedsSendTransport()
+    let service = SendService(api: transport, database: database, account: account)
+
+    let earlier = OutboxMessage(
+        from: account, to: ["a@example.com"], subject: "Earlier", bodyText: "First message")
+    let job1 = try await service.enqueue(earlier, undoHold: .zero, now: 1_000)
+
+    let fresh = OutboxMessage(
+        from: account, to: ["b@example.com"], subject: "Fresh", bodyText: "Second message")
+    let job2 = try await service.enqueue(fresh, undoHold: .seconds(15), now: 1_000)
+
+    let confirmedThisPass = try await service.flushOnce(now: 1_000)
+    #expect(confirmedThisPass == 1)  // only job1 was past its hold and claimable
+
+    let job1Row = try await database.sendJob(id: job1, account: account)
+    let job2Row = try await database.sendJob(id: job2, account: account)
+    #expect(job1Row?.state == .sent)  // job1 really WAS silently sent this pass
+    #expect(job2Row?.state == .pending)  // job2 is still within its own hold
+
+    let line = SendCLI.reportLine(
+        job: job2Row!, jobID: job2, confirmedThisPass: confirmedThisPass, now: 1_000)
+
+    #expect(line.contains("also delivered 1 other previously-queued message"))
+    #expect(!line.contains("or wait"))
+    #expect(line.contains("queued"))  // job2 itself is still just queued, not sent
+}
+
+@Test func reportLineForASentJobExcludesItselfFromTheOtherCount() async throws {
+    // Two jobs both past their hold: `flushOnce` confirms both in one pass.
+    // When reporting on job2 — which IS one of the two confirmed sends —
+    // the side-note must say "1 other" (job1), not "2 other": job2 must not
+    // double-count itself.
+    let database = try HudsonDatabase.inMemory()
+    let account = "me@hudson.test"
+    let transport = AlwaysSucceedsSendTransport()
+    let service = SendService(api: transport, database: database, account: account)
+
+    let first = OutboxMessage(from: account, to: ["a@example.com"], subject: "First", bodyText: "One")
+    let job1 = try await service.enqueue(first, undoHold: .zero, now: 1_000)
+    let second = OutboxMessage(from: account, to: ["b@example.com"], subject: "Second", bodyText: "Two")
+    let job2 = try await service.enqueue(second, undoHold: .zero, now: 1_000)
+
+    let confirmedThisPass = try await service.flushOnce(now: 1_000)
+    #expect(confirmedThisPass == 2)
+
+    let job2Row = try await database.sendJob(id: job2, account: account)
+    #expect(job2Row?.state == .sent)
+
+    let line = SendCLI.reportLine(
+        job: job2Row!, jobID: job2, confirmedThisPass: confirmedThisPass, now: 1_000)
+
+    #expect(line.hasPrefix("sent"))
+    #expect(line.contains("also delivered 1 other previously-queued message"))
+    #expect(!line.contains("2 other"))
+    _ = job1
 }
