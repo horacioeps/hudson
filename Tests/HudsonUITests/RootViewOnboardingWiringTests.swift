@@ -136,3 +136,68 @@ private struct ProbeView: View {
 
     #expect(probe.lastObservedState == 42)  // the write DID reach the live tree
 }
+
+// MARK: - The REVERSE gate (Task 5: "Disconnect account")
+
+/// Mirrors `ProbeView` above, but for the shape `RootView`'s reverse gate
+/// actually uses: `.onChange(of: model?.needsOnboarding)`, built inside
+/// `body` (never `init`), rebuilding `onboarding` only on a genuine
+/// TRANSITION of the watched value — exactly how `needsOnboarding` behaves
+/// in practice (it starts `false` for a connected launch and flips `true`
+/// only later, when `AppModel.disconnectAccount()` clears `account`).
+/// `flag` stands in for `needsOnboarding`; `connectedState` stands in for
+/// `onboarding` being (re)built. Proves the SAME "captured after body's
+/// first pass reaches live `@State`" guarantee `.task` relies on also holds
+/// for `.onChange` — the mechanism `RootView` needs for the reverse gate,
+/// since `.task` itself only runs once per view identity and can't be
+/// re-triggered by a LATER `needsOnboarding` flip.
+private struct ReverseProbeView: View {
+    @State private var flag = false
+    @State private var connectedState = 0
+    private let probe: Probe
+
+    init(probe: Probe) {
+        self.probe = probe
+    }
+
+    var body: some View {
+        Color.clear
+            .onChange(of: flag) { _, newValue in
+                // Built here — inside a body-attached modifier — so `self`
+                // is always a body-bound copy, the same guarantee `.task`'s
+                // closure relies on above.
+                if newValue { self.connectedState = 42 }
+            }
+            .onChange(of: connectedState) { _, newValue in
+                probe.recordStateChange(newValue)
+            }
+            .task {
+                // Hands the test a way to flip `flag` from OUTSIDE this
+                // view's identity — standing in for `AppModel.account`
+                // being cleared by a real "Disconnect" tap sometime after
+                // this view first appeared.
+                probe.fireTaskWiredSwap = { [self] in self.flag = true }
+            }
+    }
+}
+
+/// `RootView`'s reverse-gate fix: an `.onChange(of:)` closure built inside
+/// `body`, firing only once `flag` genuinely transitions (never for the
+/// view's initial appearance — SwiftUI's `onChange` doesn't fire for that),
+/// correctly reaches the live `@State` when the transition happens later.
+@MainActor
+@Test func onChangeCapturedInsideBodyReachesTheLiveViewOnALaterFlip() async throws {
+    let probe = Probe()
+    let view = ReverseProbeView(probe: probe)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 10, height: 10)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(50))
+    host.layout()
+
+    probe.fireTaskWiredSwap?()  // flips `flag` — the disconnect-flips-needsOnboarding moment
+    try await Task.sleep(for: .milliseconds(50))
+    host.layout()
+
+    #expect(probe.lastObservedState == 42)  // the onChange-driven write DID reach the live tree
+}

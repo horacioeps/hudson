@@ -230,6 +230,48 @@ private func assertRendered(_ size: NSSize) {
     assertRendered(host.fittingSize)
 }
 
+/// `RootView` after `AppModel.disconnectAccount()` (Task 5's "Disconnect
+/// account") — the REVERSE of the test above. Builds a real, non-demo
+/// `AppModel` (an `isDemo` model can never need onboarding either way — see
+/// `needsOnboarding`'s doc comment) with a seeded account and an injected
+/// `InMemoryTokenStore`, hosts `RootView` while still CONNECTED (mirrors a
+/// real launch reaching the assembled three-pane), then disconnects and
+/// re-renders. This is integration coverage that the pieces actually wire
+/// together end to end and nothing crashes on the transition;
+/// `RootViewOnboardingWiringTests.onChangeCapturedInsideBodyReachesTheLiveViewOnALaterFlip`
+/// is what proves the underlying `.onChange`-in-`body` mechanism itself is
+/// sound (this file's `NSHostingView` recipe can't distinguish "showing
+/// `OnboardingView`" from "stuck on `loadingPlaceholder`" — both render a
+/// non-zero fitting size — see that test's doc comment for why).
+@MainActor
+@Test func rootViewReturnsToOnboardingAfterDisconnect() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "a@b.com", clientID: "cid", consentedAt: Date())
+    let account = try await db.account(email: "a@b.com")
+    let tokenStore = InMemoryTokenStore()
+    try tokenStore.saveTokens(
+        TokenSet(accessToken: "at", refreshToken: "rt", expiresAt: .distantFuture),
+        account: "a@b.com")
+    let appModel = AppModel(database: db, account: account, tokenStore: tokenStore)
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(!appModel.needsOnboarding)  // precondition: starts connected
+
+    let view = RootView(model: appModel)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(100))
+    host.layout()
+    assertRendered(host.fittingSize)  // connected: the three-pane mailbox renders fine
+
+    await appModel.disconnectAccount()
+    #expect(appModel.needsOnboarding)  // the account is really gone
+
+    try await Task.sleep(for: .milliseconds(100))
+    host.layout()
+    assertRendered(host.fittingSize)  // still renders after the reverse-gate transition
+}
+
 /// The REAL `HudsonApp` boot path (`RootView(databaseURL:)`, not the
 /// direct-injection `init(model:)` seam) with a fresh, empty on-disk
 /// database — no seeded account, so the async `.task` load lands a model
@@ -266,6 +308,41 @@ private func assertRendered(_ size: NSSize) {
     let view = RootView(model: appModel)
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+// MARK: - SettingsView (Task 5: "Disconnect account")
+
+/// `SettingsView` with a connected account — exercises the AI section
+/// alongside the NEW account section (Task 5): the "Account" heading and
+/// "Disconnect <email>" control, rendered whenever `accountEmail` is
+/// non-nil.
+@MainActor
+@Test func settingsViewRendersWithAccountSection() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await db.upsertAccount(email: "a@b.com", clientID: "cid", consentedAt: Date())
+    let settings = SettingsModel(database: db, account: "a@b.com", keyStore: InMemoryLLMKeyStore())
+
+    let view = SettingsView(
+        settings: settings, accountEmail: "a@b.com", onDisconnect: {}, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 460, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// `SettingsView` with NO connected account (`accountEmail == nil`) — the
+/// account section must not render (nothing to disconnect); this also
+/// exercises the sheet's default state without crashing on a nil email.
+@MainActor
+@Test func settingsViewRendersWithoutAccountSection() {
+    let settings = SettingsModel(
+        database: try! HudsonDatabase.inMemory(), account: "", keyStore: InMemoryLLMKeyStore())
+
+    let view = SettingsView(settings: settings, accountEmail: nil, onDisconnect: {}, onClose: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 460, height: 700)
     host.layout()
     assertRendered(host.fittingSize)
 }

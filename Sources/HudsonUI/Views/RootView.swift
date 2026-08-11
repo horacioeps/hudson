@@ -97,6 +97,32 @@ public struct RootView: View {
                 loaded.startAutoSync()
             }
         }
+        // The REVERSE of the `.task` gate above (Task 5: "Disconnect
+        // account"). `.task` only ever runs ONCE per view identity — it
+        // can't itself react to `needsOnboarding` flipping `true` sometime
+        // LATER, which is exactly what `SettingsView`'s "Disconnect" does
+        // via `AppModel.disconnectAccount()` clearing `account`. This
+        // modifier is what makes that later flip re-show `OnboardingView`.
+        //
+        // Built here — inside a body-attached modifier, evaluated only
+        // after SwiftUI installs this view's `@State` — for the identical
+        // reason `.task` is (see `makeOnboardingModel`'s doc comment): a
+        // closure capturing `self` is only safe once `body` has run at
+        // least once for this identity. `RootViewOnboardingWiringTests`
+        // reproduces this exact shape (`.onChange` instead of `.task`) in
+        // isolation and confirms the write reaches the live tree.
+        //
+        // Guards match `.task`'s own: only fires on an ACTUAL transition to
+        // `true` (SwiftUI's `onChange` never fires for a view's first
+        // render, so this never races the forward gate's initial build —
+        // see `onChange`'s call site doc below) and only builds when
+        // `onboarding` isn't already showing, so a stray double-fire is a
+        // harmless no-op rather than a second `OnboardingModel` clobbering
+        // the first.
+        .onChange(of: model?.needsOnboarding) { _, needsOnboarding in
+            guard needsOnboarding == true, let model, onboarding == nil else { return }
+            onboarding = makeOnboardingModel(for: model)
+        }
     }
 
     // MARK: - Onboarding (Task 4's gate — see `onboarding` above)
@@ -202,7 +228,10 @@ public struct RootView: View {
             if model.isSettingsVisible {
                 overlay {
                     SettingsView(
-                        settings: model.settings, onClose: { model.isSettingsVisible = false })
+                        settings: model.settings,
+                        accountEmail: model.account?.email,
+                        onDisconnect: { Task { await model.disconnectAccount() } },
+                        onClose: { model.isSettingsVisible = false })
                 } onDismiss: {
                     model.isSettingsVisible = false
                 }
