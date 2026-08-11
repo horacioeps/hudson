@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hudson — a fast, private Mac email client</title>
+<meta name="description" content="Hudson is a free, open-source, Mac-native Gmail client. As fast as Superhuman. Everything stays on your Mac. Bring your own AI key." />
+<link rel="icon" href="hudson-icon.png" />
+<style>
+  :root{
+    --bg:#1C1C1A; --bg-sunken:#171716; --surface:#242422; --border:#32322E;
+    --ink:#ECEAE4; --ink-2:#A29E95; --ink-3:#6E6B64;
+    --accent:#8FB5A5; --accent-ink:#16211D; --brand:#2E5D50;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
+    min-height:100vh; display:flex; flex-direction:column; align-items:center;
+    padding:0 24px;
+  }
+  .serif{font-family:"New York","Iowan Old Style",Georgia,"Times New Roman",serif}
+  main{width:100%; max-width:720px; text-align:center; padding:96px 0 40px}
+
+  .icon{width:112px;height:112px;border-radius:26px;box-shadow:0 18px 50px rgba(0,0,0,.45);display:block;margin:0 auto 32px}
+  h1{font-size:clamp(40px,7vw,60px);line-height:1.05;letter-spacing:-.02em;font-weight:600;margin-bottom:18px}
+  .tagline{font-size:clamp(18px,3vw,22px);color:var(--ink-2);max-width:30ch;margin:0 auto 40px;line-height:1.45}
+
+  .cta{
+    display:inline-flex;align-items:center;gap:10px;
+    background:var(--accent);color:var(--accent-ink);
+    font-weight:600;font-size:17px;text-decoration:none;
+    padding:15px 30px;border-radius:13px;
+    transition:transform .12s ease, filter .12s ease;
+  }
+  .cta:hover{transform:translateY(-1px);filter:brightness(1.05)}
+  .cta svg{width:19px;height:19px}
+  .req{margin-top:14px;font-size:13px;color:var(--ink-3)}
+
+  .badges{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:34px 0 0}
+  .badge{
+    font-size:13px;color:var(--ink-2);background:var(--surface);
+    border:1px solid var(--border);border-radius:999px;padding:7px 15px;
+  }
+
+  .features{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+    gap:22px;text-align:left;margin:76px 0 0;
+  }
+  .feature{background:var(--bg-sunken);border:1px solid var(--border);border-radius:16px;padding:22px}
+  .feature h3{font-size:16px;font-weight:600;margin-bottom:7px;display:flex;align-items:center;gap:9px}
+  .feature .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+  .feature p{font-size:14px;color:var(--ink-2);line-height:1.55}
+
+  footer{
+    width:100%;max-width:720px;margin-top:auto;padding:44px 0;
+    border-top:1px solid var(--border);text-align:center;
+    color:var(--ink-3);font-size:13px;
+    display:flex;gap:22px;justify-content:center;flex-wrap:wrap;
+  }
+  footer a{color:var(--ink-2);text-decoration:none}
+  footer a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+<main>
+  <img class="icon" src="hudson-icon.png" alt="Hudson app icon" width="112" height="112" />
+  <h1 class="serif">Hudson</h1>
+  <p class="tagline">A fast, private email client for your Mac. As quick as Superhuman — but everything stays on your machine.</p>
+
+  <!-- Point href at your hosted DMG (e.g. /downloads/Hudson-0.1.0.dmg). -->
+  <a class="cta" href="Hudson-0.1.0.dmg" download>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>
+    Download for Mac
+  </a>
+  <div class="req">Free forever · macOS 15 or later · Apple Silicon &amp; Intel</div>
+
+  <div class="badges">
+    <span class="badge">Open source</span>
+    <span class="badge">No account, no server</span>
+    <span class="badge">Bring your own AI key</span>
+  </div>
+
+  <div class="features">
+    <div class="feature">
+      <h3><span class="dot"></span>Blazing fast</h3>
+      <p>Keyboard-first, instant search, and a reading pane that opens the moment you land on it. Built native in Swift.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="dot"></span>Private by design</h3>
+      <p>Your mail lives in a local database on your Mac. No Hudson server ever sees it. No ambient AI reading your inbox.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="dot"></span>AI on your terms</h3>
+      <p>Summarize, draft in your voice, and ask — powered by your own Anthropic key or a local model. On only when you turn it on.</p>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <a href="https://github.com/mannasdev/hudson">Source</a>
+  <span>·</span>
+  <span>Free &amp; open source</span>
+  <span>·</span>
+  <span>Made for Gmail</span>
+</footer>
+</body>
+</html>
