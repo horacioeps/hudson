@@ -275,7 +275,8 @@ public enum DemoData {
         .single(id: "t29", hoursAgo: 30, from: cinderpeakBank, subject: "Security alert: new sign-in detected",
                 snippet: "We noticed a new sign-in to your account from a device we don't recognize.",
                 body: "We noticed a new sign-in to your account from a device we don't recognize. "
-                    + "If this was you, no action is needed — otherwise, reset your password.",
+                    + "If this was you, no action is needed — otherwise, reset your password at "
+                    + "https://cinderpeak.example/security right away.",
                 unread: true, category: "CATEGORY_UPDATES"),
         .single(id: "t30", hoursAgo: 39, from: pixelHarborSupport, subject: "Your subscription renews in 7 days",
                 snippet: "Your annual plan renews on the 18th — no changes needed on your end.",
@@ -283,9 +284,25 @@ public enum DemoData {
 
         // MARK: Promotions (CATEGORY_PROMOTIONS) — 5 threads
 
+        // A real HTML newsletter — remote hero image + CTA link — so the demo
+        // exercises the WKWebView path: the image stays BLOCKED behind "Load
+        // remote images" by default, and "Shop the sale" opens in the browser.
         .single(id: "t31", hoursAgo: 6, from: fernwoodMarket, subject: "Late-summer sale: 30% off everything",
-                snippet: "Thirty percent off sitewide, through the weekend only.", unread: true,
-                category: "CATEGORY_PROMOTIONS"),
+                snippet: "Thirty percent off sitewide, through the weekend only.",
+                body: "Late-summer sale: 30% off everything, sitewide, through the weekend only. "
+                    + "Shop the sale at https://fernwood.example/sale",
+                html: "<div style=\"font-family:sans-serif;max-width:520px\">"
+                    + "<h1 style=\"color:#b5651d;margin:0 0 8px\">Late-summer sale</h1>"
+                    + "<p style=\"font-size:16px\"><strong>30% off everything</strong> — "
+                    + "sitewide, through the weekend only.</p>"
+                    + "<img src=\"https://cdn.fernwood.example/hero-summer.jpg\" alt=\"Summer collection\" "
+                    + "width=\"480\" style=\"border-radius:8px;margin:8px 0\">"
+                    + "<p><a href=\"https://fernwood.example/sale\" "
+                    + "style=\"background:#b5651d;color:#fff;padding:10px 18px;border-radius:6px;"
+                    + "text-decoration:none;display:inline-block\">Shop the sale &rarr;</a></p>"
+                    + "<p style=\"color:#888;font-size:12px\">Fernwood Market · 100 Market St · "
+                    + "<a href=\"https://fernwood.example/unsubscribe\">Unsubscribe</a></p></div>",
+                unread: true, category: "CATEGORY_PROMOTIONS"),
         .single(id: "t32", hoursAgo: 15, from: glasswingStudio, subject: "New arrivals just dropped",
                 snippet: "This week's collection is live — first look before it goes to the main site.",
                 category: "CATEGORY_PROMOTIONS"),
@@ -334,6 +351,12 @@ private struct ThreadSeed: Sendable {
         let subject: String
         let snippet: String
         let body: String?
+        /// Optional raw HTML for this message. When present it's stored as the
+        /// message's `raw_html` (with `body` kept as the plain-text fallback),
+        /// so the reading pane exercises the real WKWebView HTML path — remote
+        /// images blocked by default, links clickable. Every URL below is a
+        /// fictional `.example` domain, so nothing actually loads or leaks.
+        let html: String?
         let attachment: AttachmentMeta?
         /// Beyond the automatic "INBOX" (added to every non-SENT message):
         /// "UNREAD", "STARRED", "SENT", or a "CATEGORY_*" id.
@@ -344,12 +367,14 @@ private struct ThreadSeed: Sendable {
 
         init(
             from: String, subject: String, snippet: String, body: String? = nil,
-            attachment: AttachmentMeta? = nil, extraLabels: [String] = [], to: String? = nil
+            html: String? = nil, attachment: AttachmentMeta? = nil, extraLabels: [String] = [],
+            to: String? = nil
         ) {
             self.from = from
             self.subject = subject
             self.snippet = snippet
             self.body = body
+            self.html = html
             self.attachment = attachment
             self.extraLabels = extraLabels
             self.to = to
@@ -365,8 +390,8 @@ private struct ThreadSeed: Sendable {
     /// Convenience for the common one-message thread.
     static func single(
         id: String, hoursAgo: Double, from: String, subject: String, snippet: String,
-        body: String? = nil, attachment: AttachmentMeta? = nil, unread: Bool = false,
-        starred: Bool = false, category: String? = nil
+        body: String? = nil, html: String? = nil, attachment: AttachmentMeta? = nil,
+        unread: Bool = false, starred: Bool = false, category: String? = nil
     ) -> ThreadSeed {
         var labels: [String] = []
         if unread { labels.append("UNREAD") }
@@ -376,7 +401,7 @@ private struct ThreadSeed: Sendable {
             id: id, hoursAgo: hoursAgo,
             messages: [
                 Message(from: from, subject: subject, snippet: snippet, body: body,
-                        attachment: attachment, extraLabels: labels)
+                        html: html, attachment: attachment, extraLabels: labels)
             ])
     }
 
@@ -406,12 +431,16 @@ private struct ThreadSeed: Sendable {
                     fromLine: message.from, toLine: message.to ?? account, subject: message.subject,
                     snippet: message.snippet, labelIDs: labelIDs))
 
-            if let bodyText = message.body {
+            if message.body != nil || message.html != nil {
                 // Build the body through the real sanitizer factory rather than
                 // fabricating a `SanitizedBody` — that keeps the §3.5 invariant
-                // that a `SanitizedBody` only ever comes out of `Sanitizer`. With
-                // `html: nil` this yields exactly the plain-text body we want.
-                let body = Sanitizer.sanitize(html: nil, plainText: bodyText)
+                // that a `SanitizedBody` only ever comes out of `Sanitizer`.
+                // With `html: nil` this yields a plain-text-only body; when a
+                // message provides HTML, the sanitizer keeps the raw HTML and
+                // catalogues its remote URLs, so the reading pane exercises the
+                // real WKWebView path (with `body` as the plain-text fallback).
+                let htmlData = message.html.map { Data($0.utf8) }
+                let body = Sanitizer.sanitize(html: htmlData, plainText: message.body)
                 let attachments = message.attachment.map { [$0] } ?? []
                 bodySaves.append((messageID: messageID, body: body, attachments: attachments))
             }

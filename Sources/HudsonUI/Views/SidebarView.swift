@@ -66,8 +66,10 @@ public struct SidebarView: View {
 
             footer
         }
-        .frame(width: Metrics.sidebarWidth)
-        .frame(maxHeight: .infinity, alignment: .top)
+        // No hard width here anymore — RootView gives the sidebar column a
+        // min/ideal/max via `.navigationSplitViewColumnWidth` so its divider
+        // stays draggable (see the reading-pane resize fix).
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Palette.bgSunken)
     }
 

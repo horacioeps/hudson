@@ -15,6 +15,27 @@ public struct MessageRow: Sendable, Equatable {
     public let labelIDs: [String]
 }
 
+/// A message's derived body content for the reading pane, mirroring what
+/// `saveBody` persisted to `message_bodies`: the sanitized `plainText`, the
+/// raw (sender-authored) `rawHTML` bytes the WKWebView renderer displays, and
+/// the sanitizer's inventories of `remoteURLs`/`cidReferences`. `remoteURLs`
+/// is what the renderer keeps blocked until the user explicitly opts into
+/// loading remote images (Hudson's #1 rule: leak nothing to the network by
+/// default).
+public struct MessageBody: Sendable, Equatable {
+    public let plainText: String?
+    public let rawHTML: Data?
+    public let remoteURLs: [String]
+    public let cidReferences: [String]
+
+    public init(plainText: String?, rawHTML: Data?, remoteURLs: [String], cidReferences: [String]) {
+        self.plainText = plainText
+        self.rawHTML = rawHTML
+        self.remoteURLs = remoteURLs
+        self.cidReferences = cidReferences
+    }
+}
+
 extension HudsonDatabase {
     /// Newest-first message list. Reads SQLite only — never the network (§4 invariant 3).
     public func recentMessages(account: String, limit: Int) async throws -> [MessageRow] {
@@ -46,6 +67,39 @@ extension HudsonDatabase {
                 arguments: [account, id])
             return (row, text)
         }
+    }
+
+    /// The full stored body for one message, or `nil` when none is hydrated
+    /// yet. Unlike `message(id:)` (which returns only the sanitized plain
+    /// text), this carries everything the reading pane's HTML renderer needs:
+    /// the raw, still-sender-authored HTML bytes, plus the inventories of
+    /// remote/cid references the sanitizer catalogued so the renderer can
+    /// enforce Hudson's remote-blocking privacy rule. Reads SQLite only —
+    /// never the network (§4 invariant 3).
+    public func messageBody(id: String, account: String) async throws -> MessageBody? {
+        try await writer.read { db in
+            guard let raw = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT plain_text, raw_html, remote_urls, cid_references
+                    FROM message_bodies WHERE account_email = ? AND message_id = ?
+                    """,
+                arguments: [account, id]) else { return nil }
+            return MessageBody(
+                plainText: raw["plain_text"],
+                rawHTML: raw["raw_html"],
+                remoteURLs: Self.decodeStringArray(raw["remote_urls"]),
+                cidReferences: Self.decodeStringArray(raw["cid_references"]))
+        }
+    }
+
+    /// Decodes a `[String]` from the JSON text `saveBody` stored it as (a
+    /// `JSONEncoder`-encoded `[String]`), so the round-trip is lossless. A
+    /// `nil`, empty, or corrupt value yields `[]` rather than throwing —
+    /// a malformed inventory must never block reading an otherwise-good body.
+    static func decodeStringArray(_ json: String?) -> [String] {
+        guard let json, let data = json.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
     }
 
     static func messageRow(from raw: Row, account: String, db: Database) throws -> MessageRow {

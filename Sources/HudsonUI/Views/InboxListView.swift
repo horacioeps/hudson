@@ -22,8 +22,10 @@ public struct InboxListView: View {
             Rectangle().fill(Palette.border).frame(height: 1)
             list
         }
-        .frame(width: Metrics.listWidth)
-        .frame(maxHeight: .infinity, alignment: .top)
+        // No hard width here anymore — the reading pane must be resizable, so
+        // the split divider (not this view) owns the column width. RootView
+        // sets a min/ideal/max via `.navigationSplitViewColumnWidth`.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Palette.bgApp)
         // `activeSplit` starts `nil` ("whole inbox", per `InboxModel`'s doc
         // comment) but the tab strip has no dedicated "whole inbox" tab —
@@ -81,10 +83,19 @@ public struct InboxListView: View {
                 row: Self.emailRowData(from: threadRow),
                 isSelected: inbox.selectedThreadID == threadRow.threadID,
                 isUnread: threadRow.unread)
+                // The ENTIRE row rectangle must open the thread, not just the
+                // glyphs. An unread/unselected row's background is `.clear`,
+                // and under `.buttonStyle(.plain)` a transparent label only
+                // hit-tests where it actually draws — so a click in the empty
+                // gutter to the right of the snippet, or in the vertical
+                // padding, would miss. Filling the width and stamping a
+                // rectangular content shape on the LABEL itself (not the outer
+                // Button, where it wouldn't affect the label's own hit region)
+                // makes every pixel of the 72pt row a valid tap target.
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
         .onAppear {
             guard threadRow.threadID == inbox.rows.last?.threadID else { return }
             // TODO(pagination): `InboxModel.rows` comes from a fixed-limit
