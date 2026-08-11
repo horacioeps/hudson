@@ -111,6 +111,15 @@ public struct RootView: View {
                 }
             }
 
+            if model.isSettingsVisible {
+                overlay {
+                    SettingsView(
+                        settings: model.settings, onClose: { model.isSettingsVisible = false })
+                } onDismiss: {
+                    model.isSettingsVisible = false
+                }
+            }
+
             sentUndoToast(model)
         }
         // Invisible — installs the app-wide `NSEvent` monitor that drives
@@ -136,6 +145,7 @@ public struct RootView: View {
                 selection: model.sidebarSelection,
                 onSelect: { model.selectFolder($0) },
                 onSyncNow: { Task { await model.syncNow() } },
+                onSettings: { model.isSettingsVisible = true },
                 onCompose: { model.composeNew() })
                 .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)
 
