@@ -53,8 +53,15 @@ private func collectText(_ stream: AsyncThrowingStream<String, Error>) async thr
     try await db.saveBody(
         messageID: "m1", account: account,
         body: Sanitizer.sanitize(html: nil, plainText: "Are you free for lunch Friday?"))
-    try await optIn(db, feature: .voiceProfile, model: "claude-sonnet-5")
-    try await optIn(db, feature: .draft, model: "claude-sonnet-5")
+    // Deliberately DIFFERENT models for `.voiceProfile` vs `.draft`: proves
+    // `Draft.resolvedModel()` reads `.draft`'s own `ai_config` row rather than
+    // `.voiceProfile`'s. If it were regressed to consult `.voiceProfile`'s
+    // config instead, `provider.lastRequest?.model` below would come back
+    // `voiceProfileModel`, not `draftModel`, and the assertion would fail.
+    let voiceProfileModel = "claude-haiku-5"
+    let draftModel = "claude-opus-5"
+    try await optIn(db, feature: .voiceProfile, model: voiceProfileModel)
+    try await optIn(db, feature: .draft, model: draftModel)
     // ScriptedProvider replays the SAME script for both the voice-profile
     // distillation call and the draft's own generation call — the assertions
     // below inspect `lastRequest`, i.e. the LAST call (the draft itself).
@@ -81,7 +88,10 @@ private func collectText(_ stream: AsyncThrowingStream<String, Error>) async thr
     #expect(promptText.contains("Voice profile:\nSure, Friday works."))
     #expect(promptText.contains("Are you free for lunch Friday?"))  // thread being replied to
     #expect(promptText.contains("say yes and suggest noon"))  // instruction
-    #expect(provider.lastRequest?.model == "claude-sonnet-5")
+    // Proves `Draft.resolvedModel()` resolved `.draft`'s OWN `ai_config` row —
+    // not `.voiceProfile`'s (`voiceProfileModel`), which is what the earlier
+    // distillation call used instead.
+    #expect(provider.lastRequest?.model == draftModel)
 }
 
 /// A new email (no `replyTo`) skips the thread lookup entirely — only the
