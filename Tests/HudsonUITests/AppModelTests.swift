@@ -1,6 +1,7 @@
 import Foundation
 import GmailKit
 import Store
+import Synchronization
 import Testing
 @testable import HudsonUI
 
@@ -392,6 +393,88 @@ import Testing
     #expect(model.keyboardContext == .list)
     model.isComposerVisible = true
     #expect(model.keyboardContext == .composer)
+}
+
+// MARK: - hydrateBody wiring (reading-pane on-demand hydration's Keychain seam)
+
+/// A `TokenStore` double that records every `clientSecret` lookup —
+/// otherwise behaves exactly like `InMemoryTokenStore` (delegates to one
+/// internally). No secret is ever saved for any account, so every lookup
+/// legitimately returns `nil` — `SyncBootstrap.makeHydrator` then bails out
+/// (its own documented "no stored credentials" contract) well before it
+/// would ever attempt a real network call. `Synchronization.Mutex` (not a
+/// plain array) because `clientSecret` is called from `LazyHydrator`, an
+/// actor, so this double must itself be safe to call from any isolation
+/// domain — matches `InMemoryTokenStore`'s own use of `Mutex`.
+private final class RecordingTokenStore: TokenStore {
+    private let inner = InMemoryTokenStore()
+    private let calls = Mutex<[String]>([])
+
+    var clientSecretCalls: [String] { calls.withLock { $0 } }
+
+    func saveTokens(_ tokens: TokenSet, account: String) throws {
+        try inner.saveTokens(tokens, account: account)
+    }
+    func tokens(account: String) throws -> TokenSet? { try inner.tokens(account: account) }
+    func saveClientSecret(_ secret: String, account: String) throws {
+        try inner.saveClientSecret(secret, account: account)
+    }
+    func clientSecret(account: String) throws -> String? {
+        calls.withLock { $0.append(account) }
+        return try inner.clientSecret(account: account)
+    }
+    func deleteAll(account: String) throws { try inner.deleteAll(account: account) }
+}
+
+/// The regression this guards against: `AppModel.makeHydrateBody` used to
+/// ignore the initializer's injectable `tokenStore` entirely, always
+/// defaulting `SyncBootstrap.makeHydrator`'s own `store:` parameter to a
+/// FRESH `KeychainTokenStore()` — so every non-nil-account `AppModel`
+/// construction performed an unconditional, real Keychain lookup at INIT
+/// time regardless of what was injected (CI must never touch the real
+/// Keychain, spec §6.3). Two things must now hold: (1) construction alone
+/// makes NO `clientSecret` lookup at all — the hydrator's stack is built
+/// lazily, on the FIRST on-demand fetch a reading pane actually triggers,
+/// not on every `AppModel` construction (mirrors `ComposerModel
+/// .makeService` deferring to send()-time; see `LazyHydrator`'s doc
+/// comment) — and (2) when a fetch IS triggered, it reads through THIS
+/// injected store, never a fresh default.
+@MainActor
+@Test func hydrateBodyIsBuiltLazilyFromTheInjectedTokenStoreNotARealKeychainAtInit() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let email = "you@hudson.app"
+    try await db.upsertAccount(email: email, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "tk-m0", threadID: "tk", historyID: 1, internalDate: 1000,
+            fromLine: "Ada Lovelace <ada@example.com>", toLine: email,
+            subject: "Not hydrated yet", snippet: "sn", labelIDs: ["INBOX"]),
+        account: email)
+    // Deliberately no `saveBody` — a body-less row, exactly the shape that
+    // drives `ThreadModel`'s on-demand `hydrateBody` fallback.
+
+    let recordingStore = RecordingTokenStore()
+    let account = try await db.account(email: email)
+    let model = AppModel(database: db, account: account, tokenStore: recordingStore)
+
+    // (1) Construction alone must never touch the token store.
+    #expect(recordingStore.clientSecretCalls.isEmpty)
+
+    // (2) Opening the thread auto-expands its sole (newest) message, which
+    // has no local body — driving `ThreadModel` to fall back to
+    // `hydrateBody`, which must now read through `recordingStore`.
+    model.openThread("tk")
+    for _ in 0..<80 where recordingStore.clientSecretCalls.isEmpty {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+
+    #expect(recordingStore.clientSecretCalls == [email])
+    // No secret was ever saved, so the hydrator stack never actually
+    // builds — the message legitimately stays uncached, exactly the
+    // "no stored credentials" contract `ThreadModelTests`'
+    // `nilHydrateBodyLeavesABodylessMessageUncached` already covers for a
+    // `nil` hydrateBody.
+    #expect(model.thread.messages.first?.bodyText == nil)
 }
 
 // MARK: - disconnectAccount() — "Disconnect account" (Task 5)
