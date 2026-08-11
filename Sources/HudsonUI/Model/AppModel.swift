@@ -19,6 +19,10 @@ public final class AppModel {
     public let thread: ThreadModel
     public let command: CommandModel
     public let search: SearchModel
+    public let settings: SettingsModel
+
+    /// Whether the Settings sheet (AI setup) is showing.
+    public var isSettingsVisible = false
     public let composer: ComposerModel
 
     /// The Summarize chip's view model for the OPEN thread. Reset on every
@@ -88,6 +92,7 @@ public final class AppModel {
         self.thread = ThreadModel(database: database, account: email)
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
+        self.settings = SettingsModel(database: database, account: email)
         self.composer = ComposerModel(database: database, account: account)
         self.summary = SummaryModel(database: database, account: email)
         await inbox.start()
@@ -112,6 +117,7 @@ public final class AppModel {
         self.thread = ThreadModel(database: database, account: email)
         self.command = CommandModel()
         self.search = SearchModel(database: database, account: email)
+        self.settings = SettingsModel(database: database, account: email)
         self.composer = ComposerModel(database: database, account: account)
         self.summary = SummaryModel(database: database, account: email)
         let inbox = self.inbox
@@ -356,10 +362,10 @@ public final class AppModel {
     /// event — derived, never stored, so it can never drift from the
     /// overlay flags that actually drive what's on screen.
     var keyboardContext: KeyboardContext {
-        // The composer is a text-entry modal — it takes keyboard priority so
-        // the list's single-letter triage shortcuts never eat characters you're
-        // typing into an email.
-        if isComposerVisible { return .composer }
+        // The composer AND settings are text-entry modals — they take keyboard
+        // priority so the list's single-letter triage shortcuts never eat
+        // characters you're typing (into an email, an API key, a base URL, …).
+        if isComposerVisible || isSettingsVisible { return .composer }
         if isPaletteVisible { return .palette }
         if isSearchVisible { return .search }
         return .list
@@ -385,7 +391,9 @@ public final class AppModel {
         case .togglePalette: togglePalette()
         case .toggleSearch: toggleSearch()
         case .composeNew: composeNew()
-        case .closeComposer: isComposerVisible = false
+        case .closeComposer:
+            // Esc closes whichever text-entry modal is open.
+            if isSettingsVisible { isSettingsVisible = false } else { isComposerVisible = false }
         }
     }
 
