@@ -52,7 +52,7 @@ let package = Package(
         .target(name: "Outbox", dependencies: ["GmailKit", "Store"]),
         .testTarget(
             name: "OutboxTests",
-            dependencies: ["Outbox"],
+            dependencies: ["Outbox", "Store"],
             resources: [.copy("Golden")]
         ),
     ]
