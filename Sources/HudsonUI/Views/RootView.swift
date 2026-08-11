@@ -133,21 +133,8 @@ public struct RootView: View {
                 pendingCount: model.pendingCount,
                 isSyncing: model.isSyncing,
                 syncBanner: model.syncBanner,
-                // Only "Inbox" is wired to a real Store-backed filter this
-                // milestone; pinning the highlight there avoids a misleading
-                // "selected but does nothing" affordance for the rest.
-                selection: .inbox,
-                onSelect: { selection in
-                    switch selection {
-                    case .inbox:
-                        model.inbox.activeSplit = nil
-                    case .starred, .snoozed, .sent, .label:
-                        // Non-functional this milestone (no Store query backs
-                        // them yet) — a deliberate gap, like ThreadView's
-                        // AI-summary placeholder.
-                        break
-                    }
-                },
+                selection: model.sidebarSelection,
+                onSelect: { model.selectFolder($0) },
                 onSyncNow: { Task { await model.syncNow() } },
                 onCompose: { model.composeNew() })
                 .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)

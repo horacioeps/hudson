@@ -153,3 +153,38 @@ import Testing
     #expect(model.rows.isEmpty)
     #expect(model.tabs == [SplitTab(key: "primary", title: "Primary", count: 0)])
 }
+
+/// Switching to a label folder (Starred/Sent/…) loads the threads carrying
+/// that label, drops the split-tab strip, and shows the folder title — the
+/// sidebar folders the user reported as dead.
+@MainActor
+@Test func labelFolderLoadsThreadsAndDropsSplitTabs() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: "you@hudson.app")
+    let model = InboxModel(database: db, account: "you@hudson.app")
+    await model.start()
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(model.showsSplitTabs)            // inbox mode by default
+    let inboxCount = model.rows.count
+
+    model.mailbox = .label(id: "STARRED", title: "Starred")
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(!model.showsSplitTabs)           // a flat label folder
+    #expect(model.folderTitle == "Starred")
+    #expect(!model.rows.isEmpty)             // demo seeds starred threads
+    #expect(model.rows.count != inboxCount)  // a genuinely different set
+
+    // Every row in the Starred folder actually carries STARRED (verifies the
+    // Store query, not just that *some* rows came back).
+    for row in model.rows {
+        let labels = try await db.threadMessages(threadID: row.threadID, account: "you@hudson.app")
+            .flatMap(\.labelIDs)
+        #expect(labels.contains("STARRED"))
+    }
+
+    // Back to the inbox restores the split view.
+    model.mailbox = .inbox
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(model.showsSplitTabs)
+    #expect(model.folderTitle == "Inbox")
+}

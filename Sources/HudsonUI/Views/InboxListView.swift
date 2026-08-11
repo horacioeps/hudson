@@ -18,7 +18,7 @@ public struct InboxListView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            tabStrip
+            header
             Rectangle().fill(Palette.border).frame(height: 1)
             list
         }
@@ -37,6 +37,24 @@ public struct InboxListView: View {
             if inbox.activeSplit == nil {
                 inbox.activeSplit = "primary"
             }
+        }
+    }
+
+    /// The inbox shows its split-tab strip; a label folder (Sent/Starred/…)
+    /// shows a plain title header instead.
+    @ViewBuilder
+    private var header: some View {
+        if inbox.showsSplitTabs {
+            tabStrip
+        } else {
+            HStack {
+                Text(inbox.folderTitle)
+                    .font(Typography.ui(13, .semibold))
+                    .foregroundStyle(Palette.ink)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, Metrics.unit * 3)
+            .padding(.vertical, Metrics.unit * 3)
         }
     }
 
@@ -61,13 +79,23 @@ public struct InboxListView: View {
         (inbox.activeSplit ?? "primary") == tab.key
     }
 
+    @ViewBuilder
     private var list: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(inbox.rows, id: \.threadID) { threadRow in
-                    row(for: threadRow)
-                    if threadRow.threadID != inbox.rows.last?.threadID {
-                        Rectangle().fill(Palette.border).frame(height: 1)
+        if inbox.rows.isEmpty {
+            VStack {
+                Text("No messages here")
+                    .font(Typography.ui(13))
+                    .foregroundStyle(Palette.inkTertiary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(inbox.rows, id: \.threadID) { threadRow in
+                        row(for: threadRow)
+                        if threadRow.threadID != inbox.rows.last?.threadID {
+                            Rectangle().fill(Palette.border).frame(height: 1)
+                        }
                     }
                 }
             }

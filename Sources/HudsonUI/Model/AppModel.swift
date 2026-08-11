@@ -60,6 +60,10 @@ public final class AppModel {
     /// (wired in both initializers below) — see `wireComposerDismissal`.
     public var isComposerVisible = false
 
+    /// Which sidebar folder is selected — drives the sidebar highlight and the
+    /// inbox list's `mailbox`. `RootView` reads this for `SidebarView(selection:)`.
+    public private(set) var sidebarSelection: SidebarView.Selection = .inbox
+
     /// A user-visible strip for app-level sync state (offline, no account
     /// connected, a failed pass) — `nil` when there's nothing to show.
     /// Never blocks reading/triage: this is purely informational.
@@ -223,6 +227,21 @@ public final class AppModel {
     /// Void` and `SearchView`'s `onOpen`) — `thread.open` is async, so it
     /// runs in its own `Task`; `ThreadModel.open` doesn't wait for its
     /// first emission either (see its doc comment), so this doesn't need to.
+    /// Maps a sidebar tap to the inbox list's folder. Sent/Starred and user
+    /// labels are "threads carrying label X"; Inbox is the split view. Snoozed
+    /// points at the `Hudson/Snoozed` label — empty until M6 adds snoozing.
+    public func selectFolder(_ selection: SidebarView.Selection) {
+        sidebarSelection = selection
+        switch selection {
+        case .inbox: inbox.mailbox = .inbox
+        case .starred: inbox.mailbox = .label(id: "STARRED", title: "Starred")
+        case .sent: inbox.mailbox = .label(id: "SENT", title: "Sent")
+        case .snoozed: inbox.mailbox = .label(id: "Hudson/Snoozed", title: "Snoozed")
+        case .label(let id):
+            inbox.mailbox = .label(id: id, title: labels.first { $0.id == id }?.name ?? "Label")
+        }
+    }
+
     public func openThread(_ threadID: String) {
         inbox.selectedThreadID = threadID
         // Drop the previous thread's summary so the chip resets to its
