@@ -45,6 +45,10 @@ public final class AppModel {
     public private(set) var totalUnread: Int = 0
     private var unreadCountTask: Task<Void, Never>?
 
+    /// The background auto-sync loop (see `startAutoSync`). Kept so it can be
+    /// cancelled in `deinit` and so `startAutoSync` is idempotent.
+    private var autoSyncTask: Task<Void, Never>?
+
     /// Whether the ⌘K command palette overlay is showing.
     public var isPaletteVisible = false
     /// Whether the ⌘F/`/` search overlay is showing.
@@ -150,6 +154,7 @@ public final class AppModel {
     isolated deinit {
         pendingCountTask?.cancel()
         unreadCountTask?.cancel()
+        autoSyncTask?.cancel()
     }
 
     private func subscribeToPendingCount() {
@@ -360,11 +365,49 @@ public final class AppModel {
         }
     }
 
-    // MARK: - Sync (the ONLY network path in the app — see Privacy #1: user-initiated, never automatic)
+    // MARK: - Sync (mail poll/flush — machine<->Gmail direct, no server; see Privacy #1)
+
+    /// Background auto-sync: on launch and every `interval`, quietly pull new
+    /// mail (a cheap Gmail history poll, ~2 quota units) and flush queued
+    /// triage/sends — so the mailbox stays live WITHOUT the user pressing "Sync
+    /// now". This is NOT a Privacy-#1 departure: it fetches the user's OWN mail
+    /// directly (machine <-> Gmail, no server, no middleman). Privacy #1 bans
+    /// *AI-content* egress and background *AI* (no summarize-on-scroll), not
+    /// being an email client. Deliberately QUIET — it never touches
+    /// `isSyncing`/`syncBanner` (those are the manual button's UI feedback); a
+    /// failed pass just waits for the next tick. Idempotent (guards on the
+    /// task) and a no-op under `--demo`/no-creds (the stack is nil, so it
+    /// returns before any network call). Started by `RootView` once the real
+    /// model has loaded; cancelled in `deinit`.
+    // Internal (not public): `SyncStack` is an internal UI seam, and the only
+    // callers are `RootView` (same module) and tests (`@testable`).
+    func startAutoSync(
+        interval: Duration = .seconds(30),
+        makeStack: (@Sendable () -> SyncStack?)? = nil
+    ) {
+        guard autoSyncTask == nil, let account else { return }
+        let database = self.database
+        // `makeStack` is injectable so tests stay hermetic (the default hits
+        // the Keychain via `SyncBootstrap`; a test passes a fake).
+        let make = makeStack ?? { SyncBootstrap.makeStack(database: database, account: account) }
+        autoSyncTask = Task { [weak self] in
+            guard let stack = make() else { return }
+            while !Task.isCancelled {
+                _ = try? await stack.engine.syncOnce()
+                _ = try? await stack.flusher.flushOnce()
+                await self?.refreshLabels()
+                try? await Task.sleep(for: interval)
+            }
+        }
+    }
+
+    /// Test seam: whether the background auto-sync loop is running.
+    var isAutoSyncActive: Bool { autoSyncTask != nil }
 
     /// Wired to the sidebar footer's "Sync now" button (`RootView` ->
-    /// `SidebarView.onSyncNow`) — per Privacy #1 this stays the ONLY way
-    /// sync ever runs; it is never called automatically (e.g. on launch).
+    /// `SidebarView.onSyncNow`) — a MANUAL "refresh right now" override on top
+    /// of the automatic `startAutoSync` loop above. Surfaces a banner on the
+    /// no-account / failure paths (the auto loop stays silent).
     ///
     /// Best-effort and fully guarded: builds the network stack from the
     /// Keychain (mirrors `HudsonCLI/Runtime.bootstrap()`, via
