@@ -181,7 +181,7 @@ public final class AppModel {
             return
         }
         isPaletteVisible = false
-        search.query = ""
+        search.reset()
         isSearchVisible = true
     }
 
@@ -203,7 +203,7 @@ public final class AppModel {
         case .toggleRead:
             Task { try? await self.inbox.toggleReadSelected() }
         case .openSearch:
-            search.query = ""
+            search.reset()
             isSearchVisible = true
         case .switchSplit(let key):
             inbox.activeSplit = key

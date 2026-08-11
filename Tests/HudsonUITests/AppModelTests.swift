@@ -52,6 +52,34 @@ import Testing
     #expect(model.search.query.isEmpty)
 }
 
+/// The stale-hits regression (whole-branch review): after a search leaves
+/// real results, closing and REOPENING the search overlay must show an empty
+/// field with NO leftover results — `AppModel` resets the query directly, so
+/// it must clear `hits` too (via `SearchModel.reset()`), not just the text.
+@MainActor
+@Test func reopeningSearchClearsPreviousQuerysHits() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let model = AppModel(database: db, account: try await db.primaryAccount())
+    try await Task.sleep(for: .milliseconds(50))
+
+    // Open search, run a real query, let results land. AppModel builds the
+    // SearchModel with the production 150ms debounce (not injectable here), so
+    // wait comfortably past it before asserting the precondition holds.
+    model.toggleSearch()
+    model.search.query = "denver"
+    model.search.queryChanged()
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(!model.search.hits.isEmpty)  // precondition: a prior search left results
+
+    model.toggleSearch()  // close
+    model.toggleSearch()  // reopen — must be a clean slate
+
+    #expect(model.search.query.isEmpty)
+    #expect(model.search.hits.isEmpty)
+    #expect(!model.search.isSearching)
+}
+
 // MARK: - perform(_:) — palette command dispatch
 
 @MainActor

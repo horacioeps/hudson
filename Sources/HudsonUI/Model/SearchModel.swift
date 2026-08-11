@@ -75,6 +75,20 @@ public final class SearchModel {
         self.debounce = debounce
     }
 
+    /// Clears the search back to its initial empty state — query, results,
+    /// and spinner — and cancels any in-flight search. Call this when the
+    /// search overlay is (re)opened: `AppModel` resets `query` directly rather
+    /// than through a keystroke, so without also clearing `hits` a fresh mount
+    /// would show the PREVIOUS query's results under an empty field (the
+    /// `query`→`hits` dependency that `queryChanged()` maintains is otherwise
+    /// left stale until the next keystroke).
+    public func reset() {
+        searchTask?.cancel()
+        query = ""
+        hits = []
+        isSearching = false
+    }
+
     /// `isolated` (SE-0371) because `searchTask` is `@MainActor`-isolated
     /// storage — a plain `nonisolated deinit` can't touch it without an
     /// unsafe escape hatch. Only cancels the in-flight task; nothing else

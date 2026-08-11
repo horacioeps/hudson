@@ -66,3 +66,26 @@ private let testDebounce: Duration = .milliseconds(10)
     #expect(model.hits.allSatisfy { $0.subject.contains("Denver") || $0.snippet.contains("Denver") })
     #expect(!model.isSearching)
 }
+
+/// `reset()` returns the model to its empty initial state — the fix for the
+/// stale-hits bug where reopening the search overlay showed the PREVIOUS
+/// query's results under a blank field (`AppModel` resets `query` directly,
+/// so `hits` must be cleared alongside it). Search first, prove there are
+/// hits, then `reset()` and prove everything is cleared.
+@MainActor
+@Test func resetClearsQueryHitsAndSpinner() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: "you@hudson.app")
+    let model = SearchModel(database: db, account: "you@hudson.app", debounce: testDebounce)
+
+    model.query = "den"
+    model.queryChanged()
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(!model.hits.isEmpty)  // precondition: a prior search left results
+
+    model.reset()
+
+    #expect(model.query.isEmpty)
+    #expect(model.hits.isEmpty)
+    #expect(!model.isSearching)
+}
