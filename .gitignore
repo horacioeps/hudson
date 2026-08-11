@@ -4,3 +4,10 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 .swiftpm/
+
+# Local dev scratch — never commit
+.worktrees/
+.superpowers/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
