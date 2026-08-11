@@ -298,7 +298,7 @@ public struct ThreadView: View {
                     .font(Typography.ui(13, .semibold))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
-                Text(message.row.snippet)
+                Text(HTMLEntities.decode(message.row.snippet))
                     .font(Typography.ui(13))
                     .foregroundStyle(Palette.inkSecondary)
                     .lineLimit(1)

@@ -157,7 +157,7 @@ public struct SearchView: View {
                     .font(Typography.ui(12))
                     .foregroundStyle(Palette.inkSecondary)
                     .lineLimit(1)
-                Text(hit.snippet)
+                Text(HTMLEntities.decode(hit.snippet))
                     .font(Typography.ui(12))
                     .foregroundStyle(Palette.inkSecondary)
                     .lineLimit(1)

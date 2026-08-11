@@ -141,7 +141,8 @@ public struct InboxListView: View {
 
     static func emailRowData(from row: ThreadRow) -> EmailRowData {
         EmailRowData(
-            fromSummary: row.fromSummary, subject: row.subject, snippet: row.snippet,
+            fromSummary: row.fromSummary, subject: row.subject,
+            snippet: HTMLEntities.decode(row.snippet),
             timeText: formattedTime(epochMilliseconds: row.lastMessageAt),
             hasAttachment: row.hasAttachment, category: row.category, unread: row.unread)
     }
