@@ -103,6 +103,35 @@ private func matchCount(_ db: HudsonDatabase, _ query: String) async throws -> I
     #expect(try await matchCount(db, "quarter*") == 0)
 }
 
+// MARK: - M5 Task 7 carry-forward: reindexBody must not allocate an orphan seq
+
+@Test func reindexBodyDoesNotAllocateASeqForAMessageThatNoLongerExists() async throws {
+    let db = try HudsonDatabase.inMemory()
+    // `reindexBody`'s "message row is gone" guard is unreachable via its
+    // only real caller, `saveBody`: `message_bodies`' FK to `messages`
+    // (enforced — `foreignKeysEnabled = true`) would already abort that
+    // same transaction's `INSERT INTO message_bodies` before `reindexBody`
+    // ever ran, so the scenario its doc comment describes ("deleted between
+    // hydration fetch and save") can't reach this guard THROUGH saveBody.
+    // Exercised directly instead — the guard is still worth having
+    // defensively (a hypothetical future caller with no such FK ahead of
+    // it), and this is the only way to actually drive the branch.
+    try await db.writer.write { conn in
+        try FTSIndex.reindexBody(messageID: "ghost", account: "x", plainText: "late body", db: conn)
+    }
+    let seqCount = try await db.writer.read { conn in
+        try Int.fetchOne(
+            conn, sql: "SELECT COUNT(*) FROM message_seq WHERE account_email = ? AND message_id = ?",
+            arguments: ["x", "ghost"]) ?? -1
+    }
+    // Before the fix: `seq(for:)` runs FIRST (allocating a message_seq row
+    // for "ghost") and only THEN does the existence check fail and return
+    // early — leaving that row orphaned with no fts_messages entry and no
+    // further cleanup call. After: the existence check runs first, so a
+    // miss never allocates anything.
+    #expect(seqCount == 0)
+}
+
 // MARK: - Reused rowid: seq() is a stable lookup-or-allocate, not a fresh id per call
 
 @Test func seqIsStableAcrossRepeatedInsertsOfTheSameMessage() async throws {
