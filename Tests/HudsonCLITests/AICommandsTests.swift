@@ -191,6 +191,18 @@ private final class Capture: @unchecked Sendable {
     #expect(!out.contains("\u{1B}"))
 }
 
+/// Regression test for a review finding: a COMPLETE escape sequence
+/// immediately followed by more plain text, all in ONE fed chunk, must not
+/// be held back waiting for a new ESC/`finish()`/the 128-char cap — only the
+/// text from the LAST unterminated ESC onward should ever be withheld, and
+/// here there is no such unterminated tail at all.
+@Test func sanitizerDoesNotHoldBackPlainTextAfterACompleteEscapeInTheSameChunk() {
+    var sanitizer = TerminalStreamSanitizer()
+    let out = sanitizer.feed("before \u{1B}[31mred more plain text after the reset ... here")
+    #expect(out == "before red more plain text after the reset ... here")
+    #expect(!out.contains("\u{1B}"))
+}
+
 @Test func sanitizerDoesNotBufferForeverAfterAStrayEscape() {
     var sanitizer = TerminalStreamSanitizer()
     _ = sanitizer.feed("stray \u{1B}")
@@ -334,4 +346,55 @@ private final class Capture: @unchecked Sendable {
     let decoded = AIProviderConfig.decode(config?.baseURL)
     #expect(decoded.kind == .openaiCompat)
     #expect(decoded.baseURLOverride == URL(string: "http://localhost:11434/v1"))
+}
+
+/// Regression test for a review finding: `--base-url` is documented as
+/// "Ignored for anthropic" — passing one alongside `--provider anthropic`
+/// must NOT silently persist an override that would reroute Anthropic
+/// egress (and the real API key) to an attacker/typo-supplied host. See
+/// `AIConfigCommand.execute`'s doc comment.
+@Test func aiConfigExecuteIgnoresBaseURLForAnthropic() async throws {
+    let (database, local) = try await makeLocalRuntime()
+    let keyStore = InMemoryLLMKeyStore()
+
+    try await AIConfigCommand.execute(
+        feature: .summarize, provider: .anthropic, model: "claude-haiku-4-5",
+        baseURL: "http://example.com", apiKey: nil, optIn: true, local: local, keyStore: keyStore)
+
+    let config = try await database.aiConfig(feature: "summarize", account: account)
+    #expect(
+        AIProviderConfig.decode(config?.baseURL)
+            == AIProviderConfig(kind: .anthropic, baseURLOverride: nil))
+}
+
+/// Type-level guarantee, independent of `AIConfigCommand.execute`'s own
+/// gating: even a hand-constructed/hand-edited `AIProviderConfig` carrying
+/// an anthropic override must build a provider that actually talks to the
+/// real Anthropic endpoint, never the override — the second, defense-in-
+/// depth half of the fix (`AIProviderConfig.buildProvider`'s `.anthropic`
+/// case takes no `baseURLOverride` branch at all).
+@Test func providerConfigBuildProviderIgnoresAnthropicOverride() async throws {
+    let config = AIProviderConfig(
+        kind: .anthropic, baseURLOverride: URL(string: "http://example.com"))
+    let http = RecordingLLMHTTP()
+    let provider = config.buildProvider(http: http, apiKey: "sk-test")
+
+    let request = LLMRequest(model: "claude-haiku-4-5", system: nil, messages: [], maxTokens: 100)
+    for try await _ in provider.stream(request) {}
+
+    #expect(http.lastRequest?.url?.host == "api.anthropic.com")
+    #expect(http.lastRequest?.url?.host != "example.com")
+}
+
+/// Minimal `LLMHTTP` double that records the last `URLRequest` it was asked
+/// to stream — no scripted response needed, since these tests only assert
+/// on WHERE the request went (`buildProvider`'s job), not on any parsed
+/// response.
+private final class RecordingLLMHTTP: LLMHTTP, @unchecked Sendable {
+    private(set) var lastRequest: URLRequest?
+
+    func stream(_ request: URLRequest) async throws -> AsyncThrowingStream<Data, Error> {
+        lastRequest = request
+        return AsyncThrowingStream { $0.finish() }
+    }
 }

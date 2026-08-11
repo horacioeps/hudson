@@ -90,8 +90,15 @@ struct AIProviderConfig: Equatable {
     func buildProvider(http: any LLMHTTP, apiKey: String) -> any LLMProvider {
         switch kind {
         case .anthropic:
-            guard let baseURLOverride else { return AnthropicProvider(http: http, apiKey: apiKey) }
-            return AnthropicProvider(http: http, apiKey: apiKey, baseURL: baseURLOverride)
+            // `baseURLOverride` is never honored for anthropic — see
+            // `AIConfigCommand`'s `--base-url` help text ("Ignored for
+            // anthropic"). `AIConfigCommand.execute` already refuses to
+            // encode an override for this provider, but ignoring it here too
+            // makes the "ignored" contract hold as a property of THIS type,
+            // not merely of one caller — even a hand-edited `ai_config` row
+            // (e.g. `"anthropic|https://evil.example"`) can never reroute
+            // Anthropic egress or leak the API key to an unexpected host.
+            return AnthropicProvider(http: http, apiKey: apiKey)
         case .openaiCompat:
             guard let baseURLOverride else { return OpenAICompatProvider(http: http, apiKey: apiKey) }
             return OpenAICompatProvider(http: http, apiKey: apiKey, baseURL: baseURLOverride)
@@ -244,7 +251,13 @@ struct TerminalStreamSanitizer {
     /// Splits `text` into a safe-to-flush prefix and a held-back suffix
     /// starting at the LAST escape (`ESC`, `\x1B`) introducer that is not
     /// yet a complete, terminated CSI/OSC sequence. Returns the whole string
-    /// as `safe` with an empty `held` when there is no such trailing tail.
+    /// as `safe` with an empty `held` when there is no such trailing tail —
+    /// which includes the case where `tail` is a complete escape sequence
+    /// immediately followed by MORE plain text (e.g. `"\x1B[31mred more"`):
+    /// `lastEscape` is by construction the last ESC anywhere in `text`, so
+    /// once a complete sequence is found starting there, everything from its
+    /// terminator to the end of `text` is guaranteed escape-free and safe to
+    /// flush now rather than held back for no reason.
     private static func split(_ text: String) -> (safe: String, held: String) {
         guard let lastEscape = text.lastIndex(of: "\u{1B}") else { return (text, "") }
         let tail = String(text[lastEscape...])
@@ -252,16 +265,21 @@ struct TerminalStreamSanitizer {
         return (String(text[text.startIndex..<lastEscape]), tail)
     }
 
-    /// Whether `tail` (starting at an `ESC`) is ALREADY a complete,
+    /// Whether `tail` (starting at an `ESC`) BEGINS WITH a complete,
     /// terminated CSI or OSC sequence — the same two terminated forms
-    /// `Sanitizer.terminalSafe` itself recognizes (see its `pattern`s),
-    /// anchored to match the ENTIRE tail so a still-growing prefix of a
-    /// longer sequence (e.g. `"\x1B[31"`, waiting on its final byte) is
-    /// correctly reported as NOT complete yet.
+    /// `Sanitizer.terminalSafe` itself recognizes (see its `pattern`s).
+    /// Anchored only at `^` (no trailing `$`): this only needs to know
+    /// whether a complete sequence starts at position 0, not whether `tail`
+    /// consists of NOTHING else — text after that sequence's terminator
+    /// (there can be no further ESC in it; see `split`'s doc comment) is
+    /// still complete-and-safe even though it isn't part of the match. A
+    /// still-growing prefix of a longer sequence (e.g. `"\x1B[31"`, waiting
+    /// on its final byte) still correctly fails every pattern below and is
+    /// reported as NOT complete.
     private static func isCompleteEscape(_ tail: String) -> Bool {
         for pattern in [
-            #"^(?:\x1B\[|\x{9B})[0-?]*[ -/]*[@-~]$"#,  // CSI … final byte
-            #"^\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)$"#,  // OSC … BEL/ST
+            #"^(?:\x1B\[|\x{9B})[0-?]*[ -/]*[@-~]"#,  // CSI … final byte
+            #"^\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"#,  // OSC … BEL/ST
         ] {
             if tail.range(of: pattern, options: .regularExpression) != nil { return true }
         }
@@ -513,7 +531,15 @@ struct AIConfigCommand: AsyncParsableCommand {
         if let apiKey, !apiKey.isEmpty {
             try keyStore.saveKey(apiKey, provider: provider.rawValue)
         }
-        let override = baseURL.flatMap { URL(string: $0) }
+        // `--base-url` is documented as "(openai-compat only) ... Ignored for
+        // anthropic" (this command's `--base-url` help text) — so an
+        // anthropic config is never allowed to persist an override, even if
+        // `--base-url` was passed (e.g. left over from a prior openai-compat
+        // setup). This is what keeps `AIProviderConfig.buildProvider`'s
+        // `.anthropic` case from ever seeing a non-nil override in practice;
+        // that case ALSO ignores one unconditionally as a second, type-level
+        // guarantee of the same contract.
+        let override = provider == .openaiCompat ? baseURL.flatMap { URL(string: $0) } : nil
         let encodedProvider = AIProviderConfig(kind: provider, baseURLOverride: override).encode()
         try await local.database.setAIConfig(
             feature: feature.rawValue, model: model, baseURL: encodedProvider, optIn: optIn,
