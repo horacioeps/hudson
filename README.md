@@ -40,6 +40,20 @@ swift build
 client — that's the trick that keeps Hudson free and unverified-fee-free
 forever. Your tokens live in your Keychain. Nothing phones home.
 
+## Run the app
+
+The Mac-native SwiftUI shell — a three-pane mailbox with keyboard-first
+triage (`j`/`k`/`e`/`s`/`u`), a ⌘K command palette, and local search — reads
+and triages the SAME local mailbox the CLI above syncs:
+
+```bash
+swift run HudsonApp          # reads ~/Library/Application Support/Hudson/hudson.sqlite
+swift run HudsonApp --demo   # a synthetic ~40-thread demo mailbox — no real account needed
+```
+
+Full keyboard map and what's still stubbed pending later milestones (send,
+AI, snooze): [`docs/ui/running-the-app.md`](docs/ui/running-the-app.md).
+
 ## Roadmap
 
 Foundation (headless, CLI-verified): auth → sync engine → triage mutations →

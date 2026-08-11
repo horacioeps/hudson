@@ -7,6 +7,8 @@ let package = Package(
     products: [
         .library(name: "GmailKit", targets: ["GmailKit"]),
         .executable(name: "hudson", targets: ["HudsonCLI"]),
+        .library(name: "HudsonUI", targets: ["HudsonUI"]),
+        .executable(name: "HudsonApp", targets: ["HudsonApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
@@ -33,5 +35,13 @@ let package = Package(
         .testTarget(name: "HudsonCLITests", dependencies: ["HudsonCLI"]),
         .target(name: "SyncEngine", dependencies: ["GmailKit", "Store"]),
         .testTarget(name: "SyncEngineTests", dependencies: ["SyncEngine"]),
+        .target(
+            name: "HudsonUI",
+            dependencies: ["GmailKit", "Store", "SyncEngine",
+                           .product(name: "GRDB", package: "GRDB.swift")],
+            resources: [.process("Resources")]
+        ),
+        .executableTarget(name: "HudsonApp", dependencies: ["HudsonUI"]),
+        .testTarget(name: "HudsonUITests", dependencies: ["HudsonUI", "Store"]),
     ]
 )
