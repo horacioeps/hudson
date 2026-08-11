@@ -349,6 +349,15 @@ public final class ComposerModel {
             if self.justSentUndoJobID == jobID {
                 self.justSentUndoJobID = nil
             }
+            // The undo hold has elapsed and the user did NOT undo (undo cancels
+            // this task), so the job is now claimable — flush it to Gmail. This
+            // is the composer's own prompt delivery; the app's periodic
+            // auto-sync send-flush is the durable safety net (e.g. if the app
+            // was quit before this fired). Without this, a sent email would sit
+            // in the queue until the next ~30s auto-sync tick.
+            if let service = self.lastSendService {
+                _ = try? await service.flushOnce(now: Self.nowMilliseconds())
+            }
         }
     }
 

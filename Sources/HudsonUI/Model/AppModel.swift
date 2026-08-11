@@ -424,9 +424,18 @@ public final class AppModel {
         let make = makeStack ?? { SyncBootstrap.makeStack(database: database, account: account) }
         autoSyncTask = Task { [weak self] in
             guard let stack = make() else { return }
+            // Also drain the SEND queue (durable send jobs whose undo-hold has
+            // elapsed) — a SEPARATE flusher from `stack.flusher` (which only
+            // drains triage `mutation_queue`). Without this, a composed email
+            // sits queued forever after its hold, which is exactly the
+            // "said Sent but never sent" bug.
+            let sendService = SendBootstrap.makeService(database: database, account: account)
             while !Task.isCancelled {
                 _ = try? await stack.engine.syncOnce()
                 _ = try? await stack.flusher.flushOnce()
+                if let sendService {
+                    _ = try? await sendService.flushOnce(now: Int64(Date().timeIntervalSince1970 * 1000))
+                }
                 await self?.refreshLabels()
                 try? await Task.sleep(for: interval)
             }
