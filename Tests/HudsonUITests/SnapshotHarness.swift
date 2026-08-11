@@ -67,6 +67,11 @@ struct SnapshotHarness {
         }
         try await render(search, width: 1240, height: 780, to: dir.appending(path: "hudson-search.png"))
 
+        // 4. The REAL assembled RootView (HSplitView 3-pane) — verifies the
+        //    actual container/dividers, not just the manual composition above.
+        model.isSearchVisible = false
+        try await render(RootView(model: model), width: 1240, height: 780, to: dir.appending(path: "hudson-rootview.png"))
+
         print("SNAPSHOTS_WRITTEN_TO \(dir.path)")
     }
 
