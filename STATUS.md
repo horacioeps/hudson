@@ -1,74 +1,72 @@
-# Hudson — Distribution Status
+# Hudson — Distribution & Live-Test Status
 
-_Last updated: 2026-08-11_
+_Last updated: 2026-08-12_
 
-Snapshot of the "download → install → first launch" experience for sharing Hudson with friends.
+Snapshot of the "download → install → first launch → read mail" experience,
+after a full end-to-end live test on a real 2700-message Gmail account.
 
 ---
 
-## ✅ Done & shippable (all merged to `main`, pushed to GitHub, 601 tests green)
+## ✅ Working end-to-end (all on `main`, pushed, 613 tests green)
 
-| Piece | Detail |
+| Piece | Status |
 |---|---|
-| **Real app icon** | Deep-green Hudson mark baked into the `.app` (`Design/AppIcon/Hudson-1024.png` → `.icns` at package time) |
-| **Signed + notarized installer** | `dist/Hudson-0.1.0.dmg` — Developer ID signed, Apple-notarized, stapled, Gatekeeper-accepted. **No "cannot be opened" warning.** |
-| **Drag-to-Applications DMG** | Mounts as "Hudson" with an Applications symlink |
-| **First-launch onboarding** | Welcome → "Sign in with Google" → unverified-app explainer → done (BYO-credentials fallback built in) |
-| **Disconnect account** | Settings (gear) → Account → Disconnect → returns to onboarding. Clears Keychain tokens + account row; aborts with a banner if the purge fails (no silent privacy leak). Your synced mail stays on disk. |
+| **Real app icon** | Deep-green Hudson mark baked into the `.app` |
+| **Signed + notarized installer** | `dist/Hudson-0.1.0.dmg` — Developer ID + Apple-notarized + stapled. No Gatekeeper warning. |
+| **One-click "Sign in with Google"** | Shared OAuth client (project `hudson-mail`, published) wired into `SharedOAuth`; secret build-injected. Verified: signed in with a fresh account, zero credential pasting. |
+| **First-launch onboarding** | Welcome → Google → unverified explainer → connected |
+| **Disconnect account** | Settings → Account → Disconnect → back to onboarding |
+| **Inbox list + Primary tab** | Shows real mail (Gmail Primary = CATEGORY_PERSONAL, fixed) |
+| **Reading pane** | Opens any thread instantly (on-demand body fetch), quoted replies collapsed behind "···", HTML entities decoded, honest "Getting your mail…" status |
 
-A friend can install cleanly **today** — they'd just paste their own Google credentials on first run (see below for the one-click upgrade).
-
----
-
-## ⏳ The ONE thing left for true one-click "Sign in with Google"
-
-Create a **Google OAuth Desktop client** and send me the Client ID + secret.
-
-1. [console.cloud.google.com](https://console.cloud.google.com) → new project **"Hudson"**
-2. **APIs & Services → Library → Gmail API → Enable**
-3. **OAuth consent screen** → External → app name + your email → add scope `https://www.googleapis.com/auth/gmail.modify` → **Publish app**
-   _(Unverified + published = up to 100 users, no weekly re-login, one "unverified" click. No Google verification / CASA needed under 100 users.)_
-4. **Credentials → Create Credentials → OAuth client ID → Application type: Desktop app** → "Hudson Desktop"
-5. Send me:
-   - **Client ID** — looks like `xxxxx.apps.googleusercontent.com`
-   - **Client secret** — looks like `GOCSPX-xxxxxxxx`
-
-**Where it plugs in:** `Sources/HudsonUI/Model/SharedOAuth.swift` → `clientID` (currently `""`), secret injected at build time via `HUDSON_OAUTH_CLIENT_SECRET` (never committed).
+**A friend can install and use this today.**
 
 ---
 
-## 🔑 Credentials already set up (don't redo these)
+## 🔧 Fixed today (live-test round)
 
-- **Apple Developer ID:** `Developer ID Application: Mannas Narang (74YRG64DGB)` — in login Keychain
-- **Apple notary profile:** `hudson-notary` — saved in Keychain (Apple ID `mannasn@icloud.com`, team `74YRG64DGB`). App-specific password already stored; never needed again.
-- **These are Apple credentials** (for notarizing the installer) — separate from the Google OAuth client above.
+1. **Primary tab was empty** — `CATEGORY_PERSONAL` now routes to the `primary` split (Gmail's Primary *is* the personal category).
+2. **"All synced" lied** — footer now shows "Getting your mail…" while bodies stream in; sync loop fills fast (2s) while catching up.
+3. **Threads stuck "loading"** — reading pane now fetches a message body **on demand** the moment you open it (`SyncEngine.hydrate` + `ThreadModel.hydrateBody`), bypassing the slow background backfill.
+4. **`&#39;` in previews** — `HTMLEntities.decode` applied to snippets (inbox, reading pane, search).
+5. **Opening a reply showed the whole thread** — quoted history (`.gmail_quote` / `blockquote[type=cite]`) collapsed behind a "···" toggle.
+
+## 🐢 Known follow-ups (not blocking, next session)
+
+- **Slow background backfill** — metadata is fetched one message at a time, so a large mailbox takes a while to fully cache (search/scroll of old mail lags). On-demand fetch means this no longer blocks *reading*. Fix: parallelize/batch the metadata fetch.
+- **White email card** — email HTML renders on a white card (correct for email; Superhuman/Gmail do the same). Open design choice: keep / warmer off-white / theme-adapt simple emails.
 
 ---
+
+## 🔑 Credentials (already set up — survive restart)
+
+- **Apple Developer ID:** `Developer ID Application: Mannas Narang (74YRG64DGB)` — login Keychain
+- **Apple notary profile:** `hudson-notary` — Keychain (Apple ID `mannasn@icloud.com`, team `74YRG64DGB`)
+- **Google shared OAuth client:** id compiled into `SharedOAuth` (public); secret in git-ignored `scripts/hudson-secrets.env` (re-obtainable from Google Cloud → Credentials if ever lost)
 
 ## 🔁 Rebuild the notarized installer (one command)
 
 ```bash
-DEVELOPER_ID="Developer ID Application: Mannas Narang (74YRG64DGB)" \
-NOTARY_PROFILE="hudson-notary" \
-./scripts/make-dmg.sh
+source scripts/hudson-secrets.env      # loads DEVELOPER_ID, NOTARY_PROFILE, HUDSON_OAUTH_CLIENT_SECRET
+./scripts/make-dmg.sh                   # build → sign → inject secret → notarize → staple
 ```
-Output: `dist/Hudson-0.1.0.dmg` (signed + notarized + stapled). Takes ~2–5 min (Apple notary wait).
-_Rebuilding also recreates a loose `dist/Hudson.app` — that's a build intermediate, not a second install._
+Output: `dist/Hudson-0.1.0.dmg`. For a quick local rebuild without notarizing:
+`source scripts/hudson-secrets.env && ./scripts/package-app.sh release && codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" dist/Hudson.app`
+
+_Note: the currently-installed `/Applications/Hudson.app` is a signed (not notarized)
+local build from the live-test loop. Re-run `make-dmg.sh` for the notarized DMG to hand to friends._
 
 ---
 
-## ⏸️ Optional / deferred (not blocking a friend install)
+## What survives a restart
 
-- **Styled DMG window** — background image with a "drag Hudson → Applications" arrow
-- **Sparkle auto-update** — push updates without re-downloading
-- **Google verification / CASA** — only needed to go past 100 users
-- **Open-sourcing publicly** — repo is currently private (`github.com/mannasdev/hudson`)
-
----
+Everything: `/Applications/Hudson.app`, the local mail DB (`~/Library/Application Support/Hudson/`),
+the Keychain (tokens + secret), and the git repo (fully pushed to `github.com/mannasdev/hudson`).
+The only local-only file is `scripts/hudson-secrets.env` — it's on disk and persists; it's just
+not on GitHub, on purpose.
 
 ## Next session, in order
 
-1. You: create the Google OAuth client (steps above) → send me Client ID + secret
-2. Me: bake it into `SharedOAuth`, re-cut the DMG → true one-click sign-in
-3. You: host `Hudson-0.1.0.dmg` behind the website download button
-4. Share with friends 🎉
+1. Re-cut the notarized DMG (`make-dmg.sh`) and host it behind the website download button
+2. (optional) Speed up background backfill; decide on the email-card look
+3. Share with friends 🎉
