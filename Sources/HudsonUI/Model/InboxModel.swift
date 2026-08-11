@@ -41,6 +41,37 @@ public final class InboxModel {
         }
     }
 
+    /// Which sidebar folder the list is showing. `.inbox` is the split-view
+    /// (with the tab strip); `.label` is a flat "threads carrying this label"
+    /// list (Starred / Sent / a user label / Snoozed). Switching re-subscribes
+    /// `rows` to the matching observation and clears the selection.
+    public enum Mailbox: Equatable, Sendable {
+        case inbox
+        case label(id: String, title: String)
+    }
+    public var mailbox: Mailbox = .inbox {
+        didSet {
+            guard oldValue != mailbox else { return }
+            selectedThreadID = nil
+            subscribeToRows()
+        }
+    }
+
+    /// The header title for the current folder ("Inbox" or the label's name).
+    public var folderTitle: String {
+        switch mailbox {
+        case .inbox: return "Inbox"
+        case .label(_, let title): return title
+        }
+    }
+
+    /// The split-tab strip belongs to the inbox only — a flat label folder
+    /// shows a plain title instead.
+    public var showsSplitTabs: Bool {
+        if case .inbox = mailbox { return true }
+        return false
+    }
+
     /// The subscription driving `rows`, (re)started by `start()` and by
     /// `activeSplit`'s `didSet`. Stored so a stale subscription can be
     /// cancelled before the next one starts — otherwise two overlapping
@@ -95,26 +126,37 @@ public final class InboxModel {
     private func subscribeToRows() {
         rowsTask?.cancel()
         let split = activeSplit
+        let mailbox = self.mailbox
         let database = self.database
         let account = self.account
         rowsTask = Task { [weak self] in
             do {
-                for try await newRows in database.observeInboxThreads(
-                    account: account, split: split, limit: Self.rowLimit
-                ) {
-                    guard let self, !Task.isCancelled else { return }
-                    self.rows = newRows
-                    // When `split` is nil, `newRows` already IS every inbox
-                    // thread — reuse it instead of an extra query. Triage
-                    // is by far the most frequent trigger for this loop, so
-                    // avoiding a redundant fetch here matters more than it
-                    // does in `subscribeToTabs` below.
-                    await self.refreshTabCounts(usingFullInboxRows: split == nil ? newRows : nil)
+                switch mailbox {
+                case .inbox:
+                    // The inbox: split-filtered, and it maintains the tab-count
+                    // strip. With no active split, `newRows` already IS every
+                    // inbox thread, so reuse it (triage re-emits this loop
+                    // constantly — avoiding the redundant fetch matters).
+                    for try await newRows in database.observeInboxThreads(
+                        account: account, split: split, limit: Self.rowLimit
+                    ) {
+                        guard let self, !Task.isCancelled else { return }
+                        self.rows = newRows
+                        await self.refreshTabCounts(usingFullInboxRows: split == nil ? newRows : nil)
+                    }
+                case .label(let id, _):
+                    // A flat label folder (Sent/Starred/…): no splits, no tab
+                    // strip, so nothing to recompute — just the rows.
+                    for try await newRows in database.observeThreadsWithLabel(
+                        account: account, labelID: id, limit: Self.rowLimit
+                    ) {
+                        guard let self, !Task.isCancelled else { return }
+                        self.rows = newRows
+                    }
                 }
             } catch {
-                // `observeInboxThreads` only throws on a genuine Store/SQLite
-                // failure (never "no rows") — nothing to recover into here;
-                // a later task wires user-facing sync/error surfacing.
+                // The observation only throws on a genuine Store/SQLite failure
+                // (never "no rows") — nothing to recover into here.
             }
         }
     }
