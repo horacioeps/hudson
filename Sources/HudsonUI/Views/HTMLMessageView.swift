@@ -98,6 +98,14 @@ enum HTMLDocument {
         a { color: #2761d8; }
         blockquote { margin: 0 0 0 12px; padding-left: 12px;
             border-left: 2px solid #d9d9d9; color: #555; }
+        /* Quoted reply history (the prior thread each reply embeds) is hidden
+           by default so opening one reply shows only its NEW text; the injected
+           "···" toggle in resizeObserverScript reveals it on demand. */
+        .gmail_quote, blockquote[type="cite"] { display: none; }
+        .hudson-quote-toggle { display: inline-block; margin: 6px 0; padding: 0 12px;
+            border: none; border-radius: 12px; background: #e8e8e8; color: #555;
+            font: 15px/22px -apple-system, ui-sans-serif, system-ui, sans-serif;
+            cursor: pointer; }
         pre { white-space: pre-wrap; word-break: break-word; }
         </style>
         </head>
@@ -167,10 +175,33 @@ private struct WebBodyView: NSViewRepresentable {
                 var el = document.body || document.documentElement;
                 window.webkit.messageHandlers.\(heightMessageName).postMessage(Math.ceil(el.scrollHeight));
             }
+            // Quoted reply history is display:none by CSS. If any exists, drop a
+            // Gmail-style "···" chip right before the first (outermost) quote so
+            // the reader sees only the new text; clicking it toggles the whole
+            // quoted chain. The ResizeObserver below re-measures on that reflow,
+            // so no manual height call is needed after a toggle.
+            function setupQuoteToggle() {
+                var quotes = document.querySelectorAll('.gmail_quote, blockquote[type="cite"]');
+                if (!quotes.length) return;
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'hudson-quote-toggle';
+                btn.textContent = '···';
+                btn.setAttribute('aria-label', 'Show trimmed content');
+                var shown = false;
+                btn.addEventListener('click', function() {
+                    shown = !shown;
+                    for (var i = 0; i < quotes.length; i++) {
+                        quotes[i].style.display = shown ? 'block' : 'none';
+                    }
+                });
+                quotes[0].parentNode.insertBefore(btn, quotes[0]);
+            }
             if (window.ResizeObserver) {
                 new ResizeObserver(report).observe(document.body || document.documentElement);
             }
             window.addEventListener('load', report);
+            setupQuoteToggle();
             report();
         })();
         """

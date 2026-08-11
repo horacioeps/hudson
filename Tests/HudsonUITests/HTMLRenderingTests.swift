@@ -26,6 +26,15 @@ import Testing
     #expect(document.contains("default-src 'none'"))
 }
 
+/// Quoted reply history (Gmail `.gmail_quote` / Apple-Mail `blockquote[type=cite]`)
+/// is hidden by default so opening one reply shows only its new text; the
+/// injected "···" toggle (styled `.hudson-quote-toggle`) reveals it on demand.
+@Test func wrappedDocumentCollapsesQuotedReplyHistoryByDefault() {
+    let document = HTMLDocument.wrap(bodyHTML: "<p>Hi</p>", allowRemoteImages: false)
+    #expect(document.contains(".gmail_quote, blockquote[type=\"cite\"] { display: none; }"))
+    #expect(document.contains("hudson-quote-toggle"))
+}
+
 /// The ONLY thing the "Load remote images" opt-in changes is `img-src` gaining
 /// `https:` — nothing else in the policy loosens.
 @Test func loadingRemoteImagesOnlyAddsHTTPSToImgSrc() {
