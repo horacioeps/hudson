@@ -209,12 +209,14 @@ private func assertRendered(_ size: NSSize) {
 /// `RootView` with NO connected account (`AppModel(database:account: nil)`,
 /// not demo) — Task 4's first-launch gate must show `OnboardingView`'s
 /// welcome screen instead of the (otherwise-empty) three-pane mailbox.
-/// `RootView(model:)` builds its internal `OnboardingModel` eagerly, at
-/// `init` time (see its doc comment), so this needs no `.task`/run-loop to
-/// land before `layout()` — deterministic, matching every other test in this
-/// file's synchronous-hosting recipe.
+/// `RootView(model:)` no longer builds its internal `OnboardingModel`
+/// eagerly at `init` time — that shape silently lost `onConnected`'s later
+/// writes (see `RootViewOnboardingWiringTests`) — so this now needs the same
+/// `try await Task.sleep(...)` land-the-`.task` step every other
+/// async-loaded `RootView` test in this file already uses, before
+/// `layout()`.
 @MainActor
-@Test func rootViewRendersOnboardingWhenNoAccountConnected() {
+@Test func rootViewRendersOnboardingWhenNoAccountConnected() async throws {
     let db = try! HudsonDatabase.inMemory()
     let appModel = AppModel(database: db, account: nil)
     #expect(appModel.needsOnboarding)  // precondition this test exercises
@@ -222,6 +224,32 @@ private func assertRendered(_ size: NSSize) {
     let view = RootView(model: appModel)
     let host = NSHostingView(rootView: view)
     host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(100))
+    host.layout()
+    assertRendered(host.fittingSize)
+}
+
+/// The REAL `HudsonApp` boot path (`RootView(databaseURL:)`, not the
+/// direct-injection `init(model:)` seam) with a fresh, empty on-disk
+/// database — no seeded account, so the async `.task` load lands a model
+/// with `needsOnboarding == true` and must build+show onboarding exactly
+/// like the `init(model:)` seam does. This path had zero coverage before
+/// Task 4's fix folded `init(model:)`'s onboarding-building into the same
+/// `.task` (see `RootView`'s doc comments) — worth confirming directly
+/// since a regression here would be invisible to every other test in this
+/// file, all of which go through `init(model:)`.
+@MainActor
+@Test func rootViewRendersOnboardingOnFreshDatabaseBoot() async throws {
+    let dbURL = FileManager.default.temporaryDirectory.appending(
+        path: "hudson-render-smoke-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+
+    let view = RootView(databaseURL: dbURL)
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 1200, height: 760)
+    host.layout()
+    try await Task.sleep(for: .milliseconds(150))
     host.layout()
     assertRendered(host.fittingSize)
 }
