@@ -19,4 +19,10 @@ public enum AIError: Error, Equatable, Sendable {
     /// status code so callers — including the 429 backoff providers add in
     /// Task 3/4 — can branch on it without re-parsing headers.
     case httpStatus(Int)
+
+    /// `Summarize.summarize(threadID:invocation:)` was asked to summarize a
+    /// thread with zero messages (unknown thread id, or a race with a
+    /// concurrent delete) — thrown before any cache lookup or egress, since
+    /// there is no `last_message_id` to key the cache on.
+    case emptyThread(String)
 }
