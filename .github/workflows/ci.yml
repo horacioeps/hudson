@@ -7,9 +7,20 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Secret scan (no Google credentials in the repo, ever — spec §6.1)
+      - name: Secret scan (no Google secrets/keys/tokens in the repo — spec §6.1)
         run: |
-          ! grep -rE "GOCSPX-[A-Za-z0-9_-]{10,}|BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY|[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com|ya29\.[A-Za-z0-9_-]{20,}" \
-              --exclude-dir=.git --exclude-dir=.build --exclude=ci.yml .
+          # The shared Desktop client id is PUBLIC and intentionally committed
+          # (Sources/HudsonUI/Model/SharedOAuth.swift — Google does not treat a
+          # Desktop-app client id as confidential). Strip that one known id,
+          # then fail if any real credential remains: the client SECRET, private
+          # keys, OAuth tokens, or any OTHER googleusercontent client id.
+          SHARED_ID='419433933435-1cjpc7j8e6efq4eh7rkop8dkmvlgsk7j.apps.googleusercontent.com'
+          # dist/ and the *.secret.env files are git-ignored (absent in CI); the
+          # excludes just keep local runs of this guard honest too.
+          grep -rE "GOCSPX-[A-Za-z0-9_-]{10,}|BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY|[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com|ya29\.[A-Za-z0-9_-]{20,}" \
+              --exclude-dir=.git --exclude-dir=.build --exclude-dir=dist \
+              --exclude=ci.yml --exclude=hudson-secrets.env --exclude='*.secret.env' . \
+            | grep -vF "$SHARED_ID" \
+            | (! grep -q .)
       - run: swift --version
       - run: swift test

@@ -8,17 +8,18 @@ import Testing
 /// with no network/Keychain/browser involved (there's none to touch here;
 /// this is a pure resolver over compiled-in/environment state).
 struct SharedOAuthTests {
-    /// Until the real shared Desktop client ships, `clientID` is the empty
-    /// placeholder the plan calls for — the guard every other test here
-    /// (and `OnboardingModel`'s BYO-routing) depends on.
-    @Test func clientIDIsTheEmptyPlaceholderUntilTheSharedClientShips() {
-        #expect(SharedOAuth.clientID.isEmpty)
+    /// The real shared Desktop client now ships: `clientID` is the public
+    /// Google Cloud client id compiled into `SharedOAuth` (project
+    /// `hudson-mail`). Every one-click sign-in path depends on it being present.
+    @Test func clientIDIsTheShippedSharedClient() {
+        #expect(!SharedOAuth.clientID.isEmpty)
+        #expect(SharedOAuth.clientID.hasSuffix(".apps.googleusercontent.com"))
     }
 
-    /// `isConfigured` is derived from `clientID` alone — with today's empty
-    /// placeholder it must read `false`.
-    @Test func isConfiguredIsFalseWhileClientIDIsEmpty() {
-        #expect(SharedOAuth.isConfigured == false)
+    /// `isConfigured` is derived from `clientID` alone — now that the real
+    /// shared client ships, it reads `true`.
+    @Test func isConfiguredIsTrueOnceTheSharedClientShips() {
+        #expect(SharedOAuth.isConfigured)
     }
 
     /// No injected secret anywhere in this test process — the expected state
@@ -28,11 +29,13 @@ struct SharedOAuthTests {
         #expect(SharedOAuth.clientSecret() == nil)
     }
 
-    /// The core "no one-click path yet" case: no shared client configured
-    /// (empty `clientID`) and no BYO values supplied → `nil`, which is what
-    /// routes `OnboardingModel` to `.byoEntry` instead of attempting a shared
-    /// sign-in that could never complete.
-    @Test func credentialsWithNoSharedConfigAndNoBYOReturnsNil() {
+    /// Even though `clientID` now ships, a plain `swift test`/source checkout
+    /// injects no secret, so `clientSecret()` is nil and `credentials()`
+    /// returns nil with no BYO — routing `OnboardingModel` to `.byoEntry`.
+    /// A packaged build that injects `HUDSON_OAUTH_CLIENT_SECRET` resolves a
+    /// real one-click credential here instead.
+    @Test func credentialsWithoutInjectedSecretAndNoBYOReturnsNil() {
+        #expect(SharedOAuth.clientSecret() == nil)  // precondition: no injection in tests
         let credentials = SharedOAuth.credentials()
 
         #expect(credentials == nil)

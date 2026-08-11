@@ -27,10 +27,11 @@ import GmailKit
 /// `credentials` returns `nil` and the caller falls back to `.byoEntry` —
 /// so Hudson is fully usable today, before the real shared client ships.
 public enum SharedOAuth {
-    /// The bundled Desktop OAuth client's id. Empty until Hudson has a real
-    /// one — see `isConfigured`.
-    // TODO(shared-client): real Desktop client id
-    public static let clientID = ""
+    /// The bundled Desktop OAuth client's id (Google Cloud project
+    /// `hudson-mail`, published/in-production). Safe to commit — Google does
+    /// not treat a Desktop-app client id as confidential; the paired secret is
+    /// build-injected, never committed (see `clientSecret()`).
+    public static let clientID = "419433933435-1cjpc7j8e6efq4eh7rkop8dkmvlgsk7j.apps.googleusercontent.com"
 
     /// The env var a build that injects the shared secret sets (e.g. via
     /// `swift build` with the variable exported, or a CI/notarization step).

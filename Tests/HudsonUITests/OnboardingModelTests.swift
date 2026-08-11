@@ -140,16 +140,17 @@ private final class OpenSpy {
 
 // MARK: - Not configured + no BYO → BYO entry, zero network
 
-/// With no shared client compiled in (today's empty placeholder) and no BYO
-/// values, `signInWithGoogle` must route straight to `.byoEntry` and perform
-/// NO network, NO listener, NO browser open — there is no one-click path that
-/// could ever complete, so the user is sent to enter their own credentials
-/// instead of watching a doomed sign-in spin.
+/// When `SharedOAuth` can't resolve a one-click credential — the shared client
+/// id ships, but a plain test run injects no secret, so `credentials()` is nil —
+/// and no BYO values are supplied, `signInWithGoogle` must route straight to
+/// `.byoEntry` and perform NO network, NO listener, NO browser open: there is no
+/// one-click path that could complete, so the user is sent to enter their own
+/// credentials instead of watching a doomed sign-in spin.
 @MainActor
-@Test func signInWithGoogleWithNoSharedClientRoutesToBYOAndTouchesNothing() async throws {
-    // Guard the premise: these tests only hold while the shared client is
-    // unconfigured (Task 1's empty placeholder).
-    try #require(SharedOAuth.isConfigured == false)
+@Test func signInWithGoogleWithNoResolvableCredentialRoutesToBYOAndTouchesNothing() async throws {
+    // Guard the premise: no shared secret is injected in this test process, so
+    // the one-click credential can't resolve and the BYO fallback is expected.
+    try #require(SharedOAuth.credentials() == nil)
 
     let db = try HudsonDatabase.inMemory()
     let transport = ScriptedTransport()

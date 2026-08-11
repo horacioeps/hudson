@@ -12,3 +12,9 @@ xcuserdata/
 *.sqlite-wal
 *.sqlite-shm
 dist/
+
+# Build-time OAuth shared-client secret — NEVER commit.
+# Bare filename (no dir prefix) so it's ignored regardless of the Scripts/
+# vs scripts/ case, on case-sensitive filesystems too.
+hudson-secrets.env
+*.secret.env

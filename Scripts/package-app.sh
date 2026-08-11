@@ -60,4 +60,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
+# Shared-client OAuth secret — injected ONLY at build time, never committed.
+# When HUDSON_OAUTH_CLIENT_SECRET is exported, bake it into the bundle's
+# Info.plist (added via PlistBuddy so the value never appears in this script or
+# its logs). SharedOAuth.clientSecret() reads this key, which is what makes the
+# onboarding "Sign in with Google" button one-click. Absent → BYO fallback.
+if [[ -n "${HUDSON_OAUTH_CLIENT_SECRET:-}" ]]; then
+  /usr/libexec/PlistBuddy -c \
+    "Add :HudsonOAuthClientSecret string ${HUDSON_OAUTH_CLIENT_SECRET}" \
+    "$APP/Contents/Info.plist" >/dev/null
+  echo "Injected shared-client secret into Info.plist"
+else
+  echo "NOTE: HUDSON_OAUTH_CLIENT_SECRET not set — app will use BYO sign-in." >&2
+fi
+
 echo "Built $APP (v$VERSION, unsigned)"
