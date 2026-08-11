@@ -263,40 +263,13 @@ public actor SyncEngine {
         var hydrated = 0
         for id in ids {
             do {
-                let message = try await api.getMessage(id: id, format: "full")
-                let content = message.extractContent()
-                let attachments = message.attachments().map {
-                    AttachmentMeta(
-                        id: $0.attachmentID, filename: $0.filename,
-                        mimeType: $0.mimeType, size: $0.size)
+                // `hydrate` already tombstones a 404'd id (returning `false`)
+                // rather than throwing, so the batch loop only needs to
+                // handle non-404 failures below — see `hydrate`'s doc
+                // comment for why the two callers split that way.
+                if try await hydrate(messageID: id) {
+                    hydrated += 1
                 }
-                // M5 Task 5: `format: "full"` already carries the
-                // Message-ID/References headers — this is the actual
-                // hydrate-time write path spec §7.1 asks for (distinct
-                // from `SnapshotMapping`'s backfill/history metadata-fetch
-                // path, which never re-runs for an account whose backfill
-                // predates this migration). Routed through the same
-                // `SnapshotMapping.snapshot` mapper backfill/history use,
-                // so there's exactly one place that knows how to pull
-                // these headers off a `GmailMessage`.
-                let threadingSnapshot = SnapshotMapping.snapshot(from: message)
-                try await database.saveBody(
-                    messageID: id, account: account,
-                    body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText),
-                    attachments: attachments,
-                    rfc822MessageID: threadingSnapshot?.rfc822MessageID,
-                    referencesHeader: threadingSnapshot?.referencesHeader)
-                hydrated += 1
-            } catch GmailError.invalidRequest(let status, _) where status == 404 {
-                // The message provably no longer exists server-side — unlike
-                // backfill's silent skip (nothing was ever persisted for it),
-                // this id is already sitting in the store with has_body=0, so
-                // skipping alone would leave it at the head of
-                // `messageIDsNeedingBodies`'s work-list forever, failing
-                // every future `hudson sync` with the same 404 (e.g. a ghost
-                // row left by the §4.3 expiry re-list). Tombstone + delete
-                // instead so it leaves the work-list for good.
-                try await database.deleteVanishedMessage(id: id, account: account)
             } catch let error as GmailError {
                 // Any other failure skips just this message — never lets one
                 // bad id stall the whole hydration batch.
@@ -304,6 +277,68 @@ public actor SyncEngine {
             }
         }
         return hydrated
+    }
+
+    /// Fetches ONE message's full body from Gmail right now and saves it —
+    /// the exact fetch -> extractContent -> sanitize -> saveBody pipeline
+    /// `hydrateBodies`'s loop runs per id, factored out here so there is
+    /// EXACTLY ONE body-fetch code path (both the batch above and
+    /// `ThreadModel`'s on-demand reading-pane fetch route through it).
+    ///
+    /// Returns `true` when a body was fetched and saved, `false` when the
+    /// message has vanished server-side (a 404 — tombstoned via
+    /// `deleteVanishedMessage`, same treatment `hydrateBodies`' own 404
+    /// branch always gave it, so it leaves `messageIDsNeedingBodies`'s
+    /// work-list for good instead of 404ing forever).
+    ///
+    /// Any OTHER error (rate limit, network, auth, a non-404 HTTP status,
+    /// ...) is deliberately NOT swallowed here — unlike `hydrateBodies`'
+    /// batch (where one bad id must never stall the other 24 in the
+    /// pass, so its loop catches `GmailError` and skips just that id), a
+    /// single on-demand call has no "next id" to fall through to. It
+    /// throws and lets the caller decide: `hydrateBodies` catches around
+    /// its own call (see above); `ThreadModel`'s on-demand path (public
+    /// API consumer, not in this module) is expected to `try?` it, since
+    /// the reading pane has nothing more useful to do with a failed
+    /// on-demand fetch than leave the message uncached for the next retry.
+    public func hydrate(messageID: String) async throws -> Bool {
+        do {
+            let message = try await api.getMessage(id: messageID, format: "full")
+            let content = message.extractContent()
+            let attachments = message.attachments().map {
+                AttachmentMeta(
+                    id: $0.attachmentID, filename: $0.filename,
+                    mimeType: $0.mimeType, size: $0.size)
+            }
+            // M5 Task 5: `format: "full"` already carries the
+            // Message-ID/References headers — this is the actual
+            // hydrate-time write path spec §7.1 asks for (distinct
+            // from `SnapshotMapping`'s backfill/history metadata-fetch
+            // path, which never re-runs for an account whose backfill
+            // predates this migration). Routed through the same
+            // `SnapshotMapping.snapshot` mapper backfill/history use,
+            // so there's exactly one place that knows how to pull
+            // these headers off a `GmailMessage`.
+            let threadingSnapshot = SnapshotMapping.snapshot(from: message)
+            try await database.saveBody(
+                messageID: messageID, account: account,
+                body: Sanitizer.sanitize(html: content.htmlData, plainText: content.plainText),
+                attachments: attachments,
+                rfc822MessageID: threadingSnapshot?.rfc822MessageID,
+                referencesHeader: threadingSnapshot?.referencesHeader)
+            return true
+        } catch GmailError.invalidRequest(let status, _) where status == 404 {
+            // The message provably no longer exists server-side — unlike
+            // backfill's silent skip (nothing was ever persisted for it),
+            // this id is already sitting in the store with has_body=0, so
+            // skipping alone would leave it at the head of
+            // `messageIDsNeedingBodies`'s work-list forever, failing every
+            // future `hudson sync` with the same 404 (e.g. a ghost row left
+            // by the §4.3 expiry re-list). Tombstone + delete instead so it
+            // leaves the work-list for good.
+            try await database.deleteVanishedMessage(id: messageID, account: account)
+            return false
+        }
     }
 
     private func requireAccount() async throws -> AccountRecord {

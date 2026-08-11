@@ -156,3 +156,56 @@ import Testing
     let calls = await gmail.calls
     #expect(calls.filter { $0 == "get:mGone:full" }.count == 1)
 }
+
+// MARK: - `hydrate(messageID:)` — the on-demand path `ThreadModel` calls when
+// the reading pane needs a body the background `hydrateBodies()` batch
+// hasn't reached yet. Exercises the SAME fetch -> extractContent -> sanitize
+// -> saveBody pipeline `hydrateBodies`'s loop uses per id (it's now a thin
+// wrapper around this), so these tests double as coverage that the refactor
+// didn't change that pipeline's behavior.
+
+@Test func hydrateFetchesFullFormatSavesTheBodyAndReturnsTrue() async throws {
+    let database = try HudsonDatabase.inMemory()
+    try await database.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    // A message row that already exists (e.g. from backfill/history) but has
+    // no body yet — exactly what a reading-pane "expanded but not hydrated"
+    // message looks like.
+    _ = try await database.applySnapshot(
+        MessageSnapshot(
+            id: "m1", threadID: "t1", historyID: 1, internalDate: 1000,
+            fromLine: "a@ex.com", toLine: "b@ex.com", subject: "s", snippet: "sn",
+            labelIDs: ["INBOX"]),
+        account: "x")
+    let gmail = ScriptedGmail(messagesByID: [
+        "m1": testMessageWithBody(
+            id: "m1", historyID: "1", internalDate: "1000", plainText: "fetched on demand")
+    ])
+    let engine = SyncEngine(api: gmail, database: database, account: "x")
+
+    let saved = try await engine.hydrate(messageID: "m1")
+    #expect(saved == true)
+
+    let stored = try #require(try await database.message(id: "m1", account: "x"))
+    #expect(stored.plainText == "fetched on demand")
+    #expect(stored.row.hasBody)
+    let calls = await gmail.calls
+    #expect(calls.contains("get:m1:full"))
+}
+
+@Test func hydrate404TombstonesTheMessageAndReturnsFalse() async throws {
+    let database = try HudsonDatabase.inMemory()
+    try await database.upsertAccount(email: "x", clientID: "c", consentedAt: .now)
+    _ = try await database.applySnapshot(
+        MessageSnapshot(
+            id: "mGone", threadID: "t1", historyID: 1, internalDate: 1000,
+            fromLine: "a@ex.com", toLine: "b@ex.com", subject: "s", snippet: "sn",
+            labelIDs: ["INBOX"]),
+        account: "x")
+    // No entry in `messagesByID` — `ScriptedGmail.getMessage` 404s.
+    let gmail = ScriptedGmail()
+    let engine = SyncEngine(api: gmail, database: database, account: "x")
+
+    let saved = try await engine.hydrate(messageID: "mGone")
+    #expect(saved == false)
+    #expect(try await database.message(id: "mGone", account: "x") == nil)
+}
