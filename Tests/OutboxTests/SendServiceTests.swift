@@ -32,6 +32,7 @@ actor RecordingSendTransport: SendTransport {
     var sendCount: Int { sentMIMEs.count }
 
     func setSendError(_ error: Error?) { sendError = error }
+    func setProbeError(_ error: Error?) { probeError = error }
     func setProbeHit(_ gmailID: String, forRFC822 id: String) { probeHitsByID[id] = gmailID }
 
     func sendRawMessage(_ rawMIME: Data, threadID: String?) async throws -> SentMessage {
@@ -90,11 +91,23 @@ private func plainMessage(subject: String = "Hello") -> OutboxMessage {
     #expect(try await service.cancel(jobID: jobID, now: 2_000) == true)
     #expect(try await database.claimSendable(account: account, now: 999_999).isEmpty)
 
-    // A second job that we drive into `in_flight` can no longer be undone.
-    let jobID2 = try await service.enqueue(
-        plainMessage(subject: "Second"), undoHold: .zero, now: 3_000)
-    try await database.markSendInFlight(id: jobID2, account: account)
-    #expect(try await service.cancel(jobID: jobID2, now: 3_000) == false)
+    // Now prove the *in_flight* guard specifically — not merely an elapsed
+    // hold. Both jobs below are enqueued with a 15s hold at now=3_000
+    // (hold_until = 18_000), and both are cancel-probed at now=4_000, well
+    // WITHIN that window. The only difference is state: the control job stays
+    // pending, `heldJob` is driven `in_flight`.
+    let controlID = try await service.enqueue(
+        plainMessage(subject: "Control"), undoHold: .seconds(15), now: 3_000)
+    let heldJobID = try await service.enqueue(
+        plainMessage(subject: "Second"), undoHold: .seconds(15), now: 3_000)
+    try await database.markSendInFlight(id: heldJobID, account: account)
+
+    // The pending control IS cancellable at now=4_000 — so the hold window is
+    // genuinely still open at the cancel instant. This is what makes the next
+    // assertion meaningful: an identical still-held job cannot be undone once
+    // it is `in_flight`, and state is the ONLY variable that differs.
+    #expect(try await service.cancel(jobID: heldJobID, now: 4_000) == false)
+    #expect(try await service.cancel(jobID: controlID, now: 4_000) == true)
 }
 
 @Test func killBetweenSendAndRecordIsResolvedByProbeNotResent() async throws {
@@ -140,6 +153,64 @@ private func plainMessage(subject: String = "Hello") -> OutboxMessage {
     #expect(await transport.sendCount == 0)  // ambiguous → wait, do NOT resend
     #expect(try await database.inFlightSendJobs(account: account).count == 1)  // still in_flight
     #expect(await transport.probedIDs.count == 1)  // it WAS re-probed
+}
+
+private struct TransportBoom: Error {}
+
+@Test func sendFailureLeavesInFlightAndNeverResendsAcrossTheFailure() async throws {
+    // Spec §7.3's crash-safety property at the send-error boundary: when the
+    // wire call throws, the job is ALREADY committed `in_flight`, so the pass
+    // must leave it there (not pending, not failed) and stop — the next
+    // flush's probe path is the ONLY thing allowed to decide its fate, and it
+    // must never resend across the failure.
+    let database = try HudsonDatabase.inMemory()
+    let transport = RecordingSendTransport()
+    let service = SendService(api: transport, database: database, account: account)
+
+    let jobID = try await service.enqueue(plainMessage(), undoHold: .zero, now: 1_000)
+    await transport.setSendError(TransportBoom())
+
+    // First flush: the send is attempted (sendCount == 1) and throws. Nothing
+    // is confirmed, and the job is stranded `in_flight`.
+    let firstSent = try await service.flushOnce(now: 1_000)
+    #expect(firstSent == 0)
+    #expect(await transport.sendCount == 1)  // the wire WAS hit, exactly once
+    let stranded = try await database.inFlightSendJobs(account: account)
+    #expect(stranded.count == 1)  // left in_flight — not pending, not failed
+    // Not pending/held either: it is not on the claim worklist.
+    #expect(try await database.claimSendable(account: account, now: 999_999).isEmpty)
+
+    // The failed wire call actually DID land server-side (the classic
+    // kill-after-send ambiguity). Clear the error and script the probe to find
+    // it. The second flush must resolve it via the probe, NOT a fresh send.
+    await transport.setSendError(nil)
+    await transport.setProbeHit("gmail-recovered", forRFC822: stranded[0].rfc822MessageID)
+
+    let secondSent = try await service.flushOnce(now: 2_000)
+    #expect(secondSent == 1)                       // confirmed sent — via probe
+    #expect(await transport.sendCount == 1)        // STILL 1: never resent across the failure
+    #expect(try await database.inFlightSendJobs(account: account).isEmpty)  // terminal `sent`
+    _ = jobID
+}
+
+@Test func probeErrorRethrowsAndLeavesJobInFlight() async throws {
+    // A probe that itself throws (Gmail unreachable) is not a non-delivery
+    // signal — §7.3 forbids guessing. `flushOnce` must rethrow and leave the
+    // job `in_flight` for the next pass, never resend.
+    let database = try HudsonDatabase.inMemory()
+    let transport = RecordingSendTransport()
+    let service = SendService(api: transport, database: database, account: account)
+
+    let jobID = try await service.enqueue(plainMessage(), undoHold: .zero, now: 1_000)
+    try await database.markSendInFlight(id: jobID, account: account)
+    await transport.setProbeError(TransportBoom())
+
+    await #expect(throws: TransportBoom.self) {
+        _ = try await service.flushOnce(now: 2_000)
+    }
+    // Untouched: still in_flight, never resent.
+    #expect(try await database.inFlightSendJobs(account: account).count == 1)
+    #expect(await transport.sendCount == 0)
 }
 
 @Test func enqueueRejectsOversizedMessageAtEnqueueTime() async throws {
