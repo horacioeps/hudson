@@ -11,3 +11,4 @@ xcuserdata/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+dist/
