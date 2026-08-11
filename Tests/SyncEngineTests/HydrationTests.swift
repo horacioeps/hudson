@@ -106,9 +106,10 @@ import Testing
     // Establish the cursor and complete the (empty) backfill first.
     _ = try await engine.syncOnce()
 
-    // Materialize two in-window messages via history — this is data straight
-    // out of the history record, no getMessage call involved (mirrors
-    // HistoryTests' unknownLabelEventHydratesTheMessage setup).
+    // Two in-window messages arrive as minimal history stubs; the engine
+    // reconciles each with a metadata get, which materializes an in-window row
+    // (has_body=0) that hydration then fills. Both must be served for that
+    // metadata get.
     await gmail.setHistory([historyPage("""
         {"historyId": "150", "history": [
           {"id": "140", "messagesAdded": [{"message":
@@ -122,13 +123,21 @@ import Testing
         ]}
         """)])
     await gmail.setMessages([
+        // Survives the whole pass — served for both the metadata reconciliation
+        // get AND the body-hydration ("full") get.
         "mSurvivor": testMessageWithBody(
             id: "mSurvivor", historyID: "999", internalDate: String(threeDaysAgoMS),
-            plainText: "still here after the vanish")
+            plainText: "still here after the vanish"),
+        // Exists at reconciliation time, so it materializes a has_body=0 row...
+        "mGone": testMessage(
+            id: "mGone", historyID: "140", internalDate: String(threeDaysAgoMS),
+            labels: ["INBOX"]),
     ])
-    // "mGone" is deliberately never registered in messagesByID: its hydration
-    // getMessage(format: "full") 404s, simulating a message deleted between
-    // the history poll and body hydration.
+    // ...but "mGone" is deleted server-side before body hydration: its
+    // getMessage(format: "full") 404s while its metadata get still succeeds,
+    // simulating a message that vanished between the reconciliation and the
+    // body fetch. That 404 must tombstone the row.
+    await gmail.setIDsVanishedBeforeBodyFetch(["mGone"])
 
     let report = try await engine.syncOnce()
     #expect(report.eventsApplied == 2)

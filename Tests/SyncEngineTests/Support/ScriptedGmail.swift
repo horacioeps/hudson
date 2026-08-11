@@ -43,6 +43,12 @@ actor ScriptedGmail: GmailAPI {
     var listPages: [MessageListPage]
     var messagesByID: [String: GmailMessage]
     var historyPages: [HistoryPage]
+    /// Ids that exist for the metadata reconciliation get (history/backfill)
+    /// but 404 on the body-hydration `format: "full"` get — models a message
+    /// deleted server-side in the window BETWEEN the engine materializing its
+    /// `has_body=0` row and hydration fetching its body, all within one pass.
+    /// (Empty by default, so it changes nothing for tests that don't opt in.)
+    var idsVanishedBeforeBodyFetch: Set<String> = []
     /// When set, listHistory throws this (e.g. 404 expiry) instead of serving.
     var historyError: GmailError?
     /// Scripted `modify` response — see `GmailMessageStub`. Defaults to
@@ -97,6 +103,11 @@ actor ScriptedGmail: GmailAPI {
 
     func getMessage(id: String, format: String) async throws -> GmailMessage {
         calls.append("get:\(id):\(format)")
+        // The message survived long enough to be reconciled (metadata) but has
+        // since been deleted, so only its body-hydration ("full") get 404s.
+        if format == "full" && idsVanishedBeforeBodyFetch.contains(id) {
+            throw GmailError.invalidRequest(status: 404, message: "no message \(id)")
+        }
         guard let message = messagesByID[id] else {
             throw GmailError.invalidRequest(status: 404, message: "no message \(id)")
         }
@@ -138,6 +149,11 @@ actor ScriptedGmail: GmailAPI {
     func setHistory(_ pages: [HistoryPage]) { historyPages = pages }
     func setMessages(_ messages: [String: GmailMessage]) {
         messagesByID.merge(messages) { _, new in new }
+    }
+    /// Marks ids that 404 on their body-hydration ("full") get while still
+    /// serving their metadata reconciliation get — see the property above.
+    func setIDsVanishedBeforeBodyFetch(_ ids: Set<String>) {
+        idsVanishedBeforeBodyFetch = ids
     }
     func setProfileHistoryID(_ id: String) {
         profile = Profile(
