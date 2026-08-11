@@ -101,10 +101,10 @@ private func makeComposer(
 /// Once the undo hold elapses on its own — nobody tapped Undo — the model
 /// clears its own `justSentUndoJobID` handle (`scheduleUndoExpiry`), so
 /// `ComposerView.bottomToast` (a pure function of that property) hides
-/// itself without needing any view-local timer. The underlying job row is
-/// untouched — only the UI-facing handle expires, not the send itself
-/// (that's still `SendService.claimSendable`'s call once a real flush pass
-/// runs past `hold_until`, unrelated to this in-process timer).
+/// itself without needing any view-local timer. When the hold elapses and the
+/// user did NOT undo, the composer also FLUSHES the now-claimable job to Gmail
+/// — the fix for "the app said Sent but the mail never left the queue" (the
+/// prior behavior left delivery to a periodic flush that wasn't wired).
 @MainActor
 @Test func justSentUndoJobIDAutoClearsAfterHoldWindowElapses() async throws {
     let db = try HudsonDatabase.inMemory()
@@ -124,10 +124,10 @@ private func makeComposer(
 
     try await Task.sleep(for: .milliseconds(220))  // well past the 60ms hold
 
-    #expect(model.justSentUndoJobID == nil)  // handle auto-cleared, no `undo()` call needed
+    #expect(model.justSentUndoJobID == nil)  // undo handle auto-cleared, no `undo()` call needed
     let job = try #require(try await db.sendJob(id: jobID, account: email))
-    #expect(job.state == .pending)  // the row itself is untouched by the local timer
-    #expect(await transport.timesSent() == 0)  // and nothing was ever sent
+    #expect(job.state == .sent)  // the hold elapsed with no undo -> the composer flushed it out
+    #expect(await transport.timesSent() == 1)  // and it actually reached (the fake) Gmail
 }
 
 /// Regression test for the exact bug this fix-loop closed: a SECOND send
