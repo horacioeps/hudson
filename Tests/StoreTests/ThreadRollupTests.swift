@@ -173,21 +173,29 @@ private final class StatementCounter: @unchecked Sendable {
 // MARK: - The named biggest risk: bounded, not O(N²)
 
 @Test func rollupMaintenanceStaysBoundedOnLargeThread() async throws {
-    let db = try HudsonDatabase.inMemory()
-    let counter = StatementCounter()
-    try await db.writer.write { conn in
-        conn.trace { _ in counter.increment() }
+    // Inserts `n` messages into ONE thread, newest-first, into a fresh
+    // in-memory db — returns the statement count (guard 1) and wall-clock
+    // elapsed (guard 2's raw material). Factored out so guard 2 can compare
+    // two different thread sizes on the SAME run, rather than compare one
+    // size against a fixed absolute number.
+    func insertLargeThread(_ n: Int) async throws -> (statementCount: Int, elapsed: Duration, row: RollupSnapshot?) {
+        let db = try HudsonDatabase.inMemory()
+        let counter = StatementCounter()
+        try await db.writer.write { conn in
+            conn.trace { _ in counter.increment() }
+        }
+        let start = ContinuousClock.now
+        for i in stride(from: n, through: 1, by: -1) {
+            _ = try await db.applySnapshot(snap("m\(i)", date: Int64(i), labels: ["INBOX"]), account: "x")
+        }
+        let elapsed = start.duration(to: .now)
+        return (counter.count, elapsed, try await rollupRow(db, account: "x", thread: "t1"))
     }
+
     let messageCount = 2000
-    let start = ContinuousClock.now
-    // N messages in ONE thread applied newest-first — must not degrade to O(N^2).
-    for i in stride(from: messageCount, through: 1, by: -1) {
-        _ = try await db.applySnapshot(snap("m\(i)", date: Int64(i), labels: ["INBOX"]), account: "x")
-    }
-    let elapsed = start.duration(to: .now)
-    let row = try #require(try await rollupRow(db, account: "x", thread: "t1"))
-    #expect(row.messageCount == messageCount)
-    #expect(row.lastMessageAt == Int64(messageCount))
+    let full = try await insertLargeThread(messageCount)
+    #expect(full.row?.messageCount == messageCount)
+    #expect(full.row?.lastMessageAt == Int64(messageCount))
     // Two independent guards, because either shape of regression must fail
     // this test:
     //  1. Statement COUNT — catches a regression that issues MORE SQL
@@ -206,22 +214,43 @@ private final class StatementCounter: @unchecked Sendable {
     //     internally amplifies across `fts_messages`'s several shadow
     //     tables — it carries three configured prefix indexes
     //     (`prefix='2 3 4'`), each maintaining its own b-tree. Still O(1)
-    //     per message (confirmed by guard 2's wall-clock bound below
-    //     staying flat), just a higher constant than before FTS existed.
-    #expect(counter.count < messageCount * 35)
-    //  2. Wall-clock — catches a regression that keeps a FIXED statement
-    //     count per message but makes each statement scan the whole
-    //     thread (e.g. calling the full-rebuild `recomputeThreadRollup`
+    //     per message (confirmed by guard 2's ratio staying flat), just a
+    //     higher constant than before FTS existed. Deterministic and
+    //     machine-speed-independent by construction (a statement count
+    //     doesn't care how fast the runner is), so this one keeps its
+    //     original absolute-bound shape.
+    #expect(full.statementCount < messageCount * 35)
+    //  2. Wall-clock RATIO — catches a regression that keeps a FIXED
+    //     statement count per message but makes each statement scan the
+    //     whole thread (e.g. calling the full-rebuild `recomputeThreadRollup`
     //     on every insert instead of `maintainRollup`'s O(1) upsert).
-    //     Statement count alone is blind to this: SQLite's trace fires
-    //     once per statement EXECUTION regardless of how many rows that
+    //     Statement count alone is blind to this: SQLite's trace fires once
+    //     per statement EXECUTION regardless of how many rows that
     //     execution internally scans, so a same-count-but-O(thread size)-
     //     per-call regression wouldn't move guard 1 at all — confirmed by
     //     hand-injecting exactly that regression (an unconditional
     //     `recomputeThreadFlags` call after every apply) during review:
-    //     guard 1 stayed green (still ~10 statements/message) while this
-    //     one went from well under a second to ~6.8s.
-    #expect(elapsed < .seconds(5))
+    //     guard 1 stayed green while wall-clock cost went from well under a
+    //     second to several seconds.
+    //
+    //     Fix round (M5 Task 7 carry-forward): the ORIGINAL form of this
+    //     guard asserted an ABSOLUTE bound (`elapsed < .seconds(5)`) on the
+    //     2000-message run above — a bet on the CI runner's speed, and
+    //     therefore flaky under machine load independent of any real
+    //     regression. Comparing the SAME algorithm at two thread sizes on
+    //     the SAME runner, in the SAME test, cancels the runner's absolute
+    //     speed out of the assertion entirely: O(1)-per-message maintenance
+    //     means total cost is O(N), so quadrupling the thread size should
+    //     roughly quadruple wall-clock cost, not the ~16x a reintroduced
+    //     O(N²) per-message full-thread scan would produce.
+    let quarter = try await insertLargeThread(messageCount / 4)
+    // Linear (O(N)) scaling predicts ~4x; true O(N²) predicts ~16x. 10x is
+    // the threshold: comfortably clear of linear (leaves headroom for
+    // ordinary timing noise, including on a loaded/throttled CI runner —
+    // the *ratio* stays close to 4x regardless of the runner's absolute
+    // speed), while still decisively short of the ~16x an O(N²) regression
+    // would produce.
+    #expect(full.elapsed < quarter.elapsed * 10)
 }
 
 // MARK: - Fix wave 2: batch-deduped .labels/.deleted rollup recomputes
