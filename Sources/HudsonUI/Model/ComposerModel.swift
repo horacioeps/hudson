@@ -50,6 +50,14 @@ public final class ComposerModel {
     public var subject: String = ""
     public var bodyText: String = ""
 
+    /// The quoted copy of the message being replied to, held OUT of the
+    /// editable `bodyText` so the composer opens on a clean field, and
+    /// re-attached beneath the reply by `outgoingBody` at send time. Empty for
+    /// a new compose. Exposed read-only so the sheet can offer it behind a
+    /// "show quoted text" toggle — the user can inspect what will be sent
+    /// without having to scroll past it to type.
+    public private(set) var quotedReplyText: String = ""
+
     public private(set) var mode: Mode = .new
 
     /// The reply's threading scaffold, built once by `startReply` from the
@@ -157,6 +165,7 @@ public final class ComposerModel {
         cc = ""
         subject = ""
         bodyText = ""
+        quotedReplyText = ""
         banner = nil
         undoExpiryTask?.cancel()
         undoExpiryTask = nil
@@ -184,7 +193,10 @@ public final class ComposerModel {
             to = scaffold.to.joined(separator: ", ")
             cc = scaffold.cc.joined(separator: ", ")
             subject = scaffold.subject
-            bodyText = await quotedReplyPrefill(threadID: threadID)
+            // Empty body, cursor ready — the quote lives apart and is
+            // re-attached in `outgoingBody` at send time.
+            bodyText = ""
+            quotedReplyText = await quotedOriginal(threadID: threadID)
             banner = nil
             undoExpiryTask?.cancel()
             undoExpiryTask = nil
@@ -307,7 +319,7 @@ public final class ComposerModel {
                 to: Self.splitAddressList(to),
                 cc: Self.splitAddressList(cc),
                 subject: subject,
-                bodyText: bodyText)
+                bodyText: outgoingBody)
         case .reply:
             guard let scaffold = replyScaffold else { return nil }
             return OutboxMessage(
@@ -316,7 +328,7 @@ public final class ComposerModel {
                 cc: scaffold.cc,
                 bcc: scaffold.bcc,
                 subject: scaffold.subject,
-                bodyText: bodyText,
+                bodyText: outgoingBody,
                 bodyHTML: nil,
                 attachments: scaffold.attachments,
                 inReplyTo: scaffold.inReplyTo,
@@ -325,13 +337,27 @@ public final class ComposerModel {
         }
     }
 
-    /// Seeds a reply's `bodyText` with a quoted copy of the thread's newest
-    /// message — the familiar "type above the quote" layout. Falls back to the
-    /// message's snippet when its full body isn't hydrated yet, and to an
-    /// empty draft if the thread can't be read (the scaffold, built from the
-    /// same read moments earlier, is what actually threads the reply — the
-    /// quote is a convenience).
-    private func quotedReplyPrefill(threadID: String) async -> String {
+    /// Builds the quoted copy of the thread's newest message that will be
+    /// appended BENEATH the reply at send time.
+    ///
+    /// It is deliberately not put into `bodyText`. The composer body holds
+    /// only what the user is writing (Pencil "Composer + AI Draft" → Body,
+    /// which contains prose and a caret and nothing else), so a reply opens on
+    /// an empty field instead of a screenful of `>` markers the user has to
+    /// scroll past to find their cursor.
+    ///
+    /// It also quotes only the NEW half of the original. A reply's stored body
+    /// already contains every earlier round of history, so re-quoting it whole
+    /// re-marked text that was already `>`-marked — which is why a few rounds
+    /// in, the draft carried `>>`, `>>>`, and a stack of "On … wrote:" lines.
+    /// `QuotedText.split` is the same boundary detector the reading pane uses
+    /// to collapse history, so the two agree on where a message ends.
+    ///
+    /// Falls back to the snippet when the full body isn't hydrated yet, and to
+    /// an empty quote if the thread can't be read — the scaffold, built from
+    /// the same read moments earlier, is what actually threads the reply, so
+    /// losing the quote costs nothing but convenience.
+    private func quotedOriginal(threadID: String) async -> String {
         let email = account?.email ?? ""
         guard let messages = try? await database.threadMessages(threadID: threadID, account: email),
             let newest = messages.last
@@ -341,13 +367,21 @@ public final class ComposerModel {
         // (nil until sync hydrates the body), so fall back to the snippet.
         let fetchedBody = try? await database.messageBody(id: newest.id, account: email)
         let original = fetchedBody?.plainText ?? newest.snippet
-        let quoted = original
+        let (newContent, _) = QuotedText.split(original)
+        guard !newContent.isEmpty else { return "" }
+        let quoted = newContent
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { "> \($0)" }
             .joined(separator: "\n")
-        // Two blank lines above the attribution give the user room to type
-        // their reply before the quoted original.
-        return "\n\nOn \(newest.fromLine) wrote:\n\(quoted)"
+        return "On \(newest.fromLine) wrote:\n\(quoted)"
+    }
+
+    /// The full text to send: what the user wrote, then the quoted original
+    /// beneath it. The two are stored apart so the editor stays clean, and are
+    /// only ever recombined here.
+    var outgoingBody: String {
+        guard !quotedReplyText.isEmpty else { return bodyText }
+        return "\(bodyText)\n\n\(quotedReplyText)"
     }
 
     private func clearDraftFields() {
@@ -355,6 +389,7 @@ public final class ComposerModel {
         cc = ""
         subject = ""
         bodyText = ""
+        quotedReplyText = ""
         replyScaffold = nil
         mode = .new
     }
