@@ -37,23 +37,29 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
 }
 
 @MainActor
-@Test func openLoadsMessagesNewestExpandedOlderCollapsed() async throws {
+@Test func openExpandsEveryMessageAndFetchesEachBody() async throws {
     let db = try HudsonDatabase.inMemory()
     let account = "you@hudson.app"
     try await seedTwoMessageThread(into: db, account: account)
 
     let model = ThreadModel(database: db, account: account)
     await model.open(threadID: "th1")
-    try await Task.sleep(for: .milliseconds(50))
+    // `allSatisfy` is vacuously true on an empty array, so the emptiness
+    // check is what makes this wait for the first emission rather than
+    // sailing straight through it.
+    try await waitUntil {
+        !model.messages.isEmpty && model.messages.allSatisfy { $0.bodyText != nil }
+    }
 
     #expect(model.messages.count == 2)
     #expect(model.messages.map(\.id) == ["th1-m0", "th1-m1"])
-    #expect(model.messages[0].isExpanded == false)
+    // The reading pane presents a thread as a continuous conversation, so a
+    // message opens expanded and its body is fetched — not one open message
+    // above a stack of stubs (Pencil "Thread (Expanded)").
+    #expect(model.messages[0].isExpanded == true)
     #expect(model.messages[1].isExpanded == true)
-    // The expanded (newest) message's body was fetched eagerly on open.
+    #expect(model.messages[0].bodyText == "Body of the first message.")
     #expect(model.messages[1].bodyText == "Body of the second (newest) message.")
-    // The collapsed (older) message's body is NOT fetched until expanded.
-    #expect(model.messages[0].bodyText == nil)
 }
 
 @MainActor
@@ -64,17 +70,22 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
 
     let model = ThreadModel(database: db, account: account)
     await model.open(threadID: "th1")
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil {
+        !model.messages.isEmpty && model.messages.allSatisfy { $0.bodyText != nil }
+    }
 
-    #expect(model.messages[0].isExpanded == false)
-    model.toggleExpanded("th1-m0")
+    // Messages now open expanded, so the first toggle COLLAPSES.
     #expect(model.messages[0].isExpanded == true)
-    try await Task.sleep(for: .milliseconds(50))
     #expect(model.messages[0].bodyText == "Body of the first message.")
 
     model.toggleExpanded("th1-m0")
     #expect(model.messages[0].isExpanded == false)
-    // Collapsing never clears an already-cached body.
+    // Collapsing never clears an already-cached body...
+    #expect(model.messages[0].bodyText == "Body of the first message.")
+
+    // ...so re-expanding is instant, with no second fetch.
+    model.toggleExpanded("th1-m0")
+    #expect(model.messages[0].isExpanded == true)
     #expect(model.messages[0].bodyText == "Body of the first message.")
 }
 
@@ -90,22 +101,25 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
 
     let model = ThreadModel(database: db, account: account)
     await model.open(threadID: "th1")
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.messages.count == 2 }
 
-    // User expands the older message too, so BOTH are expanded going in.
+    // User COLLAPSES the older message, so the two differ going in — a
+    // re-emit that reset state would be invisible if both matched the default.
     model.toggleExpanded("th1-m0")
     try await Task.sleep(for: .milliseconds(50))
-    #expect(model.messages[0].isExpanded == true)
+    #expect(model.messages[0].isExpanded == false)
     #expect(model.messages[1].isExpanded == true)
 
     #expect(model.messages[1].row.labelIDs.contains("UNREAD") == false)
     try await Triage.markUnread(messageID: "th1-m1", account: account, database: db)
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.messages[1].row.labelIDs.contains("UNREAD") }
 
     // Label state updated...
     #expect(model.messages[1].row.labelIDs.contains("UNREAD") == true)
-    // ...but expand state for both still-present messages was preserved.
-    #expect(model.messages[0].isExpanded == true)
+    // ...but expand state for both still-present messages was preserved,
+    // including the hand-collapsed one, which must NOT snap back to the
+    // expanded default.
+    #expect(model.messages[0].isExpanded == false)
     #expect(model.messages[1].isExpanded == true)
 }
 
@@ -131,7 +145,7 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
 
     let model = ThreadModel(database: db, account: account)
     await model.open(threadID: "th3")
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.messages.first?.rawHTML != nil }
 
     let message = try #require(model.messages.first)
     #expect(message.isExpanded)  // newest -> auto-expanded -> body fetched eagerly
@@ -161,7 +175,7 @@ private func seedTwoMessageThread(into db: HudsonDatabase, account: String) asyn
 
     let model = ThreadModel(database: db, account: account)
     await model.open(threadID: "th2")
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.subject.isEmpty }
 
     #expect(model.subject == "Re: Proposal draft")
     // "you@hudson.app" (no `Name <email>` form) falls back to its local
@@ -215,7 +229,7 @@ private actor HydrateBodyRecorder {
         })
 
     await model.open(threadID: "th4")
-    try await Task.sleep(for: .milliseconds(80))
+    try await waitUntil { model.messages.first?.bodyText != nil }
 
     #expect(model.messages.count == 1)
     #expect(model.messages[0].isExpanded)  // sole message -> newest -> auto-expanded
@@ -238,11 +252,11 @@ private actor HydrateBodyRecorder {
         })
 
     await model.open(threadID: "th1")
-    try await Task.sleep(for: .milliseconds(50))
-    // Expanding the already-hydrated older message too must still never
-    // reach for the network — its body is already local.
-    model.toggleExpanded("th1-m0")
-    try await Task.sleep(for: .milliseconds(50))
+    // Both messages are expanded on open, and both already have LOCAL
+    // bodies — so both must resolve without ever reaching for the network.
+    try await waitUntil {
+        !model.messages.isEmpty && model.messages.allSatisfy { $0.bodyText != nil }
+    }
 
     #expect(model.messages[0].bodyText == "Body of the first message.")
     #expect(model.messages[1].bodyText == "Body of the second (newest) message.")
@@ -272,10 +286,12 @@ private actor HydrateBodyRecorder {
     let db = try HudsonDatabase.inMemory()
     let account = "you@hudson.app"
     try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
-    // "th7-m1" (newest -> auto-expanded by `open`) already has a LOCAL body,
-    // so `open`'s own eager fetch never touches `hydrateBody` for it — the
-    // recorder starts clean. "th7-m0" (older -> starts collapsed, no body)
-    // is the message under test.
+    // "th7-m1" already has a LOCAL body, so its on-open fetch never touches
+    // `hydrateBody`. "th7-m0" has none and is the message under test: its
+    // FIRST hydrate (the one `open` fires) deliberately fails, leaving it
+    // expanded-with-no-body and nothing in flight, which is the state a
+    // collapse/re-expand needs in order to fire `toggleExpanded`'s own
+    // independent `Task` — the only genuine racer, per the note above.
     _ = try await db.applySnapshot(
         MessageSnapshot(
             id: "th7-m0", threadID: "th7", historyID: 1, internalDate: 1000,
@@ -296,7 +312,11 @@ private actor HydrateBodyRecorder {
     let model = ThreadModel(
         database: db, account: account,
         hydrateBody: { id in
+            let isFirstAttempt = await recorder.calls.isEmpty
             await recorder.record(id)
+            // The on-open attempt fails fast and saves nothing, so the
+            // message is left uncached with no fetch outstanding.
+            guard !isFirstAttempt else { return false }
             // Wide enough that the sibling-triggered re-emit below lands
             // WHILE this fetch is still in flight, giving the in-flight
             // guard something to actually guard.
@@ -309,11 +329,22 @@ private actor HydrateBodyRecorder {
         })
 
     await model.open(threadID: "th7")
-    try await Task.sleep(for: .milliseconds(50))
-    #expect(model.messages[0].isExpanded == false)  // "th7-m0" starts collapsed
+    try await waitUntil { !model.messages.isEmpty }
+    // The on-open attempt is async and its failure leaves `bodyText` nil, so
+    // there is no view state to poll — wait on the recorder itself.
+    // (`waitUntil`'s condition is synchronous and can't await the actor.)
+    for _ in 0..<300 where await recorder.calls.isEmpty {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    // Expanded by default, but its body fetch failed, so it is still uncached.
+    #expect(model.messages[0].isExpanded == true)
+    #expect(model.messages[0].bodyText == nil)
+    #expect(await recorder.calls == ["th7-m0"])
 
-    // Expand it — `toggleExpanded`'s OWN unstructured `Task` starts fetching
-    // "th7-m0" via `hydrateBody`, independent of `observationTask`.
+    // Collapse, then re-expand: THAT expand is what fires `toggleExpanded`'s
+    // own unstructured `Task`, independent of `observationTask`.
+    model.toggleExpanded("th7-m0")
+    #expect(model.messages[0].isExpanded == false)
     model.toggleExpanded("th7-m0")
     #expect(model.messages[0].isExpanded == true)
 
@@ -326,7 +357,9 @@ private actor HydrateBodyRecorder {
     try await Triage.markUnread(messageID: "th7-m1", account: account, database: db)
     try await Task.sleep(for: .milliseconds(200))
 
-    #expect(await recorder.calls == ["th7-m0"])
+    // Two calls total — the failed on-open attempt and the re-expand — and
+    // crucially NOT a third from the re-emit that landed mid-flight.
+    #expect(await recorder.calls == ["th7-m0", "th7-m0"])
     #expect(model.messages[0].bodyText == "Hydrated")
 }
 
@@ -347,7 +380,7 @@ private actor HydrateBodyRecorder {
 
     let model = ThreadModel(database: db, account: account)  // hydrateBody defaults to nil
     await model.open(threadID: "th6")
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.messages.isEmpty }
 
     #expect(model.messages[0].isExpanded)
     #expect(model.messages[0].bodyText == nil)
