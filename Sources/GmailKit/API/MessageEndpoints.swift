@@ -2,11 +2,17 @@ import Foundation
 
 extension GmailClient {
     /// One newest-first page of message ids (spec §4.1 backfill driver).
+    ///
+    /// `query` is a Gmail search expression (`after:`, `label:`, …) narrowing
+    /// the listing — SyncEngine uses it to bound backfill to a window of mail
+    /// around the connect date. Passing `nil` omits the parameter entirely
+    /// rather than sending an empty `q=`, which Gmail does not treat the same.
     public func listMessages(
-        pageToken: String?, maxResults: Int = 100
+        pageToken: String?, maxResults: Int = 100, query searchQuery: String? = nil
     ) async throws -> MessageListPage {
         var query = [URLQueryItem(name: "maxResults", value: String(maxResults))]
         if let pageToken { query.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+        if let searchQuery { query.append(URLQueryItem(name: "q", value: searchQuery)) }
         return try await get(
             template: "users/me/messages", path: "users/me/messages",
             query: query, cost: GmailQuotaCost.messagesList)

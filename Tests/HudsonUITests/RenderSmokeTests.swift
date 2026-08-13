@@ -551,3 +551,59 @@ private func makeRenderSmokeOnboardingModel(database: HudsonDatabase) -> Onboard
     #expect(view.isUndoToastShown)  // the ACTUAL condition `bottomToast` renders on
     assertRendered(host.fittingSize)
 }
+
+/// `ThreadView` against `t41` — the demo thread whose newest message is
+/// prose-only HTML with a `gmail_quote` block. This is the reading pane's
+/// NATIVE path: no `WKWebView`, no white card, sender styling discarded, and
+/// the quoted history split off behind the "···" toggle. Renders to a PNG when
+/// `HUDSON_SNAPSHOT=1`, so the dark-ground fidelity is eyeballable; otherwise
+/// it's a plain "it lays out" smoke test like its `t01` sibling above.
+@MainActor
+@Test func threadViewRendersNativeHTMLBodyOnTheDarkGround() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db)
+    let thread = ThreadModel(database: db, account: AppModel.demoAccount)
+    await thread.open(threadID: "t41")
+    try await waitUntil { thread.messages.contains { $0.rawHTML != nil } }
+
+    // The newest message must have reached the native path with a body — an
+    // empty one would render a blank pane and still "lay out" fine.
+    let newest = try #require(thread.messages.max(by: { $0.row.internalDate < $1.row.internalDate }))
+    let html = try #require(newest.rawHTML.map { String(decoding: $0, as: UTF8.self) })
+    #expect(SimpleBody.isSimple(html: html))
+    let parsed = MessageBodyParser.parse(html: html)
+    #expect(ParsedBody.text(parsed.new).contains("indemnity cap"))
+    #expect(!parsed.quoted.isEmpty, "the gmail_quote block must be split off")
+
+    let summary = SummaryModel(database: db, account: AppModel.demoAccount)
+    let view = ThreadView(
+        thread: thread, summary: summary, onArchive: {}, onToggleStar: {}, onReply: {},
+        onSummarize: {})
+    let host = NSHostingView(rootView: view)
+    host.frame = .init(x: 0, y: 0, width: 760, height: 700)
+    host.layout()
+    assertRendered(host.fittingSize)
+
+    guard ProcessInfo.processInfo.environment["HUDSON_SNAPSHOT"] == "1" else { return }
+    // Same recipe as `SnapshotHarness.render`, and for the same reason:
+    // `ImageRenderer` comes back blank for a `ScrollView`'s contents, so the
+    // capture needs a real window and a synchronous display cycle.
+    let frame = NSRect(x: 0, y: 0, width: 760, height: 700)
+    let window = NSWindow(
+        contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = host
+    window.orderFrontRegardless()
+    try await Task.sleep(for: .milliseconds(250))
+    host.layoutSubtreeIfNeeded()
+    window.display()
+    if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+        host.cacheDisplay(in: host.bounds, to: rep)
+        let dir = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["HUDSON_SNAPSHOT_DIR"]
+                ?? NSTemporaryDirectory(), isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try rep.representation(using: .png, properties: [:])?
+            .write(to: dir.appending(path: "hudson-native-body.png"))
+    }
+    window.orderOut(nil)
+}

@@ -56,6 +56,7 @@ public struct RootView: View {
         Group {
             if let model, !model.needsOnboarding {
                 assembled(model)
+                    .transition(.opacity)
             } else if let onboarding {
                 // First launch, no account yet (Task 4's gate) — the ENTIRE
                 // mailbox chrome stays unmounted until a real account exists,
@@ -63,10 +64,21 @@ public struct RootView: View {
                 // anything" posture, just with a graphical sign-in instead of
                 // a terminal command.
                 OnboardingView(model: onboarding)
+                    .transition(.opacity)
             } else {
                 loadingPlaceholder
+                    .transition(.opacity)
             }
         }
+        // Opacity only, and only between these three branches. Both crossings
+        // are once-per-launch arrivals into a shell the user is waiting on
+        // (boot, and finishing sign-in), which is the one case where an
+        // async-driven transition is honest rather than jank. Nothing here may
+        // animate size: the `.frame` below sits outside this `Group` precisely
+        // so the window's minimums are never interpolated, and
+        // `RenderSmokeTests` measures `fittingSize` immediately after the
+        // onboarding branch flips.
+        .animation(Motion.crossfade, value: bootPhase)
         .frame(minWidth: 1040, minHeight: 680)
         .background(Palette.bgApp)
         .task {
@@ -123,6 +135,17 @@ public struct RootView: View {
             guard needsOnboarding == true, let model, onboarding == nil else { return }
             onboarding = makeOnboardingModel(for: model)
         }
+    }
+
+    /// Which of `body`'s three branches is showing, as one value to key the
+    /// crossfade on. Deliberately NOT the `model` identity: swapping in a new
+    /// `AppModel` for the same phase (there is no such path today, but there
+    /// is nothing stopping one) must not re-fade an already-visible mailbox.
+    private enum BootPhase { case loading, onboarding, mailbox }
+
+    private var bootPhase: BootPhase {
+        if let model, !model.needsOnboarding { return .mailbox }
+        return onboarding == nil ? .loading : .onboarding
     }
 
     // MARK: - Onboarding (Task 4's gate — see `onboarding` above)
@@ -185,63 +208,94 @@ public struct RootView: View {
         ZStack {
             threePane(model)
 
-            if let syncBanner = model.syncBanner {
-                VStack(spacing: 0) {
-                    Banner(text: syncBanner, role: .warn)
-                    Spacer(minLength: 0)
-                }
-            }
-
-            if model.isPaletteVisible {
-                overlay {
-                    CommandPaletteView(
-                        command: model.command,
-                        perform: { model.perform($0) },
-                        onClose: { model.isPaletteVisible = false })
-                } onDismiss: {
-                    model.isPaletteVisible = false
-                }
-            }
-
-            if model.isSearchVisible {
-                overlay {
-                    SearchView(
-                        search: model.search,
-                        onOpen: { threadID in
-                            model.isSearchVisible = false
-                            model.openThread(threadID)
-                        })
-                } onDismiss: {
-                    model.isSearchVisible = false
-                }
-            }
-
-            if model.isComposerVisible {
-                overlay {
-                    ComposerView(
-                        composer: model.composer, onClose: { model.isComposerVisible = false })
-                } onDismiss: {
-                    model.isComposerVisible = false
-                }
-            }
-
-            if model.isSettingsVisible {
-                overlay {
-                    SettingsView(
-                        settings: model.settings,
-                        accountEmail: model.account?.email,
-                        onDisconnect: { Task { await model.disconnectAccount() } },
-                        onClose: { model.isSettingsVisible = false })
-                } onDismiss: {
-                    model.isSettingsVisible = false
-                }
-            }
-
+            syncBannerStrip(model)
+            overlays(model)
             sentUndoToast(model)
         }
         // Invisible — installs the app-wide `NSEvent` monitor that drives
         // every keyboard shortcut (see `KeyboardMonitor`/`KeyRouter`).
         .background(KeyboardMonitor(appModel: model))
+    }
+
+    /// The top-pinned sync banner. Safe to slide — it OVERLAYS the panes
+    /// rather than displacing them (that `Spacer` is what keeps it out of the
+    /// layout), so an inbox row's frame can never move because a banner
+    /// arrived, and the list's 16ms budget is untouched.
+    private func syncBannerStrip(_ model: AppModel) -> some View {
+        VStack(spacing: 0) {
+            if let syncBanner = model.syncBanner {
+                Banner(text: syncBanner, role: .warn)
+                    .transition(Motion.banner)
+            }
+            Spacer(minLength: 0)
+        }
+        .animation(model.syncBanner == nil ? Motion.dismiss : Motion.settle, value: model.syncBanner)
+    }
+
+    /// The modal stack. All four overlays share ONE animation, keyed on all
+    /// four flags at once, for two reasons: the palette→search handoff closes
+    /// one and opens the other in the same tick (`AppModel.showSearch`), so a
+    /// single transaction cross-fades them instead of flashing the scrim off
+    /// and back on; and the direction is read off the resulting state, which
+    /// is what buys the asymmetry — arriving should feel placed (`present`'s
+    /// spring), dismissing should feel instant (`dismiss`'s half-length ease).
+    private func overlays(_ model: AppModel) -> some View {
+        let visible = OverlayVisibility(model)
+        return ZStack {
+            overlay(isPresented: model.isPaletteVisible) {
+                CommandPaletteView(
+                    command: model.command,
+                    perform: { model.perform($0) },
+                    onClose: { model.isPaletteVisible = false })
+            } onDismiss: {
+                model.isPaletteVisible = false
+            }
+
+            overlay(isPresented: model.isSearchVisible) {
+                SearchView(
+                    search: model.search,
+                    onOpen: { threadID in
+                        model.isSearchVisible = false
+                        model.openThread(threadID)
+                    })
+            } onDismiss: {
+                model.isSearchVisible = false
+            }
+
+            overlay(isPresented: model.isComposerVisible) {
+                ComposerView(
+                    composer: model.composer, onClose: { model.isComposerVisible = false })
+            } onDismiss: {
+                model.isComposerVisible = false
+            }
+
+            overlay(isPresented: model.isSettingsVisible) {
+                SettingsView(
+                    settings: model.settings,
+                    accountEmail: model.account?.email,
+                    onDisconnect: { Task { await model.disconnectAccount() } },
+                    onClose: { model.isSettingsVisible = false })
+            } onDismiss: {
+                model.isSettingsVisible = false
+            }
+        }
+        .animation(visible.isEmpty ? Motion.dismiss : Motion.present, value: visible)
+    }
+
+    /// The four overlay flags as one comparable value — every flip animates,
+    /// and `isEmpty` is what tells the modifier above whether this frame is an
+    /// arrival or a dismissal.
+    private struct OverlayVisibility: Equatable {
+        let palette: Bool, search: Bool, composer: Bool, settings: Bool
+
+        @MainActor init(_ model: AppModel) {
+            palette = model.isPaletteVisible
+            search = model.isSearchVisible
+            composer = model.isComposerVisible
+            settings = model.isSettingsVisible
+        }
+
+        var isEmpty: Bool { !(palette || search || composer || settings) }
     }
 
     private func threePane(_ model: AppModel) -> some View {
@@ -285,8 +339,20 @@ public struct RootView: View {
                         onSummarize: { model.summarizeOpenThread() })
                 } else {
                     readingPaneEmptyState
+                        .transition(.opacity)
                 }
             }
+            // Keyed on the CLICK, never on `thread.messages` — which is the
+            // deliberate reason only the CLOSING direction fades here. The
+            // second half of the condition above lands asynchronously
+            // (`thread.open` is a `Task`), so a key that included it would
+            // fire once on the click and again when the rows arrive, playing
+            // the fade twice with the second pass starting half-faded. Mail
+            // appearing because a fetch returned is not a state change the
+            // user made, and it stays a hard cut. Content only either way —
+            // both branches already sit on `bgSurface`, so the backdrop never
+            // moves.
+            .animation(Motion.crossfade, value: model.inbox.selectedThreadID)
             .frame(minWidth: 420, maxWidth: .infinity)
         }
         .background(Palette.bgApp)
@@ -321,32 +387,52 @@ public struct RootView: View {
     /// job is still durably held in `send_jobs` for the rest of its undo
     /// window regardless of whether any view is showing it, and this is
     /// what keeps that real window visibly actionable.
-    @ViewBuilder
+    ///
+    /// It rises in and fades out WITHOUT moving: the removal is usually the
+    /// 15s window expiring on its own, and sliding away would claim the user
+    /// dismissed it. `Motion.toast` encodes exactly that asymmetry.
     private func sentUndoToast(_ model: AppModel) -> some View {
-        if model.composer.justSentUndoJobID != nil {
-            VStack {
-                Spacer(minLength: 0)
+        VStack {
+            Spacer(minLength: 0)
+            if model.composer.justSentUndoJobID != nil {
                 Button(action: { Task { await model.composer.undo() } }) {
                     Toast(text: "Sent · Undo")
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
                 .padding(.bottom, Metrics.unit * 8)
+                .transition(Motion.toast)
             }
         }
+        .animation(
+            model.composer.justSentUndoJobID == nil ? Motion.dismiss : Motion.present,
+            value: model.composer.justSentUndoJobID)
     }
 
     /// A dimmed, click-to-dismiss backdrop behind a centered modal —
     /// shared shape for the palette and search overlays. Matches both
     /// views' own `.shadow(color: .black.opacity(0.4), radius: 24, y: 12)`
     /// styling of the modal itself; this is the scrim BEHIND it.
+    ///
+    /// Owns its own `isPresented` gate so the scrim and the card can carry
+    /// different transitions — the scrim is a flat cross-fade and gets there
+    /// ahead of the card, which scales in under the shared spring. Never a
+    /// blur or a material on that backdrop: it covers the full window, and a
+    /// per-frame composite of the entire mailbox costs far more than the
+    /// polish is worth.
+    @ViewBuilder
     private func overlay<Content: View>(
-        @ViewBuilder content: () -> Content, onDismiss: @escaping () -> Void
+        isPresented: Bool, @ViewBuilder content: () -> Content,
+        onDismiss: @escaping () -> Void
     ) -> some View {
-        ZStack {
-            Color.black.opacity(0.4)
-                .ignoresSafeArea()
-                .onTapGesture(perform: onDismiss)
-            content()
+        if isPresented {
+            ZStack {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                    .onTapGesture(perform: onDismiss)
+                    .transition(.opacity.animation(Motion.crossfade))
+                content()
+                    .transition(Motion.overlayCard)
+            }
         }
     }
 }

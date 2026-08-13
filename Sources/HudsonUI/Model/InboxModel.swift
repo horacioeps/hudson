@@ -1,5 +1,6 @@
 import Foundation
 import Store
+import SwiftUI
 
 /// One tab in the inbox's split-view header — see `InboxModel.buildTabs`
 /// for how the set (and each tab's `count`) is derived. `Identifiable` via
@@ -28,6 +29,19 @@ public final class InboxModel {
     /// `buildTabs` returns for an empty rule set and an empty inbox.
     public private(set) var tabs: [SplitTab] = [InboxModel.primaryTab(count: 0)]
     public var selectedThreadID: String?
+
+    /// Bumped only when `move(by:)` actually lands the selection somewhere
+    /// new — the seam the list uses to scroll the selection back into view.
+    /// It has to be distinct from `selectedThreadID` because a *click*
+    /// selects a row the user is already looking at, and scrolling the list
+    /// out from under their cursor is the classic cheap-feeling bug.
+    public private(set) var keyboardMoveCount = 0
+
+    /// Thread IDs the user archived whose removal hasn't come back from the
+    /// store yet. `apply(rows:)` animates exactly the emit that drops one of
+    /// these, and nothing else — the same stream also carries background
+    /// sync, and mail disappearing on its own must not move the list.
+    private var pendingArchive: Set<String> = []
 
     /// `nil` shows the whole inbox; a split key restricts `rows` to that
     /// one split. Setting a NEW value re-subscribes `rows`' observation —
@@ -125,6 +139,11 @@ public final class InboxModel {
 
     private func subscribeToRows() {
         rowsTask?.cancel()
+        // A pending archive belongs to the list it was performed on. The next
+        // emit comes from a different query entirely, and a thread missing
+        // from THAT result is not this archive landing — it is simply mail
+        // that was never in the new folder.
+        pendingArchive.removeAll()
         let split = activeSplit
         let mailbox = self.mailbox
         let database = self.database
@@ -141,7 +160,7 @@ public final class InboxModel {
                         account: account, split: split, limit: Self.rowLimit
                     ) {
                         guard let self, !Task.isCancelled else { return }
-                        self.rows = newRows
+                        self.apply(rows: newRows)
                         await self.refreshTabCounts(usingFullInboxRows: split == nil ? newRows : nil)
                     }
                 case .label(let id, _):
@@ -151,7 +170,7 @@ public final class InboxModel {
                         account: account, labelID: id, limit: Self.rowLimit
                     ) {
                         guard let self, !Task.isCancelled else { return }
-                        self.rows = newRows
+                        self.apply(rows: newRows)
                     }
                 }
             } catch {
@@ -159,6 +178,27 @@ public final class InboxModel {
                 // (never "no rows") — nothing to recover into here.
             }
         }
+    }
+
+    /// Writes an emit into `rows`, animating only when this particular emit
+    /// is the round-trip completing an archive the user just performed. The
+    /// animation has to ride the transaction that carries the removal, and
+    /// this is the only place that can tell that transaction apart from the
+    /// constant sync-driven re-emits which must land with no motion at all.
+    private func apply(rows newRows: [ThreadRow]) {
+        let landed = pendingArchive.subtracting(newRows.map(\.threadID))
+        // The marker is resolved by the first emit that follows it, whichever
+        // way that emit goes. Archiving from a label folder (Starred, Sent)
+        // only takes the thread out of the INBOX — its row stays right where
+        // it is, so `landed` is empty and there is nothing to fade. Keeping
+        // the id past this emit would let some later, unrelated replacement
+        // impersonate the archive and fade an entire outgoing list.
+        pendingArchive.removeAll()
+        guard !landed.isEmpty else {
+            rows = newRows
+            return
+        }
+        withAnimation(Motion.collapse) { rows = newRows }
     }
 
     private func subscribeToTabs() {
@@ -287,10 +327,15 @@ public final class InboxModel {
             let currentIndex = rows.firstIndex(where: { $0.threadID == currentSelection })
         else {
             selectedThreadID = rows.first?.threadID
+            keyboardMoveCount += 1
             return
         }
         let clampedIndex = min(max(currentIndex + offset, 0), rows.count - 1)
+        // Clamping at either end is a no-op, and bumping the counter there
+        // would ask the list to re-scroll to a row it is already showing.
+        guard rows[clampedIndex].threadID != currentSelection else { return }
         selectedThreadID = rows[clampedIndex].threadID
+        keyboardMoveCount += 1
     }
 
     // MARK: - Optimistic triage
@@ -307,7 +352,16 @@ public final class InboxModel {
     /// `Triage`'s doc comment.
     public func archiveSelected() async throws {
         guard let selectedRow else { return }
-        try await Triage.archiveThread(threadID: selectedRow.threadID, account: account, database: database)
+        let threadID = selectedRow.threadID
+        // Marked before the await so the emit that drops this row is already
+        // recognizable as the user's own doing — see `apply(rows:)`.
+        pendingArchive.insert(threadID)
+        do {
+            try await Triage.archiveThread(threadID: threadID, account: account, database: database)
+        } catch {
+            pendingArchive.remove(threadID)
+            throw error
+        }
     }
 
     /// Stars the selected thread's newest message, or unstars it if

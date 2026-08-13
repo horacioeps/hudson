@@ -242,3 +242,122 @@ private func makeComposer(
     let job = try #require(try await db.sendJob(id: jobID, account: AppModel.demoAccount))
     #expect(job.threadID == "t01")  // threaded back to the original Gmail thread
 }
+
+// MARK: - Reply quoting (the composer opens clean; the quote rides along)
+
+/// Seeds a thread whose newest message body ALREADY contains a round of
+/// quoted history — the shape every real reply chain has after the first
+/// exchange, and the one that used to make the composer accumulate `>>`.
+private func seedThreadWithPriorHistory(
+    into db: HudsonDatabase, account: String
+) async throws {
+    try await db.upsertAccount(email: account, clientID: "test-client", consentedAt: .now)
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "q1-m0", threadID: "q1", historyID: 1, internalDate: 1000,
+            fromLine: "Dhravya Shah <hi@dhravya.example>", toLine: account,
+            subject: "i want to work with you", snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+    try await db.saveBody(
+        messageID: "q1-m0", account: account,
+        body: Sanitizer.sanitize(
+            html: nil,
+            plainText: """
+                Sounds good, let's find a time.
+
+                On Thu, Aug 6, 2026 at 11:25 PM Mannas <m@example.com> wrote:
+                > Hey Dhravya, stepping off for now.
+                > Let me know what works
+                >
+                """),
+        attachments: [])
+}
+
+@MainActor
+@Test func replyOpensWithAnEmptyBodyAndTheQuoteHeldAside() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await seedThreadWithPriorHistory(into: db, account: account)
+    let record = try #require(try await db.account(email: account))
+    let model = ComposerModel(database: db, account: record, makeService: { nil })
+
+    await model.startReply(threadID: "q1")
+
+    // The editor is clean — cursor ready, nothing to scroll past.
+    #expect(model.bodyText.isEmpty)
+    // ...but the quote exists and will be sent.
+    #expect(model.quotedReplyText.contains("> Sounds good, let's find a time."))
+    #expect(model.quotedReplyText.hasPrefix("On Dhravya Shah"))
+}
+
+@MainActor
+@Test func theQuoteDoesNotReQuoteHistoryTheOriginalAlreadyCarried() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await seedThreadWithPriorHistory(into: db, account: account)
+    let record = try #require(try await db.account(email: account))
+    let model = ComposerModel(database: db, account: record, makeService: { nil })
+
+    await model.startReply(threadID: "q1")
+
+    // The regression: quoting the original WHOLE re-marked text that was
+    // already ">"-marked, so each round added a level of nesting and another
+    // attribution line.
+    #expect(!model.quotedReplyText.contains(">>"))
+    #expect(model.quotedReplyText.components(separatedBy: "wrote:").count - 1 == 1)
+    #expect(!model.quotedReplyText.contains("stepping off for now"))
+}
+
+@MainActor
+@Test func theSentBodyIsTheUsersTextAboveTheQuote() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "you@hudson.app"
+    try await seedThreadWithPriorHistory(into: db, account: account)
+    let record = try #require(try await db.account(email: account))
+    let transport = FakeSendTransport()
+    let model = makeComposer(database: db, account: record, transport: transport)
+
+    await model.startReply(threadID: "q1")
+    model.bodyText = "Thursday works."
+
+    // Asserted on the exact string handed to `OutboxMessage` rather than on
+    // the built MIME, whose parts are base64 (see `MimeBuilder`) — the
+    // encoding itself is covered by Outbox's golden tests; what matters here
+    // is that holding the quote outside `bodyText` doesn't drop it, and that
+    // it lands BELOW the reply.
+    let sent = model.outgoingBody
+    let reply = try #require(sent.range(of: "Thursday works."))
+    let quote = try #require(sent.range(of: "> Sounds good, let's find a time."))
+    #expect(reply.lowerBound < quote.lowerBound)
+
+    // ...and the send still threads, with the quote attached.
+    await model.send()
+    let jobID = try #require(model.justSentUndoJobID)
+    let job = try #require(try await db.sendJob(id: jobID, account: account))
+    #expect(job.threadID == "q1")
+}
+
+@MainActor
+@Test func aNewComposeCarriesNoQuoteAndSendsExactlyWhatWasTyped() async throws {
+    let db = try HudsonDatabase.inMemory()
+    try await DemoData.seed(into: db, account: AppModel.demoAccount)
+    let account = try #require(try await db.account(email: AppModel.demoAccount))
+    let transport = FakeSendTransport()
+    let model = makeComposer(database: db, account: account, transport: transport)
+
+    // A reply first, so a stale quote would have something to leak from.
+    await model.startReply(threadID: "t01")
+    model.startNew()
+
+    #expect(model.quotedReplyText.isEmpty)
+    model.to = "a@example.com"
+    model.subject = "Hello"
+    model.bodyText = "Just this."
+    // Checked BEFORE sending — `send()` clears the draft on success.
+    // Nothing from the earlier reply leaked into the new draft.
+    #expect(model.outgoingBody == "Just this.")
+
+    await model.send()
+    let jobID = try #require(model.justSentUndoJobID)
+    #expect(try await db.sendJob(id: jobID, account: AppModel.demoAccount) != nil)
+}

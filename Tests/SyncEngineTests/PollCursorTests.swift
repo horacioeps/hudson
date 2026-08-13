@@ -44,8 +44,10 @@ private actor CrashingAfterNthHistoryCall: GmailAPI {
     }
 
     func getProfile() async throws -> Profile { try await inner.getProfile() }
-    func listMessages(pageToken: String?, maxResults: Int) async throws -> MessageListPage {
-        try await inner.listMessages(pageToken: pageToken, maxResults: maxResults)
+    func listMessages(
+        pageToken: String?, maxResults: Int, query: String?
+    ) async throws -> MessageListPage {
+        try await inner.listMessages(pageToken: pageToken, maxResults: maxResults, query: query)
     }
     func getMessage(id: String, format: String) async throws -> GmailMessage {
         try await inner.getMessage(id: id, format: format)

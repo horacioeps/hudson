@@ -152,13 +152,24 @@ public struct SidebarView: View {
                     Image(systemName: "gearshape")
                         .foregroundStyle(Palette.inkTertiary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressable)
             }
-            // Sync status as a quiet subtitle under the wordmark.
+            // Sync status as a quiet subtitle under the wordmark. This line
+            // changes its WORD, all day, every time a pass starts or ends — so
+            // it dissolves in place (the same `.contentTransition(.opacity)`
+            // every other in-place text swap in the app uses) rather than
+            // giving each wording its own identity: two strings co-mounted in
+            // one 13pt slot draw over each other as a smear, and `Motion.reveal`
+            // would push the incoming one 6pt up into the wordmark, since
+            // nothing here clips. The fixed height keeps the footer and the
+            // divider above it still regardless.
             Text(footerStatusText)
                 .font(Typography.ui(10))
                 .foregroundStyle(syncBanner != nil ? Palette.danger : Palette.inkTertiary)
                 .lineLimit(1)
+                .contentTransition(.opacity)
+                .frame(height: 13, alignment: .leading)
+                .animation(Motion.crossfade, value: footerStatusText)
         }
         .padding(.horizontal, Metrics.unit * 3)
         .padding(.vertical, Metrics.unit * 3)
@@ -190,7 +201,7 @@ public struct SidebarView: View {
                 .font(Typography.ui(11, .medium))
                 .foregroundStyle(isSyncing ? Palette.inkTertiary : Palette.accent)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.pressable)
         .disabled(isSyncing)
     }
 }

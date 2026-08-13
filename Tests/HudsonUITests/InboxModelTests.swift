@@ -8,8 +8,7 @@ import Testing
     try await DemoData.seed(into: db, account: "you@hudson.app")
     let model = InboxModel(database: db, account: "you@hudson.app")
     await model.start()
-    // let the first observation emit
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.isEmpty }  // the first observation emit
 
     #expect(!model.rows.isEmpty)
     model.selectNext()
@@ -22,7 +21,7 @@ import Testing
     model.selectPrevious()
     let target = model.selectedThreadID
     try await model.archiveSelected()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.contains { $0.threadID == target } }
     #expect(model.rows.contains { $0.threadID == target } == false)
 }
 
@@ -36,11 +35,14 @@ import Testing
     try await DemoData.seed(into: db, account: "you@hudson.app")
     let model = InboxModel(database: db, account: "you@hudson.app")
     await model.start()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.isEmpty }
     let allCount = model.rows.count
 
     model.activeSplit = "important"
-    try await Task.sleep(for: .milliseconds(50))
+    // Setting a split re-subscribes — cancel, re-observe, re-query — so this
+    // waits for the narrowed emit to land rather than guessing its latency.
+    // Waiting only on "the set changed" keeps the assertions below load-bearing.
+    try await waitUntil { model.rows.count != allCount }
 
     #expect(!model.rows.isEmpty)
     #expect(model.rows.count < allCount)
@@ -57,14 +59,14 @@ import Testing
     try await DemoData.seed(into: db, account: "you@hudson.app")
     let model = InboxModel(database: db, account: "you@hudson.app")
     await model.start()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.isEmpty }
 
     model.selectNext()
     let target = try #require(model.selectedThreadID)
     let wasUnread = try #require(model.rows.first { $0.threadID == target }).unread
 
     try await model.toggleReadSelected()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.rows.first { $0.threadID == target }?.unread == !wasUnread }
 
     let isUnreadNow = try #require(model.rows.first { $0.threadID == target }).unread
     #expect(isUnreadNow == !wasUnread)
@@ -86,13 +88,13 @@ import Testing
     try await DemoData.seed(into: db, account: "you@hudson.app")
     let model = InboxModel(database: db, account: "you@hudson.app")
     await model.start()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.isEmpty }
 
     let target = try #require(model.rows.first { $0.messageCount > 1 })
     model.selectedThreadID = target.threadID
 
     try await model.archiveSelected()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.contains { $0.threadID == target.threadID } }
 
     #expect(model.rows.contains { $0.threadID == target.threadID } == false)
 }
@@ -125,14 +127,14 @@ import Testing
 
     let model = InboxModel(database: db, account: account)
     await model.start()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.rows.isEmpty }
 
     let target = try #require(model.rows.first { $0.threadID == "multi" })
     #expect(target.unread)
     model.selectedThreadID = target.threadID
 
     try await model.toggleReadSelected()
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.rows.first { $0.threadID == "multi" }?.unread == false }
 
     let updated = try #require(model.rows.first { $0.threadID == "multi" })
     #expect(!updated.unread)
@@ -148,6 +150,10 @@ import Testing
     #expect(model.tabs == [SplitTab(key: "primary", title: "Primary", count: 0)])
 
     await model.start()
+    // The only fixed sleep left in this file, and deliberately: this asserts a
+    // NEGATIVE — that nothing ever arrives — so there is no condition to poll
+    // for. A `waitUntil` on emptiness would return on the first tick and prove
+    // nothing.
     try await Task.sleep(for: .milliseconds(50))
 
     #expect(model.rows.isEmpty)
@@ -163,12 +169,12 @@ import Testing
     try await DemoData.seed(into: db, account: "you@hudson.app")
     let model = InboxModel(database: db, account: "you@hudson.app")
     await model.start()
-    try await Task.sleep(for: .milliseconds(80))
+    try await waitUntil { !model.rows.isEmpty }
     #expect(model.showsSplitTabs)            // inbox mode by default
     let inboxCount = model.rows.count
 
     model.mailbox = .label(id: "STARRED", title: "Starred")
-    try await Task.sleep(for: .milliseconds(80))
+    try await waitUntil { model.rows.count != inboxCount }
     #expect(!model.showsSplitTabs)           // a flat label folder
     #expect(model.folderTitle == "Starred")
     #expect(!model.rows.isEmpty)             // demo seeds starred threads
@@ -184,7 +190,7 @@ import Testing
 
     // Back to the inbox restores the split view.
     model.mailbox = .inbox
-    try await Task.sleep(for: .milliseconds(80))
+    try await waitUntil { model.rows.count == inboxCount }
     #expect(model.showsSplitTabs)
     #expect(model.folderTitle == "Inbox")
 }

@@ -43,6 +43,10 @@ public struct ComposerView: View {
     /// own placeholders (Snooze, "⋯ more").
     @State private var placeholderToastText: String?
 
+    /// Whether the reply's quoted original is revealed. Collapsed by default —
+    /// it's context, not something the user is editing.
+    @State private var showQuotedOriginal = false
+
     public init(composer: ComposerModel, onClose: @escaping () -> Void) {
         self.composer = composer
         self.onClose = onClose
@@ -51,9 +55,7 @@ public struct ComposerView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let banner = composer.banner {
-                Banner(text: banner, role: .warn)
-            }
+            bannerSlot
             header
             bodyEditor
             footer
@@ -77,6 +79,29 @@ public struct ComposerView: View {
         }
     }
 
+    // MARK: - Banner
+
+    /// The banner gets its own animation scope rather than riding one on the
+    /// outer VStack: that VStack is an ancestor of the body `TextEditor`, and
+    /// an animation there would interpolate the editor's layout on every delta
+    /// an AI draft streams in — and on every keystroke besides.
+    ///
+    /// Keyed on presence, not on the text, so one banner REPLACING another
+    /// ("Couldn't undo the send." → "Send cancelled.") swaps in place instead
+    /// of collapsing to zero height and re-expanding. Suppressed outright while
+    /// a send is in flight: `send()` clears the banner in the same tick it
+    /// dismisses the sheet, and a banner collapsing under a card that is
+    /// already leaving is two unrelated motions in one 180ms window.
+    private var bannerSlot: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let banner = composer.banner {
+                Banner(text: banner, role: .warn)
+                    .transition(Motion.banner)
+            }
+        }
+        .animation(composer.isSending ? nil : Motion.settle, value: composer.banner != nil)
+    }
+
     // MARK: - Header (To / Cc / Subject)
 
     private var header: some View {
@@ -84,9 +109,14 @@ public struct ComposerView: View {
             toRow
             if isCcVisible {
                 ccRow
+                    .transition(Motion.reveal)
             }
             subjectRow
         }
+        // Scoped to the toggle alone. The card's height is pinned, so the
+        // editor below hands over exactly the Cc row's height as it arrives —
+        // that reflow is the point, and it should ride the same curve.
+        .animation(Motion.expand, value: isCcVisible)
     }
 
     private var toRow: some View {
@@ -104,7 +134,11 @@ public struct ComposerView: View {
             Button(action: { isCcVisible.toggle() }) {
                 Text("Cc")
                     .font(Typography.ui(12, .medium))
-                    .foregroundStyle(Palette.inkTertiary)
+                    // Reads tertiary in both states otherwise, so the toggle
+                    // never looks toggled once its row is open. Its own
+                    // cross-fade, not the header's spring: color has no mass.
+                    .foregroundStyle(isCcVisible ? Palette.ink : Palette.inkTertiary)
+                    .animation(Motion.crossfade, value: isCcVisible)
             }
             .buttonStyle(.plain)
         }
@@ -153,17 +187,65 @@ public struct ComposerView: View {
             .frame(width: Metrics.unit * 10, alignment: .leading)
     }
 
-    // MARK: - Body (serif editor)
+    // MARK: - Body
 
+    /// The editor holds ONLY what the user is writing. A reply's quoted
+    /// original lives on `ComposerModel.quotedReplyText` and is re-attached at
+    /// send time, so the composer opens on an empty field with the cursor
+    /// ready instead of a screenful of `>` markers to scroll past. Pencil's
+    /// composer Body frame is exactly this: prose and a caret.
+    ///
+    /// The quote is still one click away, so nothing about what's being sent
+    /// is hidden — it just isn't in the way.
     private var bodyEditor: some View {
-        TextEditor(text: bodyTextBinding)
-            .font(Typography.serif(15))
-            .foregroundStyle(Palette.ink)
-            .scrollContentBackground(.hidden)
-            .background(Palette.bgSurface)
-            .padding(.horizontal, Metrics.unit * 4)
-            .padding(.vertical, Metrics.unit * 2)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(alignment: .leading, spacing: Metrics.unit * 2) {
+            TextEditor(text: bodyTextBinding)
+                // Sans at 14/1.55, matching the reading pane and the design —
+                // a reply should look like the message it will become.
+                .font(Typography.ui(BodyAttributedString.bodySize))
+                .lineSpacing(BodyAttributedString.bodyLineSpacing)
+                .foregroundStyle(Palette.ink)
+                .scrollContentBackground(.hidden)
+                .background(Palette.bgSurface)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if !composer.quotedReplyText.isEmpty {
+                quotedOriginalDisclosure
+            }
+        }
+        .padding(.horizontal, Metrics.unit * 5)
+        .padding(.vertical, Metrics.unit * 4)
+    }
+
+    private var quotedOriginalDisclosure: some View {
+        VStack(alignment: .leading, spacing: Metrics.unit * 2) {
+            Button(action: { showQuotedOriginal.toggle() }) {
+                Text(showQuotedOriginal ? "••• Hide quoted text" : "••• Show quoted text")
+                    .font(Typography.ui(12, .semibold))
+                    .foregroundStyle(Palette.inkTertiary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if showQuotedOriginal {
+                ScrollView {
+                    Text(composer.quotedReplyText)
+                        .font(Typography.ui(BodyAttributedString.bodySize))
+                        .foregroundStyle(Palette.inkTertiary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
+                .padding(.leading, Metrics.unit * 2)
+                .overlay(alignment: .leading) {
+                    Rectangle().fill(Palette.border).frame(width: 2)
+                }
+                .transition(Motion.reveal)
+            }
+        }
+        // Keyed on the user's toggle and nothing else — never on
+        // `quotedReplyText` being non-empty, which is filled by a database read
+        // in `startReply`. Animating that would make a prefill arriving look
+        // like something the user did.
+        .animation(Motion.settle, value: showQuotedOriginal)
     }
 
     // MARK: - Footer (Send / Cancel / reply's AI Draft placeholder)
@@ -198,6 +280,7 @@ public struct ComposerView: View {
                     Text("✦")
                 }
                 Text(composer.isDrafting ? "Drafting…" : "Draft")
+                    .contentTransition(.opacity)
             }
             .font(Typography.ui(12, .medium))
             .foregroundStyle(Palette.aiInk)
@@ -205,6 +288,11 @@ public struct ComposerView: View {
             .padding(.horizontal, Metrics.unit * 3)
             .background(Palette.aiBg)
             .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
+            // On the chip, never on the footer HStack: "Drafting…" is ~14pt
+            // wider than "Draft", and Send and Cancel must not slide sideways
+            // every time a draft starts. Carries the ✦/spinner swap too, which
+            // SwiftUI cross-fades by default under this transaction.
+            .animation(Motion.settle, value: composer.isDrafting)
         }
         .buttonStyle(.plain)
         .disabled(composer.isDrafting || composer.isSending)

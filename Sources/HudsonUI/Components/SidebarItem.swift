@@ -40,11 +40,29 @@ public struct SidebarItem: View {
             // Padding not spec'd explicitly, derived from `unit`.
             .padding(.horizontal, Metrics.unit * 3)
             .padding(.vertical, Metrics.unit * 2)
-            .background(isSelected ? Palette.accentSoft : (isHovering ? Palette.bgHover : .clear))
+            .background {
+                // Both animations sit on the fill rather than the row, so a
+                // re-derived unread count arriving from sync can never be
+                // caught in an animated transaction — same scoping rule as
+                // `EmailRow`, and the reason the two surfaces agree.
+                Rectangle()
+                    .fill(backgroundColor)
+                    .animation(Motion.crossfade, value: isSelected)
+                    // Out slower than in, so a pointer swept down the folder
+                    // list doesn't leave a trail of rows lit at once.
+                    .animation(isHovering ? Motion.hoverIn : Motion.hoverOut, value: isHovering)
+            }
             .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
+    }
+
+    /// A selected row keeps its tint under the cursor — lightening it would
+    /// read as the selection being about to change.
+    private var backgroundColor: Color {
+        if isSelected { return Palette.accentSoft }
+        return isHovering ? Palette.bgHover : .clear
     }
 }
 

@@ -102,6 +102,34 @@ extension HudsonDatabase {
         }
     }
 
+    /// One message's attachment metadata, in the order `saveBody` recorded it.
+    ///
+    /// The write side (`saveBody`) has populated the `attachments` table since
+    /// it was introduced, but nothing ever read it back — the reading pane's
+    /// attachment chips had no source and were stubbed to `[]`. This is that
+    /// missing half.
+    ///
+    /// Returns `[]` for a message with no attachments and for one whose body
+    /// hasn't been hydrated yet; the two are indistinguishable here and the
+    /// caller treats them the same (no chips to draw).
+    public func attachments(messageID: String, account: String) async throws -> [AttachmentMeta] {
+        try await writer.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT attachment_id, filename, mime_type, size FROM attachments
+                    WHERE account_email = ? AND message_id = ?
+                    ORDER BY rowid
+                    """,
+                arguments: [account, messageID]
+            ).map { row in
+                AttachmentMeta(
+                    id: row["attachment_id"], filename: row["filename"],
+                    mimeType: row["mime_type"], size: row["size"])
+            }
+        }
+    }
+
     /// Decodes a `[String]` from the JSON text `saveBody` stored it as (a
     /// `JSONEncoder`-encoded `[String]`), so the round-trip is lossless. A
     /// `nil`, empty, or corrupt value yields `[]` rather than throwing —

@@ -60,7 +60,9 @@ private let testDebounce: Duration = .milliseconds(10)
     model.query = "denv"
     model.queryChanged()
 
-    try await Task.sleep(for: .milliseconds(100))
+    // The debounce plus the query itself, not a guessed span: under full-suite
+    // load a flat 100ms loses the race and this fails intermittently.
+    try await waitUntil { !model.isSearching && !model.hits.isEmpty }
 
     #expect(!model.hits.isEmpty)
     #expect(model.hits.allSatisfy { $0.subject.contains("Denver") || $0.snippet.contains("Denver") })

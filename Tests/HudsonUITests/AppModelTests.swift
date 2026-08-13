@@ -166,12 +166,13 @@ import Testing
     let db = try HudsonDatabase.inMemory()
     try await DemoData.seed(into: db, account: AppModel.demoAccount)
     let model = AppModel(database: db, account: try await db.primaryAccount())
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { model.inbox.rows.contains { $0.threadID == "t02" } }
     model.inbox.selectedThreadID = "t02"
     model.isPaletteVisible = true
 
     model.perform(Command(id: "archive", title: "Archive", subtitle: nil, keys: [], kind: .archive))
-    try await Task.sleep(for: .milliseconds(50))
+    // The archive is optimistic but still routed through Store + a re-emit.
+    try await waitUntil { !model.inbox.rows.contains { $0.threadID == "t02" } }
 
     #expect(!model.isPaletteVisible)
     #expect(model.inbox.rows.contains { $0.threadID == "t02" } == false)
@@ -312,7 +313,8 @@ import Testing
     let db = try HudsonDatabase.inMemory()
     try await DemoData.seed(into: db, account: AppModel.demoAccount)
     let model = AppModel(database: db, account: try await db.primaryAccount())
-    try await Task.sleep(for: .milliseconds(50))
+    // `.selectNext` can only advance once the inbox observation has emitted.
+    try await waitUntil { !model.inbox.rows.isEmpty }
 
     model.apply(.selectNext)
     #expect(model.inbox.selectedThreadID != nil)
@@ -339,11 +341,11 @@ import Testing
     let db = try HudsonDatabase.inMemory()
     try await DemoData.seed(into: db, account: AppModel.demoAccount)
     let model = AppModel(database: db, account: try await db.primaryAccount())
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.inbox.rows.isEmpty }
     model.inbox.selectedThreadID = "t01"
 
     model.apply(.openSelected)
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitUntil { !model.thread.subject.isEmpty }
 
     #expect(model.thread.subject == "Re: Dinner Friday?")
 }

@@ -119,6 +119,33 @@ public enum DemoData {
                       body: "Perfect — I'll grab us a table by the window. See you then!",
                       extraLabels: ["UNREAD", "STARRED"]),
             ]),
+        // The NATIVE HTML path: prose-only markup, so `SimpleBody.isSimple`
+        // routes it away from the WKWebView card and it re-renders in Hudson's
+        // own type on the dark ground. The `gmail_quote` div is the other half
+        // of what this exercises — `MessageBodyParser` must split it off so
+        // only the new reply shows, behind a "···" toggle. Together with t31
+        // (a real newsletter, which keeps the card) this covers both branches
+        // of the reading pane's routing.
+        ThreadSeed(
+            id: "t41", hoursAgo: 3,
+            messages: [
+                .init(from: derek, subject: "Re: Contract redlines",
+                      snippet: "Sending over my notes on the redlines — mostly section 4.",
+                      body: "Sending over my notes on the redlines — mostly section 4."),
+                .init(from: derek, subject: "Re: Contract redlines",
+                      snippet: "Thanks for the quick turnaround. Section 4 looks right to me now.",
+                      body: "Thanks for the quick turnaround. Section 4 looks right to me now.",
+                      html: "<div dir=\"ltr\"><p>Thanks for the quick turnaround. "
+                          + "<b>Section 4</b> looks right to me now.</p>"
+                          + "<p>One thing left: the indemnity cap is still blank — can you "
+                          + "confirm the number before we send it on?</p>"
+                          + "<p>Details are in the <a href=\"https://brightleaf.example/redlines\">"
+                          + "shared doc</a>.</p></div>"
+                          + "<div class=\"gmail_quote\"><div>On Aug 12, Derek Osei wrote:</div>"
+                          + "<blockquote><p>Sending over my notes on the redlines — "
+                          + "mostly section 4.</p></blockquote></div>",
+                      extraLabels: ["UNREAD"]),
+            ]),
         .single(id: "t02", hoursAgo: 5, from: whistlecreekHOA,
                 subject: "Reminder: gutter cleaning this Saturday",
                 snippet: "This is a reminder that the annual gutter cleaning is scheduled for Saturday morning.",

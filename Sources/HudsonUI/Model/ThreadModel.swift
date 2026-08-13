@@ -22,6 +22,9 @@ public struct ThreadMessage: Identifiable, Sendable, Equatable {
     /// renderer keeps every one of them blocked until the user explicitly taps
     /// "Load remote images" — so an unopened tracking pixel never phones home.
     public var remoteURLs: [String]
+    /// This message's attachments, read alongside its body. Empty until the
+    /// body is fetched — the two land together, since `saveBody` writes both.
+    public var attachments: [AttachmentMeta] = []
     public var isExpanded: Bool
 
     public var id: String { row.id }
@@ -127,26 +130,31 @@ public final class ThreadModel {
     /// `bodyText` — a re-emit only ever means a label or message-set
     /// change on this thread (e.g. a mark-unread), never a reason to
     /// discard the user's expand/collapse choices or an already-fetched
-    /// body. A message id seen for the first time defaults to collapsed,
-    /// except the newest one (max `internalDate`) among the FRESH rows,
-    /// which defaults expanded — Superhuman-style "read the latest, skim
-    /// the rest". Because this rule is evaluated per fresh row rather
-    /// than only on the very first load, a brand-new reply landing on an
-    /// already-open thread becomes the newly-expanded one while every
-    /// previously-seen message (including the formerly-newest one) keeps
-    /// whatever state the user left it in.
+    /// body.
+    ///
+    /// A message seen for the first time defaults to EXPANDED. The reading
+    /// pane shows a thread as a continuous conversation (Pencil "Main Window ·
+    /// Thread (Expanded)"), not one open message above a stack of one-line
+    /// stubs. This became affordable when prose bodies stopped costing a
+    /// `WKWebView` each and became native text — before that, expanding every
+    /// message meant one web content process per message, which is what the
+    /// old newest-only default existed to avoid.
+    ///
+    /// Collapsing stays a per-message user action, and because the rule only
+    /// applies to rows not already known, a message the reader collapsed by
+    /// hand stays collapsed across every later re-emit.
     private func reconcile(with freshMessages: [MessageRow]) {
         let existingByID = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
-        let newestID = freshMessages.max(by: { $0.internalDate < $1.internalDate })?.id
         messages = freshMessages.map { row in
             if let existing = existingByID[row.id] {
                 return ThreadMessage(
                     row: row, bodyText: existing.bodyText, rawHTML: existing.rawHTML,
-                    remoteURLs: existing.remoteURLs, isExpanded: existing.isExpanded)
+                    remoteURLs: existing.remoteURLs, attachments: existing.attachments,
+                    isExpanded: existing.isExpanded)
             }
             return ThreadMessage(
-                row: row, bodyText: nil, rawHTML: nil, remoteURLs: [],
-                isExpanded: row.id == newestID)
+                row: row, bodyText: nil, rawHTML: nil, remoteURLs: [], attachments: [],
+                isExpanded: true)
         }
     }
 
@@ -222,12 +230,21 @@ public final class ThreadModel {
                 fetched = try? await database.messageBody(id: id, account: account)
             }
         }
-        guard !Task.isCancelled, let fetched,
+        guard let fetched else { return }
+        // Read attachments BEFORE resolving the index: they're written by the
+        // same `saveBody` that wrote the body, so a successful body read is
+        // exactly when they exist. Awaiting after `firstIndex` would leave the
+        // index pointing into a `messages` array that a re-emit may since have
+        // reordered or shortened.
+        let attachments =
+            (try? await database.attachments(messageID: id, account: account)) ?? []
+        guard !Task.isCancelled,
             let index = messages.firstIndex(where: { $0.id == id })
         else { return }
         messages[index].bodyText = fetched.plainText
         messages[index].rawHTML = fetched.rawHTML
         messages[index].remoteURLs = fetched.remoteURLs
+        messages[index].attachments = attachments
     }
 
     /// The newest message by `internalDate`, or `nil` before `open`'s
