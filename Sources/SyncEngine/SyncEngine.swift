@@ -6,7 +6,9 @@ import Store
 /// server instead of mocking HTTP.
 public protocol GmailAPI: Sendable {
     func getProfile() async throws -> Profile
-    func listMessages(pageToken: String?, maxResults: Int) async throws -> MessageListPage
+    func listMessages(
+        pageToken: String?, maxResults: Int, query: String?
+    ) async throws -> MessageListPage
     func getMessage(id: String, format: String) async throws -> GmailMessage
     func listHistory(startHistoryID: String, pageToken: String?) async throws -> HistoryPage
     func listLabels() async throws -> [GmailLabel]
@@ -37,6 +39,7 @@ public actor SyncEngine {
     private let pageSize: Int
     private let hydrationBatch: Int
     private let prefetchWindowDays: Int
+    private let backfillLookbackDays: Int
     private let now: @Sendable () -> Date
     private var passInFlight = false
     /// Set by `pollHistory()` when this pass hit a 404 expiry, so `syncOnce()`
@@ -44,9 +47,14 @@ public actor SyncEngine {
     private var historyExpiredThisPass = false
 
     /// Wires the engine to one account's API client and store.
+    ///
+    /// `backfillLookbackDays` bounds how far back the initial backfill reaches
+    /// — see `backfillQuery`. `0` disables the bound and lists the whole
+    /// mailbox (the pre-window behaviour).
     public init(
         api: any GmailAPI, database: HudsonDatabase, account: String,
         pageSize: Int = 100, hydrationBatch: Int = 25, prefetchWindowDays: Int = 90,
+        backfillLookbackDays: Int = 90,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.api = api
@@ -55,6 +63,7 @@ public actor SyncEngine {
         self.pageSize = pageSize
         self.hydrationBatch = hydrationBatch
         self.prefetchWindowDays = prefetchWindowDays
+        self.backfillLookbackDays = backfillLookbackDays
         self.now = now
     }
 
@@ -189,9 +198,10 @@ public actor SyncEngine {
             report.backfillComplete = true
             return
         }
+        let query = backfillQuery(consentedAt: record.consentedAt)
         for _ in 0..<maxPages {
             let page = try await api.listMessages(
-                pageToken: record.backfillPageToken, maxResults: pageSize)
+                pageToken: record.backfillPageToken, maxResults: pageSize, query: query)
             var snapshots: [MessageSnapshot] = []
             for ref in page.messages ?? [] {
                 do {
@@ -222,6 +232,33 @@ public actor SyncEngine {
             }
             record = try await requireAccount()
         }
+    }
+
+    /// The Gmail `q` filter bounding backfill to `backfillLookbackDays` of
+    /// mail before the account was connected — the sync window. Returns `nil`
+    /// (an unbounded listing) when the lookback is `0` or less.
+    ///
+    /// Backfill's job is to make the mailbox *readable fast*, not to mirror it:
+    /// listing every message costs one `messages.get` each, so an old account
+    /// spends hours fetching archive nobody is about to open. Bounding the
+    /// listing turns that into minutes. The lookback (rather than a cut at the
+    /// connect date itself) is what keeps first launch from showing an empty
+    /// inbox — there is mail to read the moment onboarding finishes. Anything
+    /// newer arrives through `pollHistory`, which is unfiltered, so the window
+    /// never applies to live mail.
+    ///
+    /// The anchor is `consentedAt` and NOT `now()`, which is load-bearing:
+    /// backfill paginates across many passes spread over hours or days, and
+    /// Gmail evaluates `q` server-side on every page request. A relative
+    /// window (`newer_than:90d`) would therefore drift between pages, so a
+    /// stored page token would resume into a listing whose result set no
+    /// longer matches the one that produced it. A fixed epoch second computed
+    /// from `consentedAt` gives every page — including one resumed days later
+    /// — provably the same filter.
+    private func backfillQuery(consentedAt: Date) -> String? {
+        guard backfillLookbackDays > 0 else { return nil }
+        let anchor = consentedAt.addingTimeInterval(-Double(backfillLookbackDays) * 86_400)
+        return "after:\(Int(anchor.timeIntervalSince1970))"
     }
 
     /// A message that vanished between `messages.list` (or a history poll)

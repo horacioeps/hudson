@@ -507,5 +507,27 @@ let migrator: DatabaseMigrator = {
             """)
     }
 
+    migrator.registerMigration("v10") { db in
+        // The sync window (`SyncEngine.backfillQuery`) makes backfill list
+        // with a Gmail `q` filter instead of listing the whole mailbox. A
+        // Gmail page token continues the *listing that created it*, so a
+        // token stored by a pre-window build — produced by an unfiltered
+        // listing — cannot be paired with the filter the next pass will now
+        // send. Any account still mid-backfill at upgrade time therefore
+        // restarts from page one under the new window.
+        //
+        // Restarting is cheap and safe rather than lossy: the window is a
+        // strict subset of what was being listed, and re-listing a message
+        // already stored is a no-op under the §4.2 version guard — the same
+        // property the §4.3 cursor-expiry fallback already relies on.
+        // Accounts whose backfill finished are deliberately untouched: their
+        // mail is fully cached, and re-running a narrower listing over them
+        // would buy nothing.
+        try db.execute(sql: """
+            UPDATE accounts SET backfill_state = 'pending', backfill_page_token = NULL
+            WHERE backfill_state != 'complete'
+            """)
+    }
+
     return migrator
 }()

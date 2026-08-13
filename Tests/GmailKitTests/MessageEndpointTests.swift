@@ -58,4 +58,18 @@ private func makeClient(transport: MockTransport) throws -> GmailClient {
     let request = try #require(await transport.recordedRequests().first)
     #expect(request.url?.query()?.contains("pageToken=tok1") == true)
     #expect(request.url?.query()?.contains("maxResults=50") == true)
+    // No `query:` argument means no `q` item at all — an empty `q=` is NOT the
+    // same thing to Gmail, and the unbounded listing is the default.
+    #expect(request.url?.query()?.contains("q=") == false)
+}
+
+@Test func listMessagesPassesSearchQuery() async throws {
+    let body = #"{"messages": [], "resultSizeEstimate": 0}"#
+    let transport = MockTransport(responses: [(Data(body.utf8), 200)])
+    _ = try await makeClient(transport: transport)
+        .listMessages(pageToken: nil, maxResults: 100, query: "after:1735689600")
+    let request = try #require(await transport.recordedRequests().first)
+    // ":" is a legal query character (`urlQueryAllowed`, and `encodedQuery`
+    // only subtracts "+&="), so the Gmail operator survives verbatim.
+    #expect(request.url?.query()?.contains("q=after:1735689600") == true)
 }

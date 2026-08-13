@@ -70,6 +70,10 @@ actor ScriptedGmail: GmailAPI {
     private(set) var calls: [String] = []
     /// Every `listHistory` call, in order — see `HistoryCall`.
     private(set) var historyCalls: [HistoryCall] = []
+    /// The `q` filter each `listMessages` call carried, in order (`nil` for an
+    /// unbounded listing) — lets backfill tests assert the sync window is
+    /// applied to every page, not just the first.
+    private(set) var listQueries: [String?] = []
     /// Every `modify` call, in order — see `ModifyCall`.
     private(set) var modifyCalls: [ModifyCall] = []
     /// Every `batchModify` call, in order — see `BatchModifyCall`.
@@ -93,8 +97,11 @@ actor ScriptedGmail: GmailAPI {
         return profile
     }
 
-    func listMessages(pageToken: String?, maxResults: Int) async throws -> MessageListPage {
+    func listMessages(
+        pageToken: String?, maxResults: Int, query: String?
+    ) async throws -> MessageListPage {
         calls.append("list:\(pageToken ?? "start")")
+        listQueries.append(query)
         guard !listPages.isEmpty else {
             return MessageListPage(messages: [], nextPageToken: nil, resultSizeEstimate: 0)
         }

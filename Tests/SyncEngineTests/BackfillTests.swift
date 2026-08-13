@@ -1,3 +1,4 @@
+import Foundation
 import GmailKit
 import Store
 import Testing
@@ -95,4 +96,63 @@ private func makeWorld(
     let account = try #require(try await database.primaryAccount())
     #expect(account.backfillState == "complete")
     #expect(try await database.recentMessages(account: "x", limit: 10).count == 2)
+}
+
+// MARK: - Sync window (backfill is bounded to mail around the connect date)
+
+/// Builds a world whose account consented at a FIXED instant, so a test can
+/// assert the exact `after:` anchor backfill derives from it.
+private func makeWindowedWorld(
+    consentedAt: Date, lookbackDays: Int, pages: [MessageListPage],
+    messages: [String: GmailMessage]
+) async throws -> (ScriptedGmail, SyncEngine) {
+    let database = try HudsonDatabase.inMemory()
+    try await database.upsertAccount(email: "x", clientID: "c", consentedAt: consentedAt)
+    let gmail = ScriptedGmail(listPages: pages, messagesByID: messages)
+    let engine = SyncEngine(
+        api: gmail, database: database, account: "x", backfillLookbackDays: lookbackDays)
+    return (gmail, engine)
+}
+
+@Test func backfillBoundsEveryPageToTheSameWindowAnchor() async throws {
+    let consentedAt = Date(timeIntervalSince1970: 1_750_000_000)
+    let page1 = MessageListPage(
+        messages: [MessageRef(id: "m1", threadId: "t1")], nextPageToken: "p2",
+        resultSizeEstimate: 2)
+    let page2 = MessageListPage(
+        messages: [MessageRef(id: "m2", threadId: "t1")], nextPageToken: nil,
+        resultSizeEstimate: 2)
+    let (gmail, engine) = try await makeWindowedWorld(
+        consentedAt: consentedAt, lookbackDays: 90, pages: [page1, page2],
+        messages: [
+            "m1": testMessage(id: "m1", historyID: "90"),
+            "m2": testMessage(id: "m2", historyID: "91"),
+        ])
+
+    // Two separate passes, so the second resumes from a stored page token —
+    // the case a sliding `newer_than:90d` would silently corrupt.
+    _ = try await engine.syncOnce(maxBackfillPages: 1)
+    _ = try await engine.syncOnce(maxBackfillPages: 1)
+
+    let expected = "after:\(1_750_000_000 - 90 * 86_400)"
+    let queries = await gmail.listQueries
+    // Anchored to consentedAt, NOT to now(): both pages carry the identical
+    // filter, so the resumed listing sees exactly the set its token came from.
+    #expect(queries == [expected, expected])
+}
+
+@Test func zeroLookbackBackfillsTheWholeMailbox() async throws {
+    let page = MessageListPage(
+        messages: [MessageRef(id: "m1", threadId: "t1")], nextPageToken: nil,
+        resultSizeEstimate: 1)
+    let (gmail, engine) = try await makeWindowedWorld(
+        consentedAt: Date(timeIntervalSince1970: 1_750_000_000), lookbackDays: 0,
+        pages: [page], messages: ["m1": testMessage(id: "m1", historyID: "90")])
+
+    _ = try await engine.syncOnce()
+
+    // The escape hatch: no window means no `q` at all (an unbounded listing),
+    // which is what every pre-window test and a full-archive re-sync expect.
+    let queries = await gmail.listQueries
+    #expect(queries == [nil])
 }
