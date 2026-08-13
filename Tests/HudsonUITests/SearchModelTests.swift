@@ -35,7 +35,7 @@ private let testDebounce: Duration = .milliseconds(10)
     model.query = "den"
     model.queryChanged()
 
-    try await Task.sleep(for: .milliseconds(100))
+    try await waitUntil { !model.isSearching && !model.hits.isEmpty }
 
     #expect(!model.hits.isEmpty)
     #expect(model.hits.contains { $0.subject.contains("Denver") })
@@ -82,7 +82,7 @@ private let testDebounce: Duration = .milliseconds(10)
 
     model.query = "den"
     model.queryChanged()
-    try await Task.sleep(for: .milliseconds(100))
+    try await waitUntil { !model.isSearching && !model.hits.isEmpty }
     #expect(!model.hits.isEmpty)  // precondition: a prior search left results
 
     model.reset()

@@ -159,3 +159,60 @@ private func mailerWrapped(_ prose: String) -> String {
 @Test func anUnknownTagIsStillDisqualifyingHoweverShort() {
     #expect(!SimpleBody.isSimple(html: "<p>hi</p><canvas></canvas>", visibleTextLength: 2))
 }
+
+// MARK: - Tag classes found by scanning a real mailbox
+
+@Test func aGoogleCalendarInvitationRendersNatively() {
+    // Structure of a real invite: layout tables, a stylesheet, a <link>, an
+    // Outlook <xml> island, and <time> elements. No images at all. Two tags —
+    // <time> and <link> — were all that kept it on the card.
+    let html = """
+        <html><head><meta charset="utf-8"><style>.x{}</style>
+        <link rel="stylesheet" href="https://x.example/a.css"><xml></xml></head>
+        <body><table><tbody><tr><td>
+          <h2>Invitation</h2>
+          <div><span>When</span> <time>Wed 5 Aug 2026 7:30pm</time></div>
+          <p>Andrew is inviting you to a scheduled Zoom meeting.</p>
+        </td></tr></tbody></table></body></html>
+        """
+    #expect(SimpleBody.isSimple(html: html, visibleTextLength: 2_228))
+}
+
+@Test func officeAndVMLNamespaceJunkIsInvisibleAndDoesNotDisqualify() {
+    // ~4000 of these across a real mailbox — Word/Outlook metadata that no
+    // other renderer draws, almost always inside an <!--[if mso]> block.
+    let html = """
+        <o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings>
+        <w:WordDocument><w:AnchorLock/></w:WordDocument>
+        <v:roundrect><v:fill color="#fff"/><v:textbox>Click</v:textbox></v:roundrect>
+        <p>The actual message.</p>
+        """
+    #expect(SimpleBody.isSimple(html: html))
+    #expect(SimpleBody.isInvisibleNamespaceTag("o:pixelsperinch"))
+    #expect(SimpleBody.isInvisibleNamespaceTag("v:roundrect"))
+    // A namespace nobody recognises is still unknown, and still disqualifying.
+    #expect(!SimpleBody.isInvisibleNamespaceTag("weird:thing"))
+    #expect(!SimpleBody.isSimple(html: "<p>hi</p><weird:thing/>"))
+}
+
+@Test func semanticProseElementsAreSimple() {
+    #expect(SimpleBody.isSimple(html: "<figure><figcaption>Cap</figcaption>Body</figure>"))
+    #expect(SimpleBody.isSimple(html: "<details><summary>More</summary><p>Detail</p></details>"))
+}
+
+@Test func imagesByAnotherNameStillRouteToTheCard() {
+    // These are content images with different spellings, and the native path
+    // renders no images at all — routing them native would silently delete
+    // the picture. Each must stay carded.
+    #expect(!SimpleBody.isSimple(html: "<picture><source srcset=\"a.webp\"><img src=\"a.png\"></picture>",
+                                 visibleTextLength: 10))
+    #expect(!SimpleBody.isSimple(html: "<svg><path d=\"M0 0\"/></svg><p>hi</p>", visibleTextLength: 10))
+    #expect(!SimpleBody.isSimple(html: "<themed-picture><img src=\"a.png\"></themed-picture>",
+                                 visibleTextLength: 10))
+}
+
+@Test func scriptAlwaysRoutesToTheSandboxedWebView() {
+    // 759 messages in a real mailbox carry one. It must never reach the native
+    // path, where the CSP that neutralises it does not apply.
+    #expect(!SimpleBody.isSimple(html: "<p>hi</p><script>alert(1)</script>", visibleTextLength: 5))
+}

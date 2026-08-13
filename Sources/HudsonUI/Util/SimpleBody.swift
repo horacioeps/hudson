@@ -39,10 +39,30 @@ enum SimpleBody {
         // Inline
         "a", "span", "b", "strong", "i", "em", "u", "s", "strike", "del", "ins",
         "code", "tt", "kbd", "samp", "var", "small", "big", "sub", "sup",
-        "font", "abbr", "cite", "q", "mark", "wbr", "nobr", "o:p",
+        "font", "abbr", "cite", "q", "mark", "wbr", "nobr",
+        // Semantic elements whose content is prose and whose meaning survives
+        // losing every attribute — `<time>` in calendar invitations, the
+        // figure/details pairs in newsletters built from Markdown.
+        "time", "figure", "figcaption", "details", "summary",
         // Gated by `containsContentImage`, not admitted outright.
         "img",
     ]
+
+    /// Namespace prefixes whose elements are Office/VML metadata: Word's
+    /// `<w:WordDocument>`, `<o:PixelsPerInch>`, VML shapes like
+    /// `<v:roundrect>`. No renderer outside Outlook draws any of them, and
+    /// they almost always sit inside an `<!--[if mso]>` block, so they say
+    /// nothing about whether the document is prose.
+    ///
+    /// Matched by prefix rather than enumerated: a real mailbox turns up
+    /// dozens of these, they vary by Word version, and listing them would be
+    /// a list nobody could finish.
+    static let invisibleNamespaces: Set<String> = ["o", "w", "v", "x", "m", "st1", "st2"]
+
+    static func isInvisibleNamespaceTag(_ name: String) -> Bool {
+        guard let colon = name.firstIndex(of: ":") else { return false }
+        return invisibleNamespaces.contains(String(name[name.startIndex..<colon]))
+    }
 
     /// Tags that build a page rather than say anything — admitted only under
     /// the short-document rule in `isSimple`, never on their own.
@@ -53,7 +73,12 @@ enum SimpleBody {
     /// table cells, none of which mean anything.
     static let wrapperTags: Set<String> = [
         "table", "tbody", "thead", "tfoot", "tr", "td", "th", "colgroup", "col",
-        "style", "xml", "noscript", "o:wordDocument", "st1:place", "v:shape",
+        "style", "xml", "noscript",
+        // A stylesheet <link> is head furniture, and the CSP blocks the fetch
+        // regardless — its presence says nothing about the body's content.
+        "link",
+        // GitHub wraps tables it generates from Markdown in this.
+        "markdown-accessiblity-table",
     ]
 
     /// How much visible text a wrapper-laden document may hold and still be
@@ -102,7 +127,7 @@ enum SimpleBody {
         var usesWrappers = false
         for match in matches {
             let name = ns.substring(with: match.range(at: 1)).lowercased()
-            if allowedTags.contains(name) { continue }
+            if allowedTags.contains(name) || isInvisibleNamespaceTag(name) { continue }
             guard wrapperTags.contains(name) else { return false }
             usesWrappers = true
         }

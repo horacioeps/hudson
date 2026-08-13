@@ -148,7 +148,10 @@ import Testing
     model.toggleSearch()
     model.search.query = "denver"
     model.search.queryChanged()
-    try await Task.sleep(for: .milliseconds(300))
+    // Poll rather than sleep past the debounce: a flat 300ms loses under
+    // full-suite load, and this precondition failing reads as a bug in the
+    // reset path it is only setting up for.
+    try await waitUntil { !model.search.isSearching && !model.search.hits.isEmpty }
     #expect(!model.search.hits.isEmpty)  // precondition: a prior search left results
 
     model.toggleSearch()  // close
