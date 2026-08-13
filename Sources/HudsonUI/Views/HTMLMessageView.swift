@@ -39,6 +39,7 @@ struct HTMLMessageView: View {
         VStack(alignment: .leading, spacing: Metrics.unit * 2) {
             if !remoteURLs.isEmpty && !allowRemoteImages {
                 QuietButton(title: "Load remote images") { allowRemoteImages = true }
+                    .transition(Motion.reveal)
             }
             WebBodyView(
                 documentHTML: HTMLDocument.wrap(
@@ -46,6 +47,14 @@ struct HTMLMessageView: View {
                     allowRemoteImages: allowRemoteImages),
                 contentHeight: $contentHeight)
                 .frame(height: max(contentHeight, 1))
+                // `contentHeight` is written by the JS bridge — on first paint
+                // (from 0), on window load, on every image decode, and again
+                // on the remote-images reload. None of that is a user action,
+                // so none of it may animate: an animated frame here turns every
+                // reflow into a visible grow that shoves the rest of the thread
+                // around, and turns the first measurement into a card unfolding
+                // on data arrival.
+                .animation(nil, value: contentHeight)
                 // Email HTML universally assumes a LIGHT background, so render
                 // it on a white card for correct contrast even in Hudson's
                 // dark UI — the same thing modern dark-mode mail clients do.
@@ -53,6 +62,10 @@ struct HTMLMessageView: View {
                 .background(Color.white)
                 .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusMedium))
         }
+        // Only the button's own removal. The reload it triggers reports a brand
+        // new height milliseconds later, and the two must not share a
+        // transaction — hence the pin above.
+        .animation(Motion.collapse, value: allowRemoteImages)
     }
 }
 

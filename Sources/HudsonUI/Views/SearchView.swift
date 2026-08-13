@@ -12,6 +12,7 @@ public struct SearchView: View {
     private let onOpen: (String) -> Void
 
     @FocusState private var isQueryFieldFocused: Bool
+    @Namespace private var scopeNamespace
 
     public init(search: SearchModel, onOpen: @escaping (String) -> Void) {
         self.search = search
@@ -50,10 +51,25 @@ public struct SearchView: View {
                 .onChange(of: search.query) {
                     search.queryChanged()
                 }
-            if search.isSearching {
-                ProgressView()
-                    .controlSize(.small)
+            // The slot is reserved whether or not a search is in flight: the
+            // spinner is a sibling of the field, so letting it claim width on
+            // appearance reflows the field on nearly every keystroke at a
+            // 150ms debounce.
+            ZStack {
+                if search.isSearching {
+                    ProgressView()
+                        .controlSize(.small)
+                        .transition(Motion.reveal)
+                }
             }
+            .frame(width: Metrics.unit * 4)
+            // Delayed on the way in so a search that resolves faster than the
+            // eye never shows a spinner at all; immediate on the way out,
+            // because a spinner still turning after results have landed is a
+            // lie about what the app is doing.
+            .animation(
+                search.isSearching ? Motion.crossfade.delay(Motion.deliberate) : Motion.crossfade,
+                value: search.isSearching)
         }
         .padding(.horizontal, Metrics.unit * 4)
         .padding(.vertical, Metrics.unit * 4)
@@ -73,6 +89,10 @@ public struct SearchView: View {
         }
         .padding(.horizontal, Metrics.unit * 4)
         .padding(.bottom, Metrics.unit * 3)
+        // Keyed on the scope alone, never on the re-search it kicks off: the
+        // results underneath cannot land for at least the model's 150ms
+        // debounce, and the toggle has to feel resolved long before they do.
+        .animation(Motion.travel, value: isScope(.all))
     }
 
     private func scopeButton(title: String, scope: SearchScope) -> some View {
@@ -86,8 +106,18 @@ public struct SearchView: View {
                 .foregroundStyle(isActive ? Palette.ink : Palette.inkTertiary)
                 .padding(.vertical, Metrics.unit)
                 .padding(.horizontal, Metrics.unit * 3)
-                .background(isActive ? Palette.accentSoft : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: Metrics.radiusSmall))
+                // One pill, handed between the two buttons, so it slides and
+                // resizes instead of blinking across. `matchedGeometryEffect`
+                // is unambiguously safe here and nowhere else on this surface:
+                // both buttons are always mounted and never lazy, so the pill
+                // can't be orphaned by a de-materialized source.
+                .background {
+                    if isActive {
+                        RoundedRectangle(cornerRadius: Metrics.radiusSmall)
+                            .fill(Palette.accentSoft)
+                            .matchedGeometryEffect(id: "scopePill", in: scopeNamespace)
+                    }
+                }
         }
         .buttonStyle(.plain)
     }
@@ -166,9 +196,10 @@ public struct SearchView: View {
             .padding(.horizontal, Metrics.unit * 4)
             .padding(.vertical, Metrics.unit * 3)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        // Hover and press only — `isHighlighted` stays false because search
+        // hits have no keyboard navigation to reflect.
+        .buttonStyle(OverlayRowStyle())
     }
 }
 

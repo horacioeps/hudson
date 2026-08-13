@@ -11,6 +11,19 @@ public struct InboxListView: View {
     private let inbox: InboxModel
     private let onOpen: (String) -> Void
 
+    /// Shared by every tab's active indicator so the bar slides between them
+    /// instead of blinking. Safe here and nowhere else on this surface: the
+    /// strip is a plain `HStack` whose children are all realized, where the
+    /// row list below is lazy and has no geometry for a row off screen.
+    @Namespace private var tabIndicator
+
+    /// Vertical distance between two rows: a fixed-height row plus the 1pt
+    /// divider under it. The selection bar is positioned from this arithmetic
+    /// rather than from a `matchedGeometryEffect`, which would need geometry
+    /// from rows the `LazyVStack` may never have realized — and would cost a
+    /// layout pass per frame across a list of up to 200 rows.
+    private static let rowPitch = EmailRow.height + 1
+
     public init(inbox: InboxModel, onOpen: @escaping (String) -> Void) {
         self.inbox = inbox
         self.onOpen = onOpen
@@ -64,11 +77,17 @@ public struct InboxListView: View {
                 ForEach(inbox.tabs) { tab in
                     InboxTab(
                         title: tab.title, count: tab.count, isActive: isActive(tab),
+                        indicatorNamespace: tabIndicator,
                         action: { inbox.activeSplit = tab.key })
                 }
             }
             .padding(.horizontal, Metrics.unit * 3)
             .padding(.vertical, Metrics.unit * 2)
+            // Keyed on the RESOLVED split, not on `activeSplit` itself: the
+            // `.task` below settles `nil` to "primary" one frame after every
+            // cold start, and that flip must not slide a bar in from nowhere.
+            // Resolved, it isn't a change at all — only a real click is.
+            .animation(Motion.travel, value: inbox.activeSplit ?? "primary")
         }
     }
 
@@ -89,17 +108,80 @@ public struct InboxListView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(inbox.rows, id: \.threadID) { threadRow in
-                        row(for: threadRow)
-                        if threadRow.threadID != inbox.rows.last?.threadID {
-                            Rectangle().fill(Palette.border).frame(height: 1)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(inbox.rows, id: \.threadID) { threadRow in
+                            VStack(spacing: 0) {
+                                row(for: threadRow)
+                                if threadRow.threadID != inbox.rows.last?.threadID {
+                                    Rectangle().fill(Palette.border).frame(height: 1)
+                                }
+                            }
+                            // The divider is a sibling of the row, not part of
+                            // it, so grouping them is what stops an archive
+                            // leaving an orphaned hairline behind.
+                            //
+                            // Rows never animate IN. Insertions here are the
+                            // first page landing, background sync, and a
+                            // `LazyVStack` realizing a row mid-scroll — none
+                            // of which the user did. The fade out only ever
+                            // runs inside the one animated transaction
+                            // `InboxModel.apply(rows:)` opens for an archive
+                            // the user asked for; every other emit carries no
+                            // animation, so this stays instant.
+                            .transition(.asymmetric(insertion: .identity, removal: .opacity))
                         }
                     }
+                    .overlay(alignment: .topLeading) { selectionBar }
+                }
+                .onChange(of: inbox.keyboardMoveCount) {
+                    guard let threadID = inbox.selectedThreadID else { return }
+                    // `anchor: nil` leaves an already-visible row exactly where
+                    // it is and pulls only an off-edge one just inside, rather
+                    // than yanking the list a full row on every keystroke.
+                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(threadID, anchor: nil) }
                 }
             }
         }
+    }
+
+    /// The single piece of travelling selection chrome: one 2pt bar over the
+    /// whole list rather than a fill inside each row, so selection reads as a
+    /// caret sliding to the new row instead of blinking out of the old one.
+    /// It rides `.offset`, which is a draw-time transform — nothing here
+    /// re-runs layout while the list is scrolling.
+    @ViewBuilder
+    private var selectionBar: some View {
+        if let index = selectedRowIndex {
+            Rectangle()
+                .fill(Palette.accent)
+                .frame(
+                    width: EmailRow.selectionBarWidth,
+                    height: EmailRow.height - EmailRow.verticalInset * 2)
+                .offset(
+                    x: EmailRow.horizontalInset,
+                    y: CGFloat(index) * Self.rowPitch + EmailRow.verticalInset)
+                // Keyed on WHICH thread is selected, never on its ordinal.
+                // `index` also changes when a background-sync emit inserts or
+                // drops a row above the selection — nothing the user did — and
+                // the rows themselves hard-cut to their new positions there
+                // (see the `ForEach`'s `insertion: .identity` above). Keyed on
+                // the index, the bar would spend the next 200ms sliding after
+                // rows that had already moved, pointing at the wrong thread
+                // the whole way. Keyed on the id, that emit moves the bar in
+                // the same frame as the rows, and only a real selection change
+                // animates.
+                .animation(Motion.travel, value: inbox.selectedThreadID)
+                // The bar sits over the row's leading gutter; it must never
+                // eat a click meant for the row underneath it.
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var selectedRowIndex: Int? {
+        guard let selectedThreadID = inbox.selectedThreadID else { return nil }
+        return inbox.rows.firstIndex { $0.threadID == selectedThreadID }
     }
 
     private func row(for threadRow: ThreadRow) -> some View {
@@ -151,7 +233,14 @@ public struct InboxListView: View {
     /// Pencil design's compact timestamp column. `now`/`calendar` are
     /// parameters (not hard-coded `.current`/`Date.now`) purely so a test
     /// can pin them; every call site in this file uses the defaults.
-    static func formattedTime(
+    ///
+    /// `nonisolated` because `View` is `@MainActor` and this is pure string
+    /// formatting over its arguments: `MessageHeaderText.recipientLine` is
+    /// itself non-isolated (see the reasoning in its own doc comment) and
+    /// calls this, so inheriting the view's isolation put a main-actor hop on
+    /// a pure function and left non-isolated callers — tests, most obviously —
+    /// trapping in `swift_task_checkIsolated`.
+    nonisolated static func formattedTime(
         epochMilliseconds: Int64, now: Date = .now, calendar: Calendar = .current
     ) -> String {
         let date = Date(timeIntervalSince1970: Double(epochMilliseconds) / 1000)

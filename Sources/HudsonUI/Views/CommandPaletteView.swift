@@ -24,9 +24,19 @@ public struct CommandPaletteView: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             queryField
+            // The card's height is a hard cut, deliberately — no transition on
+            // the list and no animation on the container. `RootView` centres
+            // this modal in a ZStack, so half of any height change is spent
+            // moving the query field the user is typing into: collapsing to
+            // the field alone would slide it ~140pt down the screen mid-word,
+            // and back up on the next character that matches. `SearchView`'s
+            // twin 560pt card swaps its results the same way for the same
+            // reason.
             if !command.results.isEmpty {
-                Rectangle().fill(Palette.border).frame(height: 1)
-                resultsList
+                VStack(alignment: .leading, spacing: 0) {
+                    Rectangle().fill(Palette.border).frame(height: 1)
+                    resultsList
+                }
             }
         }
         // 560 is the Pencil spec width for the palette, not derived from `unit`.
@@ -88,11 +98,22 @@ public struct CommandPaletteView: View {
     }
 
     private var resultsList: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(Array(command.results.enumerated()), id: \.element.id) { index, entry in
-                    row(for: entry, isHighlighted: index == command.clampedHighlightedIndex)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(command.results.enumerated()), id: \.element.id) { index, entry in
+                        row(for: entry, isHighlighted: index == command.clampedHighlightedIndex)
+                    }
                 }
+            }
+            // Without this, arrowing past the 360pt cap moves an invisible
+            // highlight while the list sits still. No anchor: SwiftUI then
+            // scrolls the minimum distance needed to reveal the row, which is
+            // the right behavior in BOTH directions — pinning to `.bottom`
+            // would yank the list on every upward step.
+            .onChange(of: command.clampedHighlightedIndex) { _, index in
+                guard command.results.indices.contains(index) else { return }
+                withAnimation(Motion.scrollFollow) { proxy.scrollTo(command.results[index].id) }
             }
         }
         // Caps the list so a long result set scrolls within the modal
@@ -125,10 +146,8 @@ public struct CommandPaletteView: View {
             }
             .padding(.horizontal, Metrics.unit * 4)
             .padding(.vertical, Metrics.unit * 2)
-            .background(isHighlighted ? Palette.bgSelected : Color.clear)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(OverlayRowStyle(isHighlighted: isHighlighted))
     }
 
     // MARK: - Keyboard navigation
@@ -154,6 +173,57 @@ public struct CommandPaletteView: View {
         case .moveToSplit: return "arrow.right.square"
         case .openSearch: return "magnifyingglass"
         case .switchSplit: return "tray"
+        }
+    }
+}
+
+/// The row affordance shared by both overlay lists — the palette's commands
+/// and `SearchView`'s hits. It lives here rather than in `Components/` because
+/// those two views are its only callers; a third would earn it a file.
+///
+/// It exists because `.buttonStyle(.plain)` gives a macOS row neither a hover
+/// nor a pressed state, so without it clicking a row is acknowledged only by
+/// the overlay vanishing. Hover and keyboard highlight deliberately use
+/// DIFFERENT tokens (`bgHover` vs `bgSelected`): when both are on screen they
+/// have to read as two different things — where the mouse is, and what Return
+/// will fire. For the same reason hovering must never write
+/// `CommandModel.highlightedIndex`, or a resting pointer would silently
+/// retarget the keyboard.
+struct OverlayRowStyle: ButtonStyle {
+    /// Whether the keyboard highlight is on this row. Always `false` for
+    /// search hits, which have no keyboard navigation.
+    var isHighlighted: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        Row(configuration: configuration, isHighlighted: isHighlighted)
+    }
+
+    /// A real `View` rather than an inline body so it can hold the `@State`
+    /// hover flag, which `makeBody` itself cannot.
+    private struct Row: View {
+        let configuration: Configuration
+        let isHighlighted: Bool
+
+        @State private var isHovering = false
+
+        var body: some View {
+            configuration.label
+                .background(fill)
+                .contentShape(Rectangle())
+                .onHover { isHovering = $0 }
+                // Three animations, each scoped to the one flag that drives it,
+                // so a hover never animates the keyboard highlight and vice
+                // versa. Press lands almost instantly and releases on the
+                // slower `hoverOut`: acknowledgement that eases IN feels laggy.
+                .animation(configuration.isPressed ? Motion.press : Motion.hoverOut,
+                           value: configuration.isPressed)
+                .animation(isHovering ? Motion.hoverIn : Motion.hoverOut, value: isHovering)
+                .animation(Motion.crossfade, value: isHighlighted)
+        }
+
+        private var fill: Color {
+            if configuration.isPressed || isHighlighted { return Palette.bgSelected }
+            return isHovering ? Palette.bgHover : .clear
         }
     }
 }
