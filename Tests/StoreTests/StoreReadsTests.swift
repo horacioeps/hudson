@@ -69,3 +69,62 @@ import Testing
     }
     #expect(name == "Primary")
 }
+
+// MARK: - Send-as identity (the From header the account already uses)
+
+private func seedSent(
+    _ db: HudsonDatabase, account: String, id: String, fromLine: String, date: Int64
+) async throws {
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: id, threadID: "t-\(id)", historyID: date, internalDate: date,
+            fromLine: fromLine, toLine: "someone@example.com",
+            subject: "s", snippet: "sn", labelIDs: ["SENT"]),
+        account: account)
+}
+
+@Test func sendAsFromLineTakesTheMostFrequentIdentity() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "mannas@example.com"
+    try await db.upsertAccount(email: account, clientID: "c", consentedAt: .now)
+    for i in 1...5 {
+        try await seedSent(
+            db, account: account, id: "a\(i)",
+            fromLine: "Mannas <\(account)>", date: Int64(i))
+    }
+    // A stray send from some other tool must not rename the user, even though
+    // it is the most RECENT.
+    try await seedSent(
+        db, account: account, id: "b1", fromLine: "Horizon <\(account)>", date: 99)
+
+    #expect(try await db.sendAsFromLine(account: account) == "Mannas <\(account)>")
+}
+
+@Test func sendAsFromLineIgnoresBareAddressesAndOtherPeople() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "mannas@example.com"
+    try await db.upsertAccount(email: account, clientID: "c", consentedAt: .now)
+    // A bare address carries no name, so it is nothing to adopt...
+    try await seedSent(db, account: account, id: "a1", fromLine: account, date: 1)
+    try await seedSent(db, account: account, id: "a2", fromLine: account, date: 2)
+    // ...and a named header for a DIFFERENT address is somebody else.
+    try await seedSent(
+        db, account: account, id: "a3", fromLine: "Someone <other@example.com>", date: 3)
+
+    #expect(try await db.sendAsFromLine(account: account) == nil)
+}
+
+@Test func sendAsFromLineIsNilWithNoSentMail() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "mannas@example.com"
+    try await db.upsertAccount(email: account, clientID: "c", consentedAt: .now)
+    // An inbox message from the account's own address is not a SENT message.
+    _ = try await db.applySnapshot(
+        MessageSnapshot(
+            id: "i1", threadID: "t1", historyID: 1, internalDate: 1,
+            fromLine: "Mannas <\(account)>", toLine: account,
+            subject: "s", snippet: "sn", labelIDs: ["INBOX"]),
+        account: account)
+
+    #expect(try await db.sendAsFromLine(account: account) == nil)
+}

@@ -361,3 +361,60 @@ private func seedThreadWithPriorHistory(
     let jobID = try #require(model.justSentUndoJobID)
     #expect(try await db.sendJob(id: jobID, account: AppModel.demoAccount) != nil)
 }
+
+// MARK: - Send-as identity on the wire
+
+/// Hudson sent a bare address, so recipients saw "mannasnarang8" where Gmail
+/// shows "Mannas". The name is adopted from the account's own SENT mail.
+@MainActor
+@Test func aSendCarriesTheAccountsEstablishedDisplayName() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "mannas@example.com"
+    try await db.upsertAccount(email: account, clientID: "c", consentedAt: .now)
+    for i in 1...3 {
+        _ = try await db.applySnapshot(
+            MessageSnapshot(
+                id: "s\(i)", threadID: "ts\(i)", historyID: Int64(i), internalDate: Int64(i),
+                fromLine: "Mannas <\(account)>", toLine: "x@example.com",
+                subject: "s", snippet: "sn", labelIDs: ["SENT"]),
+            account: account)
+    }
+    let record = try #require(try await db.account(email: account))
+    let transport = FakeSendTransport()
+    let model = makeComposer(database: db, account: record, transport: transport)
+
+    model.startNew()
+    model.to = "someone@example.com"
+    model.subject = "Hello"
+    model.bodyText = "hi, im mannas"
+    await model.send()
+
+    let jobID = try #require(model.justSentUndoJobID)
+    let job = try #require(try await db.sendJob(id: jobID, account: account))
+    // The From header is plain text in the MIME (only bodies are base64), so
+    // this asserts on what actually goes out, not on an intermediate value.
+    let mime = String(decoding: job.rawMIME, as: UTF8.self)
+    #expect(mime.contains("From: Mannas <\(account)>"))
+}
+
+/// A brand-new account has no sent mail to learn from, and must still send.
+@MainActor
+@Test func aSendWithNoKnownIdentityFallsBackToTheBareAddress() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let account = "fresh@example.com"
+    try await db.upsertAccount(email: account, clientID: "c", consentedAt: .now)
+    let record = try #require(try await db.account(email: account))
+    let transport = FakeSendTransport()
+    let model = makeComposer(database: db, account: record, transport: transport)
+
+    model.startNew()
+    model.to = "someone@example.com"
+    model.subject = "Hello"
+    model.bodyText = "hi"
+    await model.send()
+
+    let jobID = try #require(model.justSentUndoJobID)
+    let job = try #require(try await db.sendJob(id: jobID, account: account))
+    let mime = String(decoding: job.rawMIME, as: UTF8.self)
+    #expect(mime.contains("From: \(account)"))
+}

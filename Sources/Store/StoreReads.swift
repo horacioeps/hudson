@@ -102,6 +102,44 @@ extension HudsonDatabase {
         }
     }
 
+    /// The `From` header this account's own mail already goes out with —
+    /// e.g. `Mannas <mannas@example.com>` — or `nil` when nothing in the
+    /// mailbox carries one.
+    ///
+    /// Hudson was sending a bare address, so recipients saw the local part
+    /// ("mannasnarang8") where every other client shows a name. The
+    /// authoritative source is Gmail's `users/settings/sendAs`, but reading it
+    /// needs the `gmail.settings.basic` scope, and widening the OAuth request
+    /// would force every existing user to re-consent for a cosmetic fix.
+    ///
+    /// The mailbox already knows the answer: the account's own SENT mail
+    /// carries the header its other clients sent. Reusing that value verbatim
+    /// also sidesteps re-encoding it — a non-ASCII display name arrives
+    /// already RFC 2047-encoded, and passing it through unchanged is both
+    /// simpler and less likely to be wrong than re-deriving the encoding here.
+    ///
+    /// Picks the most frequent, not the most recent: a single odd send from
+    /// some other tool shouldn't rename the user. Only rows that actually pair
+    /// a name with this account's address qualify.
+    public func sendAsFromLine(account: String) async throws -> String? {
+        try await writer.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                    SELECT m.from_line FROM messages m
+                    JOIN message_labels l
+                      ON l.account_email = m.account_email AND l.message_id = m.id
+                    WHERE m.account_email = ? AND l.label_id = 'SENT'
+                      AND m.from_line LIKE '%<%>%'
+                      AND LOWER(m.from_line) LIKE '%' || LOWER(?) || '%'
+                    GROUP BY m.from_line
+                    ORDER BY COUNT(*) DESC, MAX(m.internal_date) DESC
+                    LIMIT 1
+                    """,
+                arguments: [account, account])
+        }
+    }
+
     /// One message's attachment metadata, in the order `saveBody` recorded it.
     ///
     /// The write side (`saveBody`) has populated the `attachments` table since

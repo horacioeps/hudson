@@ -60,6 +60,12 @@ public final class ComposerModel {
 
     public private(set) var mode: Mode = .new
 
+    /// The `From` header to send as, resolved once per model from the
+    /// account's own SENT mail (see `HudsonDatabase.sendAsFromLine`) and
+    /// cached — it cannot change while a draft is open, and re-reading it per
+    /// send would put a query on the Send path for no benefit.
+    private var cachedFromLine: String?
+
     /// The reply's threading scaffold, built once by `startReply` from the
     /// thread's newest message (recipients + `In-Reply-To`/`References` +
     /// Gmail `threadID` + normalized subject). The user edits `bodyText`
@@ -187,7 +193,7 @@ public final class ComposerModel {
             // the two.
             let scaffold = try await replyMessage(
                 to: threadID, account: fromAddress, database: database,
-                from: fromAddress, bodyText: "", replyAll: false)
+                from: await senderFromLine(), bodyText: "", replyAll: false)
             replyScaffold = scaffold
             mode = .reply(threadID: threadID)
             to = scaffold.to.joined(separator: ", ")
@@ -220,7 +226,7 @@ public final class ComposerModel {
     /// the undo hold elapses.
     public func send() async {
         guard !isSending else { return }
-        guard let message = buildOutgoingMessage() else { return }
+        guard let message = buildOutgoingMessage(from: await senderFromLine()) else { return }
         guard let service = makeService() else {
             banner = Self.connectAccountBannerText
             return
@@ -311,11 +317,27 @@ public final class ComposerModel {
     /// `References` even though the user rewrote the text. Returns `nil` only
     /// in the impossible "reply mode with no scaffold" case (guarded so it
     /// can't send an untethered message).
-    private func buildOutgoingMessage() -> OutboxMessage? {
+    /// The `From` value for an outgoing message: the account's established
+    /// identity when the mailbox knows one, else the bare address, which is
+    /// what every send used before.
+    ///
+    /// `ReplyRecipients.derive` reduces whatever it is given with
+    /// `bareAddress`, so handing it the `Name <addr>` form leaves
+    /// self-exclusion working exactly as it did.
+    private func senderFromLine() async -> String {
+        let address = account?.email ?? ""
+        if let cachedFromLine { return cachedFromLine }
+        let resolved = (try? await database.sendAsFromLine(account: address)) ?? nil
+        let line = resolved ?? address
+        cachedFromLine = line
+        return line
+    }
+
+    private func buildOutgoingMessage(from fromLine: String) -> OutboxMessage? {
         switch mode {
         case .new:
             return OutboxMessage(
-                from: account?.email ?? "",
+                from: fromLine,
                 to: Self.splitAddressList(to),
                 cc: Self.splitAddressList(cc),
                 subject: subject,
@@ -323,7 +345,7 @@ public final class ComposerModel {
         case .reply:
             guard let scaffold = replyScaffold else { return nil }
             return OutboxMessage(
-                from: scaffold.from,
+                from: fromLine,
                 to: scaffold.to,
                 cc: scaffold.cc,
                 bcc: scaffold.bcc,
