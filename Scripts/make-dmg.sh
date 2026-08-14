@@ -17,7 +17,7 @@
 #     APPLE_TEAM_ID="TEAMID"
 #     APPLE_APP_PASSWORD="abcd-efgh-ijkl-mnop"   # appleid.apple.com app-specific password
 #
-# Usage: ./scripts/make-dmg.sh
+# Usage: ./Scripts/make-dmg.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,7 +27,7 @@ DMG="dist/Hudson-${VERSION}.dmg"
 VOLNAME="Hudson"
 
 # 1. Build the .app (with the real icon baked in).
-HUDSON_VERSION="$VERSION" ./scripts/package-app.sh release
+HUDSON_VERSION="$VERSION" ./Scripts/package-app.sh release
 
 # 2. Code-sign (only if a Developer ID is provided).
 if [[ -n "${DEVELOPER_ID:-}" ]]; then
@@ -55,11 +55,21 @@ ln -s /Applications "$STAGE/Applications"   # the classic "drag me →" target
 # Background art, rendered from the hudson.pen tokens. The 1x and 2x PNGs are
 # folded into ONE HiDPI TIFF: Finder picks the right representation per display,
 # which is what stops the art looking upscaled on a Retina Mac.
+#
+# Non-fatal, like the Finder styling below. Rendering needs a working Swift
+# toolchain and AppKit; on a machine where that is unavailable the right outcome
+# is a plainer installer, not a failed release build.
 echo "Rendering installer background…"
-swift Scripts/make-dmg-background.swift Design/DMG
+BACKGROUND_TIFF="$STAGE/.background/background.tiff"
 mkdir -p "$STAGE/.background"
-tiffutil -cathidpicheck Design/DMG/background.png Design/DMG/background@2x.png \
-  -out "$STAGE/.background/background.tiff" >/dev/null
+if swift Scripts/make-dmg-background.swift Design/DMG >/dev/null 2>&1 \
+  && tiffutil -cathidpicheck Design/DMG/background.png Design/DMG/background@2x.png \
+       -out "$BACKGROUND_TIFF" >/dev/null 2>&1; then
+  echo "  background rendered"
+else
+  echo "  WARN: could not render the background art; using a plain window." >&2
+  rm -rf "$STAGE/.background"
+fi
 
 # Build a READ-WRITE image first. Finder can only record window geometry, icon
 # positions and the background picture into a volume it can write to; the
@@ -73,7 +83,29 @@ hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov \
   -format UDRW -fs HFS+ "$RW_DMG" >/dev/null
 
 MOUNT_POINT="/Volumes/$VOLNAME"
+
+# If a volume named "Hudson" is already mounted — a copy of the release you
+# happen to have open, say — macOS mounts this one as "Hudson 1" instead, while
+# the AppleScript below addresses disk "$VOLNAME" by name. Left unchecked that
+# styles somebody else's volume and reports success.
+#
+# Say so and stop, rather than force-ejecting it: this script runs on other
+# people's machines, and silently unmounting a volume the user opened
+# themselves is not its business.
+if [[ -d "$MOUNT_POINT" ]]; then
+  echo "ERROR: $MOUNT_POINT is already mounted." >&2
+  echo "  Eject it and re-run — otherwise this build would mount as" >&2
+  echo "  \"$VOLNAME 1\" and the window layout would be applied to the wrong volume." >&2
+  exit 1
+fi
+
 hdiutil attach "$RW_DMG" -nobrowse -noautoopen >/dev/null
+
+# Belt and braces: confirm we actually got the name we asked for before styling.
+if [[ ! -d "$MOUNT_POINT" ]]; then
+  echo "ERROR: image did not mount at $MOUNT_POINT; refusing to style blind." >&2
+  exit 1
+fi
 
 # Icon coordinates below MUST match `appIconCenter` / `applicationsCenter` in
 # make-dmg-background.swift, or the drawn arrow stops pointing at the folder.
@@ -83,6 +115,16 @@ hdiutil attach "$RW_DMG" -nobrowse -noautoopen >/dev/null
 # Finder. Treated as non-fatal on purpose — a plain-looking installer is a much
 # better outcome than a failed release build.
 echo "Laying out the installer window…"
+
+# Only reference the background picture if the art actually rendered; naming a
+# missing file makes Finder abort the whole layout, costing the icon placement
+# too rather than just the artwork.
+if [[ -f "$BACKGROUND_TIFF" ]]; then
+  SET_BACKGROUND='set background picture of opts to file ".background:background.tiff"'
+else
+  SET_BACKGROUND=''
+fi
+
 if osascript <<APPLESCRIPT >/dev/null 2>&1
 tell application "Finder"
   tell disk "$VOLNAME"
@@ -95,7 +137,7 @@ tell application "Finder"
     set arrangement of opts to not arranged
     set icon size of opts to 128
     set text size of opts to 13
-    set background picture of opts to file ".background:background.tiff"
+    $SET_BACKGROUND
     set position of item "Hudson.app" of container window to {170, 190}
     set position of item "Applications" of container window to {470, 190}
     close

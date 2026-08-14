@@ -19,11 +19,23 @@ import AppKit
 import Foundation
 
 // MARK: - Design tokens (hudson.pen)
+//
+// LIGHT on purpose, even though Hudson itself is warm-dark. Finder draws icon
+// labels in black whenever a volume has a custom background picture — it does
+// this in Dark mode too, and the label color cannot be set from AppleScript. A
+// dark background therefore renders "Hudson" and "Applications" as black text
+// on near-black, i.e. invisible. Every readable installer is light for exactly
+// this reason.
+//
+// #F6F5F1 is Hudson's own warm off-white (the site's wordmark stroke), and the
+// ink colors below are the app's dark tokens used in reverse, so this stays the
+// same palette rather than a foreign one.
 
-let bgApp = NSColor(srgbRed: 0x1C / 255, green: 0x1C / 255, blue: 0x1A / 255, alpha: 1)
-let inkSecondary = NSColor(srgbRed: 0xA2 / 255, green: 0x9E / 255, blue: 0x95 / 255, alpha: 1)
-let inkTertiary = NSColor(srgbRed: 0x6E / 255, green: 0x6B / 255, blue: 0x64 / 255, alpha: 1)
-let accent = NSColor(srgbRed: 0x8F / 255, green: 0xB5 / 255, blue: 0xA5 / 255, alpha: 1)
+let bgCanvas = NSColor(srgbRed: 0xF6 / 255, green: 0xF5 / 255, blue: 0xF1 / 255, alpha: 1)
+let inkPrimary = NSColor(srgbRed: 0x1C / 255, green: 0x1C / 255, blue: 0x1A / 255, alpha: 1)
+let inkSecondary = NSColor(srgbRed: 0x57 / 255, green: 0x55 / 255, blue: 0x4E / 255, alpha: 1)
+let inkTertiary = NSColor(srgbRed: 0x8A / 255, green: 0x87 / 255, blue: 0x7E / 255, alpha: 1)
+let accent = NSColor(srgbRed: 0x2E / 255, green: 0x5D / 255, blue: 0x50 / 255, alpha: 1)
 
 /// Window content size in points. Icon positions in make-dmg.sh's AppleScript
 /// are expressed in this same coordinate space, so the two must agree: change
@@ -111,7 +123,7 @@ func drawWave(center: CGPoint, width: CGFloat) {
     }
     path.lineWidth = 2
     path.lineCapStyle = .round
-    accent.withAlphaComponent(0.55).setStroke()
+    accent.withAlphaComponent(0.85).setStroke()
     path.stroke()
 }
 
@@ -130,7 +142,7 @@ func renderBackground(scale: CGFloat) -> NSBitmapImageRep {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 
-    bgApp.setFill()
+    bgCanvas.setFill()
     NSRect(origin: .zero, size: size).fill()
 
     drawWave(center: CGPoint(x: size.width / 2, y: size.height - 66), width: 44)
@@ -139,7 +151,7 @@ func renderBackground(scale: CGFloat) -> NSBitmapImageRep {
         "Drag Hudson into Applications",
         at: CGPoint(x: size.width / 2, y: size.height - 108),
         font: .systemFont(ofSize: 15, weight: .medium),
-        color: inkSecondary)
+        color: inkPrimary)
 
     drawArrow()
 
@@ -147,7 +159,7 @@ func renderBackground(scale: CGFloat) -> NSBitmapImageRep {
         "Free, open source, and entirely on your Mac.",
         at: CGPoint(x: size.width / 2, y: 58),
         font: .systemFont(ofSize: 12, weight: .regular),
-        color: inkTertiary)
+        color: inkSecondary)
 
     NSGraphicsContext.restoreGraphicsState()
     return rep
