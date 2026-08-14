@@ -52,8 +52,87 @@ mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"   # the classic "drag me →" target
 
-rm -f "$DMG"
-hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+# Background art, rendered from the hudson.pen tokens. The 1x and 2x PNGs are
+# folded into ONE HiDPI TIFF: Finder picks the right representation per display,
+# which is what stops the art looking upscaled on a Retina Mac.
+echo "Rendering installer background…"
+swift Scripts/make-dmg-background.swift Design/DMG
+mkdir -p "$STAGE/.background"
+tiffutil -cathidpicheck Design/DMG/background.png Design/DMG/background@2x.png \
+  -out "$STAGE/.background/background.tiff" >/dev/null
+
+# Build a READ-WRITE image first. Finder can only record window geometry, icon
+# positions and the background picture into a volume it can write to; the
+# compressed read-only image users download is converted from it at the end.
+#
+# The existing $DMG is deliberately left alone until the new one is complete and
+# only then moved into place. An earlier version deleted it up front, and when a
+# later step failed the release artifact was simply gone.
+RW_DMG="$(dirname "$STAGE")/rw.dmg"
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov \
+  -format UDRW -fs HFS+ "$RW_DMG" >/dev/null
+
+MOUNT_POINT="/Volumes/$VOLNAME"
+hdiutil attach "$RW_DMG" -nobrowse -noautoopen >/dev/null
+
+# Icon coordinates below MUST match `appIconCenter` / `applicationsCenter` in
+# make-dmg-background.swift, or the drawn arrow stops pointing at the folder.
+#
+# This is the one step that needs a real GUI session: it drives Finder, so it
+# fails on a headless CI box and when Terminal lacks Automation permission for
+# Finder. Treated as non-fatal on purpose — a plain-looking installer is a much
+# better outcome than a failed release build.
+echo "Laying out the installer window…"
+if osascript <<APPLESCRIPT >/dev/null 2>&1
+tell application "Finder"
+  tell disk "$VOLNAME"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 840, 520}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to 128
+    set text size of opts to 13
+    set background picture of opts to file ".background:background.tiff"
+    set position of item "Hudson.app" of container window to {170, 190}
+    set position of item "Applications" of container window to {470, 190}
+    close
+    open
+    update without registering applications
+    delay 2
+  end tell
+end tell
+APPLESCRIPT
+then
+  echo "  window styled"
+else
+  echo "  WARN: Finder styling skipped (needs a GUI session + Automation permission)." >&2
+  echo "  The DMG is still valid, just with the default window." >&2
+fi
+
+# Let Finder's .DS_Store write land before the volume goes away.
+sync
+hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || hdiutil detach "$MOUNT_POINT" -force >/dev/null 2>&1
+
+# Detaching returns before the kernel has finished releasing the device, so an
+# immediate convert loses a race with it and fails "Resource temporarily
+# unavailable". Retry briefly rather than failing the build.
+STAGED_DMG="$(dirname "$STAGE")/staged.dmg"
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 \
+      -o "$STAGED_DMG" -ov >/dev/null 2>&1; then
+    break
+  fi
+  if [[ "$attempt" == 10 ]]; then
+    echo "ERROR: hdiutil convert kept failing; $DMG left untouched." >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+mv -f "$STAGED_DMG" "$DMG"
 rm -rf "$(dirname "$STAGE")"
 echo "Built $DMG"
 
