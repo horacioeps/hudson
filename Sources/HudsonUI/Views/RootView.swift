@@ -53,19 +53,39 @@ public struct RootView: View {
     }
 
     public var body: some View {
+        // Switched on `bootPhase` rather than re-testing `model`/`onboarding`
+        // here. An earlier version duplicated the conditions inline, and when
+        // `bootPhase`'s precedence changed the inline copy silently kept the
+        // old order — `bootPhase` is consumed only by `.animation(value:)`
+        // below, so nothing failed loudly and the AI-key step simply never
+        // mounted. One expression decides, and the animation keys off the same
+        // value it renders from.
         Group {
-            if let model, !model.needsOnboarding {
-                assembled(model)
-                    .transition(.opacity)
-            } else if let onboarding {
+            switch bootPhase {
+            case .mailbox:
+                // `bootPhase` returns `.mailbox` only when `model` is non-nil
+                // and past onboarding, but the optional is re-unwrapped here
+                // rather than force-unwrapped — a future edit to `bootPhase`
+                // must not be able to turn a precedence change into a crash.
+                if let model, !model.needsOnboarding {
+                    assembled(model)
+                        .transition(.opacity)
+                }
+            case .onboarding:
                 // First launch, no account yet (Task 4's gate) — the ENTIRE
                 // mailbox chrome stays unmounted until a real account exists,
                 // matching `HudsonCLI`'s old "no account -> can't do
                 // anything" posture, just with a graphical sign-in instead of
                 // a terminal command.
-                OnboardingView(model: onboarding)
-                    .transition(.opacity)
-            } else {
+                //
+                // This branch also covers the window where BOTH are live: the
+                // account row exists and its mail is already downloading,
+                // while the optional AI-key step is still on screen.
+                if let onboarding {
+                    OnboardingView(model: onboarding)
+                        .transition(.opacity)
+                }
+            case .loading:
                 loadingPlaceholder
                     .transition(.opacity)
             }
@@ -141,11 +161,34 @@ public struct RootView: View {
     /// crossfade on. Deliberately NOT the `model` identity: swapping in a new
     /// `AppModel` for the same phase (there is no such path today, but there
     /// is nothing stopping one) must not re-fade an already-visible mailbox.
-    private enum BootPhase { case loading, onboarding, mailbox }
+    enum BootPhase { case loading, onboarding, mailbox }
 
     private var bootPhase: BootPhase {
-        if let model, !model.needsOnboarding { return .mailbox }
-        return onboarding == nil ? .loading : .onboarding
+        Self.resolveBootPhase(
+            hasOnboarding: onboarding != nil,
+            hasReadyMailbox: model.map { !$0.needsOnboarding } ?? false)
+    }
+
+    /// Which branch `body` renders, as a pure function of the two inputs.
+    ///
+    /// Extracted so the precedence rule is unit-testable: `@State` can't be
+    /// read back off a `View` value a test constructs (see
+    /// `RootViewOnboardingWiringTests` for the empirical write-up), so a rule
+    /// left inline here is a rule nothing can assert on — which is exactly how
+    /// this went wrong once already. `body` and the crossfade both read the
+    /// same value, so they cannot disagree.
+    ///
+    /// **Onboarding outranks a ready mailbox.** Between `onAccountPersisted`
+    /// and `onConnected` BOTH are live at once — the account exists and its
+    /// mail is already downloading, while the optional AI-key step is still on
+    /// screen. Getting this backwards unmounts that step the instant the
+    /// account row lands, which strands `onboarding` non-nil forever (its only
+    /// exit is a button on the unmounted screen) and leaves a stale model that
+    /// resurfaces after a disconnect.
+    static func resolveBootPhase(hasOnboarding: Bool, hasReadyMailbox: Bool) -> BootPhase {
+        if hasOnboarding { return .onboarding }
+        if hasReadyMailbox { return .mailbox }
+        return .loading
     }
 
     // MARK: - Onboarding (Task 4's gate — see `onboarding` above)
@@ -183,10 +226,27 @@ public struct RootView: View {
     private func makeOnboardingModel(for model: AppModel) -> OnboardingModel {
         let database = model.database
         let onboardingModel = OnboardingModel(database: database)
-        onboardingModel.onConnected = { [self] record in
+        // Split in two so the AI-key step costs the user no mail-download
+        // time. `onAccountPersisted` fires the moment the account row exists:
+        // it builds the mailbox and starts syncing immediately, but leaves
+        // `onboarding` set, so `bootPhase` keeps the key step on screen while
+        // backfill runs behind it. `onConnected` then fires when that step
+        // resolves and simply dismisses onboarding — the mailbox it reveals is
+        // already partly full.
+        onboardingModel.onAccountPersisted = { [self] record in
             let mailbox = AppModel(database: database, account: record)
             self.model = mailbox
             mailbox.startAutoSync()
+        }
+        onboardingModel.onConnected = { [self] record in
+            // Defensive: a host that reached `onConnected` without the
+            // persisted hook having built a mailbox (an older wiring, or a
+            // test) still gets one rather than a blank window.
+            if self.model == nil || self.model?.needsOnboarding == true {
+                let mailbox = AppModel(database: database, account: record)
+                self.model = mailbox
+                mailbox.startAutoSync()
+            }
             self.onboarding = nil
         }
         return onboardingModel
@@ -313,6 +373,9 @@ public struct RootView: View {
                 pendingCount: model.pendingCount,
                 isSyncing: model.isSyncing,
                 isCatchingUp: model.isCatchingUp,
+                isSyncStalled: model.isSyncStalled,
+                backfillFraction: model.backfillFraction,
+                backfillProgress: model.backfillProgress,
                 syncBanner: model.syncBanner,
                 selection: model.sidebarSelection,
                 onSelect: { model.selectFolder($0) },
@@ -321,7 +384,10 @@ public struct RootView: View {
                 onCompose: { model.composeNew() })
                 .frame(minWidth: 200, idealWidth: Metrics.sidebarWidth, maxWidth: 300)
 
-            InboxListView(inbox: model.inbox, onOpen: { model.openThread($0) })
+            InboxListView(
+                inbox: model.inbox,
+                isCatchingUp: model.isCatchingUp,
+                onOpen: { model.openThread($0) })
                 .frame(minWidth: 300, idealWidth: Metrics.listWidth, maxWidth: 620)
 
             // Reading pane: takes the remaining width, freely resizable via the
