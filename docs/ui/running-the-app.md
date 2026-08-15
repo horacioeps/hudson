@@ -1,11 +1,14 @@
 # Running the Hudson Mac app
 
-This is the SwiftUI shell over the headless foundation (M1–M4): a three-pane
-mailbox (sidebar / inbox list / reading pane), instant keyboard-first triage,
-a ⌘K command palette, and local full-text search. It reads and triages your
-already-synced mail; syncing itself still happens from the CLI (`hudson
-sync`) until a later milestone wires a "Sync now" affordance into this UI
-(see [Stubbed / deferred](#stubbed--deferred-until-a-later-milestone) below).
+This is the SwiftUI shell over the headless foundation: a three-pane mailbox
+(sidebar / inbox list / reading pane), instant keyboard-first triage, a ⌘K
+command palette, local full-text search, compose and reply with undo-send, and
+an explicitly-invoked AI summary chip. It syncs on its own — a background loop
+polls for new mail and drains the triage and send queues — with a manual "Sync
+now" in the sidebar footer.
+
+Snooze is the one surface still stubbed; see
+[Stubbed / deferred](#stubbed--deferred-until-a-later-milestone) below.
 
 ## Screenshots
 
@@ -38,11 +41,19 @@ swift run HudsonApp
 
 `HudsonApp` opens the SAME database the CLI reads and writes
 (`~/Library/Application Support/Hudson/hudson.sqlite` —
-`HudsonDatabase.defaultDatabaseURL`), so run the CLI's `hudson auth` +
-`hudson sync` first if you want to see real mail. Nothing you do in the app
-touches the network — reading and triage (archive/star/mark read) are 100%
-local; only the CLI's `hudson sync` and `hudson <verb>` commands ever call
-Gmail.
+`HudsonDatabase.defaultDatabaseURL`), so the app and `hudson` are peers over
+one mailbox. On first launch the app's own onboarding connects a Google
+account; you can also connect from the CLI with `hudson auth`.
+
+**Reads and triage are always local.** Opening a thread, scrolling, searching,
+and archive/star/mark-read all resolve against SQLite — none of them waits on
+the network. The network runs on a background loop that polls Gmail, flushes
+queued triage, and drains queued sends. It fetches your own mail directly,
+Mac ↔ Gmail, with no server in between.
+
+The one thing that never runs on its own is AI: the Summarize chip egresses
+only when you tap it, and only for a feature you opted in. See
+[ai-privacy-model.md](../explanation/ai-privacy-model.md).
 
 ### Demo mode
 
@@ -79,6 +90,10 @@ below directly, without a live event loop.
 | `Esc` | Clear the current selection |
 | `⌘K` | Open the command palette |
 | `⌘F` or `/` | Open search |
+| `⌘N` | Compose a new message |
+
+Arrow keys are deliberately unrouted here — they belong to the list's own
+scrolling.
 
 Every triage key (`e`/`s`/`u`) enqueues its mutation the same way a click on
 the corresponding button would — instantly, optimistically (the row updates
@@ -101,28 +116,33 @@ before the (still-local, no-network) write even lands), via
 | `Esc` | Close search |
 | *(anything else)* | Typed into the query field |
 
+### Compose / reply sheet (⌘N, or Reply from the reading pane)
+
+| Key | Action |
+|---|---|
+| `Esc` | Close the sheet |
+| *(everything else)* | Typed into the message |
+
+The composer takes keyboard priority precisely so the list's single-letter
+shortcuts don't eat characters you're typing — without it you couldn't put a
+`j` or an `e` in an email. The Settings sheet shares this context for the same
+reason.
+
 ## Stubbed / deferred until a later milestone
 
 These surfaces are intentionally present but non-functional — tapping them
 shows a `Toast` naming when real behavior arrives, never a silent no-op that
 could be mistaken for a bug:
 
-- **Sending / replying** (`ThreadView`'s reply bar) — arrives with **M5**.
-- **AI summaries** (the "✦ Summarize thread" chip) — arrives with **M7**.
-  Hudson ships with zero AI/LLM network calls until then, and even after M7
-  those calls only ever happen against an API key you provide yourself.
-- **Snooze** — listed in the command palette as "Coming soon"; arrives with
-  **M6**.
-- **Sidebar nav beyond "Inbox"** (Starred / Snoozed / Sent, and per-label
-  filtering) — the sidebar renders these, but only "Inbox" is wired to a
-  real Store-backed filter today; Store has no query backing the others yet.
-- **"Sync now" from the app itself** — `AppModel.syncNow()` is implemented
-  and guarded (never crashes, never blocks the UI; shows a banner asking you
-  to run `hudson auth` in Terminal if no account is connected), but nothing
-  in this milestone's UI calls it yet — there's no button wired to it. Until
-  then, run `hudson sync` from Terminal to pull new mail. This also matches
-  Hudson's privacy stance: the only network path in the app is a single,
-  user-initiated sync action — never anything automatic.
+- **Snooze** — listed in the command palette as "Coming soon", and in the
+  reading pane's action bar; arrives with **M6**. The sidebar's Snoozed folder
+  points at the `Hudson/Snoozed` label, which stays empty until then.
+- **"More actions"** (the `⋯` button in the reading pane) — **M6**.
+- **Move to split** from the command palette — **M6**.
+
+Everything else in the shell is live: sidebar navigation (Inbox with split
+tabs, Starred, Sent, and per-label folders), background + manual sync, compose
+and reply with a 15-second undo-send window, and the AI Summarize chip.
 
 ## Fidelity note
 
@@ -133,3 +153,9 @@ correct (`KeyboardMapTests`). Pixel-level fidelity against the Pencil
 design — spacing, color, exact layout — is a live-run, eyeball-driven check
 (`swift run HudsonApp --demo`, screenshot, compare), not something a
 headless test can assert.
+
+## See also
+
+- [HudsonUI reference](../reference/hudson-ui.md) — view models, theme, routing
+- [UI design brief](../design/ui-design-brief.md) — the design system
+- [ARCHITECTURE.md](../../ARCHITECTURE.md) — how the app sits over the foundation

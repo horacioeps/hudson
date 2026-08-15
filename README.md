@@ -3,9 +3,28 @@
 A fast, open-source, Mac-native Gmail client. Superhuman-class speed, AI on
 your own API keys, no subscription, no server, no telemetry.
 
-> **Status:** pre-alpha. The headless core is being built milestone by
-> milestone ([spec](docs/superpowers/specs/2026-08-10-hudson-foundation-design.md));
-> the Mac app UI follows. Today you can authenticate, sync your mailbox into a local SQLite store, and read it back instantly from the CLI. Triage actions (archive, star, read) are instant locally and sync to Gmail in the background. Local full-text search and split inbox (with Gmail categories as automatic splits) are instant from your synced mail.
+## Download
+
+<a href="https://tryhudson.email">
+  <img alt="Download Hudson for Mac"
+       src="https://img.shields.io/badge/Download-Hudson%20for%20Mac-2e5d50?style=for-the-badge&logo=apple&logoColor=white" />
+</a>
+
+Signed and Apple-notarized DMG — no Gatekeeper warning. **Apple silicon,
+macOS 15+** (there is no Intel build).
+
+On first launch Google shows a *"this app isn't verified"* screen. That is
+expected: removing it requires an annual paid third-party security audit that a
+free client isn't going to buy. Click **Advanced → Continue to Hudson**. Your
+mail and tokens never leave your Mac — this repository is the proof, and
+[`SharedOAuth.swift`](Sources/HudsonUI/Model/SharedOAuth.swift) is where the
+sign-in credentials are resolved. If you'd rather not trust the bundled OAuth
+client at all, **Use my own Google credentials** on the sign-in screen runs the
+whole flow under a Google Cloud project you control.
+
+> **Status:** beta. Sync, reading, keyboard triage, search, send, and
+> explicitly-invoked AI all work. Snooze/send-later is not built yet, and there
+> is no auto-update — new versions are re-downloaded from the site.
 
 ## Why
 
@@ -61,11 +80,30 @@ search & split inbox → send → snooze/send-later → AI (Anthropic +
 OpenAI-compatible/local). Then: the SwiftUI app, designed by a real designer.
 Details: [the spec](docs/superpowers/specs/2026-08-10-hudson-foundation-design.md).
 
+## Documentation
+
+Start at [`docs/README.md`](docs/README.md) — the full index.
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the pieces fit together
+- [CLAUDE.md](CLAUDE.md) — working in this codebase (for humans and AI agents)
+- [Module reference](docs/reference/) — one page per target: GmailKit, Store,
+  SyncEngine, Outbox, AIKit, HudsonCLI, HudsonUI
+- Why it works the way it does:
+  [local-first sync](docs/explanation/local-first-sync.md) ·
+  [optimistic triage](docs/explanation/optimistic-mutations.md) ·
+  [the AI privacy model](docs/explanation/ai-privacy-model.md)
+- How to [add a CLI command](docs/howto/add-a-cli-command.md) or
+  [cut a release](docs/howto/build-and-release.md)
+
 ## Contributing
 
 The spec is the source of truth; every milestone lands with tests
 (`swift test`). Readability is a feature — if something is hard to follow,
 that's a bug worth filing.
+
+Read [CLAUDE.md](CLAUDE.md) first — it covers the build/test loop, the module
+dependency rules, and the seven invariants that are enforced by structure
+rather than convention.
 
 ## License
 
