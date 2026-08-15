@@ -822,6 +822,26 @@ public final class AppModel {
             syncBanner = Self.disconnectFailedBannerText
             return
         }
+        // Revoke this address's AI consent BEFORE deleting the account row.
+        // `ai_config` has no foreign key to `accounts`, so its rows outlive
+        // the delete — without this, reconnecting the same address later would
+        // silently restore an `opt_in = 1` granted in a previous session, and
+        // the first Summarize tap would egress against a consent the user has
+        // every reason to believe they revoked.
+        //
+        // The ORDER matters and mirrors the Keychain-then-Store reasoning
+        // above: revoking first means a failure here leaves everything intact
+        // and retryable, whereas revoking last would let a crash between the
+        // two writes leave `opt_in = 1` for an address the app has already
+        // forgotten — precisely the resurrection this closes. Not `try?` for
+        // the same reason the other two steps aren't: a partial purge must
+        // never be reported as a completed disconnect.
+        do {
+            try await database.revokeAIOptIn(account: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
         do {
             try await database.deleteAccount(email: email)
         } catch {
@@ -831,6 +851,12 @@ public final class AppModel {
 
         autoSyncTask?.cancel()
         autoSyncTask = nil
+        backfillProgressTask?.cancel()
+        backfillProgressTask = nil
+        backfillProgress = nil
+        backfillFraction = nil
+        isCatchingUp = false
+        isSyncStalled = false
         self.account = nil
     }
 }
