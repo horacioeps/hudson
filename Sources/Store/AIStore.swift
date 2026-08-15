@@ -64,6 +64,30 @@ extension HudsonDatabase {
         }
     }
 
+    /// Opts EVERY feature out for one account, leaving each row's `model` and
+    /// `base_url` exactly as they were.
+    ///
+    /// Two jobs, both privacy-critical:
+    ///
+    /// 1. **Disconnecting an account must revoke its AI consent.** Deleting
+    ///    the `accounts` row leaves `ai_config` untouched (there is no foreign
+    ///    key), so without this a reconnect of the same address silently
+    ///    resurrects an `opt_in = 1` granted in a previous session — consent
+    ///    the user has no reason to think still exists.
+    /// 2. **Turning AI off must not rewrite which provider it would use.** The
+    ///    obvious implementation — re-`setAIConfig` every feature with
+    ///    `model: ""`, `baseURL: nil` — also erases the provider encoding, so a
+    ///    user running a LOCAL model, whose whole point is that nothing leaves
+    ///    the machine, silently comes back as cloud Anthropic when re-enabled.
+    ///    Flipping only `opt_in` cannot do that.
+    public func revokeAIOptIn(account: String) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: "UPDATE ai_config SET opt_in = 0 WHERE account_email = ?",
+                arguments: [account])
+        }
+    }
+
     /// Upserts one feature's AI configuration (model, optional custom base
     /// URL, opt-in flag).
     public func setAIConfig(
