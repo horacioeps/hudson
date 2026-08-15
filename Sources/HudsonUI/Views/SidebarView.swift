@@ -28,6 +28,16 @@ public struct SidebarView: View {
     /// drives the footer's "Getting your mail…" line (a fresh account isn't
     /// told "All synced" while bodies are still streaming in).
     private let isCatchingUp: Bool
+    /// `AppModel.isSyncStalled` — the last pass threw. Distinguishes "still
+    /// downloading" from "cannot reach Gmail", so an offline first launch
+    /// explains itself instead of showing a frozen progress line.
+    private let isSyncStalled: Bool
+    /// `AppModel.backfillFraction` — `nil` whenever there is no measured total
+    /// to draw, which is also the signal to hide the bar (see
+    /// `showsProgressTrack`).
+    private let backfillFraction: Double?
+    /// `AppModel.backfillProgress` — the raw counts behind `downloadStatusText`.
+    private let backfillProgress: BackfillProgress?
     /// `AppModel.syncBanner` — non-`nil` for "no account connected" or "the
     /// last pass failed". Surfaced right next to the button that would fix
     /// it (in place of the pending-count text) rather than only at
@@ -42,7 +52,9 @@ public struct SidebarView: View {
 
     public init(
         accountEmail: String?, unreadCount: Int, labels: [LabelRecord], pendingCount: Int,
-        isSyncing: Bool = false, isCatchingUp: Bool = false, syncBanner: String? = nil,
+        isSyncing: Bool = false, isCatchingUp: Bool = false, isSyncStalled: Bool = false,
+        backfillFraction: Double? = nil, backfillProgress: BackfillProgress? = nil,
+        syncBanner: String? = nil,
         selection: Selection, onSelect: @escaping (Selection) -> Void,
         onSyncNow: @escaping () -> Void = {}, onSettings: @escaping () -> Void = {},
         onCompose: @escaping () -> Void = {}
@@ -53,6 +65,9 @@ public struct SidebarView: View {
         self.pendingCount = pendingCount
         self.isSyncing = isSyncing
         self.isCatchingUp = isCatchingUp
+        self.isSyncStalled = isSyncStalled
+        self.backfillFraction = backfillFraction
+        self.backfillProgress = backfillProgress
         self.syncBanner = syncBanner
         self.selection = selection
         self.onSelect = onSelect
@@ -170,6 +185,17 @@ public struct SidebarView: View {
                 .contentTransition(.opacity)
                 .frame(height: 13, alignment: .leading)
                 .animation(Motion.crossfade, value: footerStatusText)
+            // The download bar's slot is reserved PERMANENTLY rather than
+            // inserted when a backfill starts. The status line above already
+            // pins its own height for exactly this reason — so the divider at
+            // the top of the footer never moves — and animating the footer's
+            // height would shift that divider, and everything above it, at the
+            // one moment the app is trying to look composed: first launch.
+            // The cost is a few points of quiet sidebar chrome forever; the
+            // alternative is a visible jolt twice per fresh account.
+            ProgressTrack(fraction: backfillFraction)
+                .opacity(showsProgressTrack ? 1 : 0)
+                .animation(Motion.crossfade, value: showsProgressTrack)
         }
         .padding(.horizontal, Metrics.unit * 3)
         .padding(.vertical, Metrics.unit * 3)
@@ -183,11 +209,48 @@ public struct SidebarView: View {
     /// the last pass failed) beats `isSyncing` (a pass is in flight) beats
     /// the ordinary pending-mutations count. One line, one truth, rather
     /// than three separately-toggled pieces of footer chrome.
-    private var footerStatusText: String {
+    var footerStatusText: String {
         if let syncBanner { return syncBanner }
+        // Stalled outranks "Syncing…"/"Getting your mail…": a frozen progress
+        // line with no explanation is the worst of the options, and the
+        // auto-sync loop is deliberately silent otherwise (it never sets
+        // `syncBanner`), so this is the only place an offline first launch can
+        // say so.
+        if isSyncStalled { return "Waiting for network…" }
         if isSyncing { return "Syncing…" }
-        if isCatchingUp { return "Getting your mail…" }
+        if isCatchingUp { return downloadStatusText }
         return pendingCount > 0 ? "\(pendingCount) pending" : "All synced"
+    }
+
+    /// The catching-up wording, which reports counts only when they mean
+    /// something.
+    ///
+    /// Note what this deliberately never renders: "340 of 1,240". The total is
+    /// Gmail's `resultSizeEstimate`, which Google documents as approximate —
+    /// the whole reason `AppModel` caps the bar below 100% — so stating it as
+    /// an exact denominator would claim a precision the number does not have.
+    /// "about 1,240" concedes the estimate; once the real count passes it, the
+    /// total is dropped entirely rather than shown as already exceeded.
+    private var downloadStatusText: String {
+        // `isSeeded` is required as well as `isFirstDownload`: between a
+        // restart clearing the seeds and the next first page re-seeding them,
+        // `stored` already reflects a full mailbox, so quoting it would report
+        // a count that has nothing to do with this run's progress.
+        guard let progress = backfillProgress, progress.isRunning,
+              progress.isSeeded, progress.isFirstDownload, progress.stored > 0
+        else { return "Getting your mail…" }
+        guard let total = progress.totalEstimate, total > 0, progress.stored <= total else {
+            return "Getting your mail — \(progress.stored) so far"
+        }
+        return "Getting your mail — \(progress.stored) of about \(total)"
+    }
+
+    /// The bar shows only when there is a measured fraction to draw AND we are
+    /// genuinely catching up. A re-list of mail already on disk, an unknown
+    /// total, a stalled network, and the demo mailbox all fall through to the
+    /// status line with an empty track.
+    private var showsProgressTrack: Bool {
+        isCatchingUp && !isSyncStalled && backfillFraction != nil
     }
 
     /// A small text button (matching this footer's own compact 11pt scale,
