@@ -529,5 +529,43 @@ let migrator: DatabaseMigrator = {
             """)
     }
 
+    migrator.registerMigration("v11") { db in
+        // First-launch progress: the two numbers a determinate backfill bar
+        // needs, neither of which anything before this stored.
+        //
+        // `backfill_total_estimate` is the DENOMINATOR — the
+        // `resultSizeEstimate` Gmail returns on the FIRST page of a backfill
+        // run. It is deliberately the WINDOWED estimate (the count matching
+        // `SyncEngine.backfillQuery`'s own `after:` filter), never
+        // `profile.messagesTotal`: backfill lists a 90-day window, so a
+        // whole-mailbox total would leave a decade-old account's bar frozen
+        // near zero forever. Persisted rather than held in memory so a
+        // relaunch mid-backfill resumes the same denominator instead of
+        // restarting the bar.
+        //
+        // `backfill_count_baseline` is what makes the numerator honest across
+        // a RESTARTED backfill. The numerator is a live windowed
+        // `COUNT(*) FROM messages`, and nothing that restarts a backfill ever
+        // deletes mail: the §4.3 cursor-expiry branch resets only
+        // `backfill_state`/`backfill_page_token`, `v10` above does the same,
+        // and `deleteAccount` deliberately leaves every message on disk (see
+        // its doc comment). So on a re-list — or on the disconnect/reconnect
+        // path — that count starts at or above the fresh estimate, and a
+        // ratio of the two would pin the bar at its ceiling for the whole
+        // run. Recording the count as it stood when the run STARTED lets the
+        // UI tell "this is a first download" (baseline 0) apart from "this is
+        // re-listing mail already on disk" (baseline > 0), and show a bar
+        // only for the former. Re-listing mail the user already has is not
+        // progress they can see, so it gets the quiet status line instead.
+        //
+        // Both are nullable and both are cleared together whenever a backfill
+        // run restarts, so "unknown" is representable and is the state before
+        // the first page returns.
+        try db.alter(table: "accounts") { t in
+            t.add(column: "backfill_total_estimate", .integer)
+            t.add(column: "backfill_count_baseline", .integer)
+        }
+    }
+
     return migrator
 }()

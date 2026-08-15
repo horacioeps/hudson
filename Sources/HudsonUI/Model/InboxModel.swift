@@ -24,6 +24,11 @@ public final class InboxModel {
     public let account: String
 
     public private(set) var rows: [ThreadRow] = []
+
+    /// `false` until the row observation has delivered its first emit — see
+    /// `apply(rows:)`. Lets the list keep quiet during the first frames
+    /// instead of asserting an empty mailbox it has not yet read.
+    public private(set) var hasLoaded = false
     /// Always has a leading `primary` entry, even before `start()` has run
     /// or on a freshly-created (unseeded) account — matches what
     /// `buildTabs` returns for an empty rule set and an empty inbox.
@@ -186,6 +191,16 @@ public final class InboxModel {
     /// this is the only place that can tell that transaction apart from the
     /// constant sync-driven re-emits which must land with no motion at all.
     private func apply(rows newRows: [ThreadRow]) {
+        // Whether the store has answered at all yet. `rows` starts `[]`, which
+        // is indistinguishable from a genuinely empty mailbox, so the list has
+        // no way to avoid flashing an empty-state label during the first
+        // frames without this.
+        //
+        // Deliberately NEVER reset — not even in `subscribeToRows()` when the
+        // folder or split changes. `rows` retains the previous emission across
+        // a re-subscribe, so there is no empty frame to protect there, and
+        // resetting would flash a loading state on every tab click.
+        hasLoaded = true
         let landed = pendingArchive.subtracting(newRows.map(\.threadID))
         // The marker is resolved by the first emit that follows it, whichever
         // way that emit goes. Archiving from a label folder (Starred, Sent)

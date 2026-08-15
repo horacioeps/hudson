@@ -159,8 +159,15 @@ public actor SyncEngine {
                 let profile = try await api.getProfile()
                 _ = try await database.applyHistory(
                     [], newCursor: Int64(profile.historyId) ?? 0, account: account)
-                try await database.updateBackfill(
-                    email: account, state: "pending", pageToken: nil, addedCount: 0)
+                // Restarts the backfill AND forgets the previous run's
+                // progress seeds, in one transaction. The re-list is a NEW
+                // run, so carrying the old denominator into it would compare a
+                // fresh listing against a count that already includes
+                // everything it is about to re-list — the bar would open at
+                // its ceiling and sit there. Atomic because the seeds are
+                // sticky: a crash between two separate writes would leave a
+                // restarted run permanently unable to re-seed.
+                try await database.restartBackfill(email: account)
                 return 0
             }
             let changes = HistoryMapping.changes(from: page.history ?? [])
@@ -200,8 +207,31 @@ public actor SyncEngine {
         }
         let query = backfillQuery(consentedAt: record.consentedAt)
         for _ in 0..<maxPages {
+            // A nil page token means this is the FIRST page of a run — the one
+            // moment the progress seeds are established (see
+            // `seedBackfillProgress`). Captured BEFORE the call so the
+            // baseline reflects what was on disk when the run began, not
+            // after this page has already added to it.
+            let isFirstPageOfRun = record.backfillPageToken == nil
             let page = try await api.listMessages(
                 pageToken: record.backfillPageToken, maxResults: pageSize, query: query)
+            if isFirstPageOfRun {
+                // `resultSizeEstimate` is scoped to `query`, so it counts the
+                // same 90-day window this run lists — which is exactly why it,
+                // and not `profile.messagesTotal`, is the denominator. Gmail
+                // documents it as approximate and it may be absent, hence the
+                // optional; the UI treats nil as "total unknown" rather than
+                // guessing. `seedBackfillProgress` is COALESCE-guarded, so a
+                // resumed run whose seeds already exist is unaffected.
+                try await database.seedBackfillProgress(
+                    email: account,
+                    totalEstimate: page.resultSizeEstimate,
+                    countBaseline: try await database.messageCount(
+                        account: account,
+                        since: Self.backfillWindowStartMilliseconds(
+                            consentedAt: record.consentedAt,
+                            lookbackDays: backfillLookbackDays)))
+            }
             var snapshots: [MessageSnapshot] = []
             for ref in page.messages ?? [] {
                 do {
@@ -257,8 +287,36 @@ public actor SyncEngine {
     /// — provably the same filter.
     private func backfillQuery(consentedAt: Date) -> String? {
         guard backfillLookbackDays > 0 else { return nil }
-        let anchor = consentedAt.addingTimeInterval(-Double(backfillLookbackDays) * 86_400)
+        let anchor = Self.backfillWindowStart(
+            consentedAt: consentedAt, lookbackDays: backfillLookbackDays)
         return "after:\(Int(anchor.timeIntervalSince1970))"
+    }
+
+    /// The instant the backfill window opens. THE single source of truth for
+    /// that boundary: `backfillQuery` above turns it into Gmail's `after:`
+    /// filter, and the progress observation counts stored messages from the
+    /// same instant via `backfillWindowStartMilliseconds`. Two independent
+    /// expressions of "90 days before consent" would let the counted set drift
+    /// from the listed set, which would show as a bar that never reaches its
+    /// denominator — so both callers go through here.
+    public static func backfillWindowStart(consentedAt: Date, lookbackDays: Int) -> Date {
+        consentedAt.addingTimeInterval(-Double(lookbackDays) * 86_400)
+    }
+
+    /// `backfillWindowStart` in the unit `messages.internal_date` is stored in
+    /// (ms since epoch), for `HudsonDatabase.observeBackfillProgress` and
+    /// `messageCount(account:since:)`.
+    ///
+    /// A `lookbackDays` of `0` or less means the window is disabled and
+    /// backfill lists the whole mailbox (see `backfillQuery`), so the matching
+    /// count must be unbounded too — `0` achieves that, since `internal_date`
+    /// is a non-negative ms-since-epoch value.
+    public static func backfillWindowStartMilliseconds(
+        consentedAt: Date, lookbackDays: Int
+    ) -> Int64 {
+        guard lookbackDays > 0 else { return 0 }
+        let start = backfillWindowStart(consentedAt: consentedAt, lookbackDays: lookbackDays)
+        return Int64(start.timeIntervalSince1970 * 1_000)
     }
 
     /// A message that vanished between `messages.list` (or a history poll)

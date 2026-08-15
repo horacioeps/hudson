@@ -40,6 +40,12 @@ public final class OnboardingModel {
         /// fallback whenever the shared client isn't configured, or the user
         /// chooses to use their own.
         case byoEntry
+        /// The account is connected and its mail is ALREADY downloading (see
+        /// `onAccountPersisted`); this offers to keep an AI key before handing
+        /// over to the mailbox. Always skippable — Hudson is a complete mail
+        /// client with no AI configured, and this step must never read as a
+        /// requirement.
+        case aiKey
         /// Connected — the host swaps in the mailbox (`onConnected`).
         case done
         /// Sign-in failed; the message is shown with a "Try again" affordance.
@@ -75,6 +81,36 @@ public final class OnboardingModel {
     /// the host (`AppModel`/`RootView`, Task 4) rebuilds itself around the new
     /// account and shows the mailbox.
     public var onConnected: ((AccountRecord) -> Void)?
+
+    /// Fired the instant the account row exists — BEFORE the AI-key step is
+    /// shown, and therefore well before `onConnected`.
+    ///
+    /// This is what keeps the key step from costing the user any mail-download
+    /// time. `onConnected` is what mounts the mailbox and starts the sync
+    /// loop; if the key step sat in front of it, backfill would not begin
+    /// until the user finished — and for the Anthropic path "finishing" can
+    /// mean leaving the app entirely to go create a key, with nothing
+    /// downloading the whole time. Splitting the two lets the host start
+    /// syncing behind the still-showing step, so by the time the user skips or
+    /// saves, mail is already arriving.
+    public var onAccountPersisted: ((AccountRecord) -> Void)?
+
+    /// The record captured at `onAccountPersisted`, replayed to `onConnected`
+    /// when the AI-key step resolves. Held rather than re-read so the two
+    /// callbacks are guaranteed to describe the same account, and readable so
+    /// the AI-key screen can scope its `SettingsModel` to the address that was
+    /// just connected.
+    public private(set) var connectedRecord: AccountRecord?
+
+    /// Leaves the AI-key step and hands over to the mailbox. Both the "save"
+    /// and the "skip" paths land here — the only difference is whether
+    /// `SettingsModel.save(optIn:)` ran first — so there is exactly one way
+    /// out of this phase and no way to strand the flow.
+    public func finishAIKeyStep() {
+        guard phase == .aiKey else { return }
+        phase = .done
+        if let connectedRecord { onConnected?(connectedRecord) }
+    }
 
     /// Production callers pass only `database`; every seam defaults to its real
     /// implementation. `openURL`'s default is written inline (not a stored
@@ -180,8 +216,23 @@ public final class OnboardingModel {
             let record = try await database.account(email: profile.emailAddress)
 
             await server.stop()
-            phase = .done
-            if let record { onConnected?(record) }
+            // Start the mail download NOW, while the AI-key step is still on
+            // screen — see `onAccountPersisted`. If the host doesn't take that
+            // hook, fall straight through to `.done` so the flow behaves
+            // exactly as it did before this step existed (and so tests and
+            // previews that only wire `onConnected` still complete).
+            guard let record else {
+                phase = .done
+                return
+            }
+            connectedRecord = record
+            guard onAccountPersisted != nil else {
+                phase = .done
+                onConnected?(record)
+                return
+            }
+            onAccountPersisted?(record)
+            phase = .aiKey
         } catch {
             await server.stop()
             phase = .failed(Self.message(for: error))

@@ -46,6 +46,23 @@ public struct MessageBody: Sendable, Equatable {
 }
 
 extension HudsonDatabase {
+    /// How many messages are stored for `account` at or after `since` (ms
+    /// since epoch) — the one-shot twin of the count inside
+    /// `observeBackfillProgress`, used by `SyncEngine.backfill` to record the
+    /// baseline when a run starts. Index-backed by
+    /// `messages(account_email, internal_date)`.
+    public func messageCount(account: String, since: Int64) async throws -> Int {
+        try await writer.read { db in
+            try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*) FROM messages
+                    WHERE account_email = ? AND internal_date >= ?
+                    """,
+                arguments: [account, since]) ?? 0
+        }
+    }
+
     /// Newest-first message list. Reads SQLite only — never the network (§4 invariant 3).
     public func recentMessages(account: String, limit: Int) async throws -> [MessageRow] {
         try await writer.read { db in

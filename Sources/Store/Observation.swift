@@ -1,5 +1,56 @@
 import GRDB
 
+/// Everything the first-launch progress indicator needs, in one value.
+///
+/// Deliberately carries raw numbers and NOT a percentage: the ratchet (a bar
+/// must never run backwards) and the ceiling (never claim "almost done" on an
+/// estimate) are presentation decisions that belong to the view model, which
+/// is also the only layer that knows what it showed last. Store's job is to
+/// report what is true right now.
+public struct BackfillProgress: Sendable, Equatable {
+    /// `pending` | `listing` | `complete`, straight from `accounts`.
+    public let state: String
+    /// Live windowed `COUNT(*)` of stored messages — the numerator.
+    /// Deliberately an exact count rather than `backfilled_count`, which
+    /// accumulates forever, counts updates as additions, and is never reset
+    /// when a backfill restarts.
+    public let stored: Int
+    /// Sticky first-page `resultSizeEstimate` for this run; `nil` before the
+    /// first page returns.
+    public let totalEstimate: Int?
+    /// Windowed count when this run started; `nil` until seeded.
+    public let countBaseline: Int?
+
+    public init(state: String, stored: Int, totalEstimate: Int?, countBaseline: Int?) {
+        self.state = state
+        self.stored = stored
+        self.totalEstimate = totalEstimate
+        self.countBaseline = countBaseline
+    }
+
+    /// Whether backfill still has work to do. Driven by persisted STATE, never
+    /// by comparing `stored` to `totalEstimate` — a page whose messages 404
+    /// between `list` and `get` is skipped without ever incrementing `stored`
+    /// (see `SyncEngine.logSkippedMessage`), so an arithmetic completion test
+    /// would hang below 100% forever on a mailbox with any deleted mail.
+    public var isRunning: Bool { state != "complete" }
+
+    /// Whether the seeds for this run exist yet. `false` in the window between
+    /// a restart clearing them and the next first page re-seeding them —
+    /// during which `stored` may already reflect a full mailbox, so callers
+    /// that phrase a count ("N so far") must not speak until this is `true`.
+    public var isSeeded: Bool { countBaseline != nil }
+
+    /// Whether this run is a genuine first download rather than a re-list of
+    /// mail already on disk. Only a first download gets a determinate bar;
+    /// see `backfill_count_baseline`'s doc comment in `Migrations.swift`.
+    ///
+    /// Strictly `== 0`, so an unseeded run (`nil`) is NOT mistaken for a fresh
+    /// one — `nil` means "we don't know yet", and a fresh account is seeded
+    /// with an explicit `0` by `SyncEngine.backfill`.
+    public var isFirstDownload: Bool { countBaseline == 0 }
+}
+
 /// Reactive twins of Store's one-shot reads. Each method wraps the exact
 /// same SELECT as its one-shot sibling in a `ValueObservation`, so GRDB's
 /// automatic region tracking re-runs it only when a table it actually read
@@ -84,6 +135,59 @@ extension HudsonDatabase {
                     db, sql: "SELECT COUNT(*) FROM mutation_queue WHERE account_email = ?",
                     arguments: [account]) ?? 0
             }
+            .values(in: writer)
+    }
+
+    /// Live backfill progress for the first-launch indicator (migration `v11`).
+    ///
+    /// `windowStart` is the caller's window boundary in ms since epoch — the
+    /// SAME boundary `SyncEngine.backfillQuery` turns into its Gmail `after:`
+    /// filter, supplied by the caller via
+    /// `SyncEngine.backfillWindowStartMilliseconds` so Store stays ignorant of
+    /// the sync policy. Counting a different window than the run lists would
+    /// make the numerator and denominator describe different sets.
+    ///
+    /// Re-emits on the existing per-page backfill commit (`applySnapshots` +
+    /// `updateBackfill` land together), so the bar advances a page at a time
+    /// with no polling and no new sync path. A pass that THROWS writes
+    /// nothing, so no emission arrives and the last honest value stands —
+    /// which is why the view model must seed its own initial state
+    /// synchronously rather than waiting for a first emission that a broken
+    /// network never produces.
+    ///
+    /// `removeDuplicates` because hydration and triage also write `messages`
+    /// and `accounts`; without it every body fetch would re-emit an identical
+    /// value and churn the UI during the very phase this exists to smooth.
+    public func observeBackfillProgress(
+        account: String, windowStart: Int64
+    ) -> AsyncValueObservation<BackfillProgress> {
+        ValueObservation
+            .tracking { db -> BackfillProgress in
+                let row = try Row.fetchOne(
+                    db,
+                    sql: """
+                        SELECT backfill_state, backfill_total_estimate, backfill_count_baseline
+                        FROM accounts WHERE email = ?
+                        """,
+                    arguments: [account])
+                // No account row (disconnected mid-observation) reads as
+                // "nothing to do" rather than throwing — the subscription is
+                // torn down moments later either way, and a thrown error here
+                // would surface as a failed stream the UI has no use for.
+                let stored = try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT COUNT(*) FROM messages
+                        WHERE account_email = ? AND internal_date >= ?
+                        """,
+                    arguments: [account, windowStart]) ?? 0
+                return BackfillProgress(
+                    state: row?["backfill_state"] ?? "complete",
+                    stored: stored,
+                    totalEstimate: row?["backfill_total_estimate"],
+                    countBaseline: row?["backfill_count_baseline"])
+            }
+            .removeDuplicates()
             .values(in: writer)
     }
 

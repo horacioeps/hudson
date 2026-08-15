@@ -1,6 +1,7 @@
 import Foundation
 import GmailKit
 import Store
+import SyncEngine
 
 /// The root of the app's object graph. Owns the open database, the active
 /// account, and every child view model (`inbox`/`thread`/`command`/
@@ -75,6 +76,7 @@ public final class AppModel {
     /// The background auto-sync loop (see `startAutoSync`). Kept so it can be
     /// cancelled in `deinit` and so `startAutoSync` is idempotent.
     private var autoSyncTask: Task<Void, Never>?
+    private var backfillProgressTask: Task<Void, Never>?
 
     /// Whether the ⌘K command palette overlay is showing.
     public var isPaletteVisible = false
@@ -99,11 +101,48 @@ public final class AppModel {
     /// overlapping passes from a double-tap of whatever future UI calls it.
     public private(set) var isSyncing = false
 
-    /// True while the initial backfill / body-hydration is still catching up
-    /// (the auto-sync loop saw an incomplete backfill or hydrated bodies this
-    /// pass). Drives the footer's "Getting your mail…" line so a fresh account
-    /// isn't told "All synced" while bodies are still streaming in.
-    public private(set) var isCatchingUp = false
+    /// True while the initial backfill / body-hydration is still catching up.
+    /// Drives the footer's "Getting your mail…" line and the inbox list's
+    /// loading empty state, so a fresh account is never told "All synced"
+    /// while its mail is still arriving.
+    ///
+    /// **Seeded SYNCHRONOUSLY in both initializers**, from the persisted
+    /// `backfill_state` already sitting in the `AccountRecord` we were handed —
+    /// no network, no Keychain, no `await`. That ordering is the whole fix for
+    /// the original bug: this used to be declared `false` and first assigned
+    /// only after the opening `syncOnce()` returned, so for the entire first
+    /// pass on a fresh account (hundreds of `messages.get` calls) the footer
+    /// read "All synced" and the empty inbox read "No messages here". Every
+    /// async path below may now only ever REFINE this value; none of them is
+    /// the first thing to set it, so the very first frame is already honest.
+    public private(set) var isCatchingUp: Bool
+
+    /// Set when a sync pass throws, cleared when one succeeds. Distinguishes
+    /// "still downloading" from "cannot reach Gmail" in the footer — without
+    /// it, an offline first launch shows a progress line (or a part-filled
+    /// bar) frozen forever with no explanation, since the auto-sync loop is
+    /// deliberately silent about failures (it never touches `syncBanner`).
+    public private(set) var isSyncStalled = false
+
+    /// Live backfill progress for the first-launch indicator, or `nil` when
+    /// there is nothing to report. See `BackfillProgress` in Store.
+    public private(set) var backfillProgress: BackfillProgress?
+
+    /// The determinate fraction to render, or `nil` for "total not known yet"
+    /// (before the first list page returns) and for any run that is NOT a
+    /// first download — re-listing mail already on disk is not progress the
+    /// user can see, so it gets the status line and no bar.
+    ///
+    /// Ratcheted: never decreases within a run, so a message deleted mid-pass
+    /// (which shrinks the live count) can't rewind the bar. Capped below 1.0
+    /// while running, because the denominator is Gmail's own approximation and
+    /// a determinate bar must never claim "almost done" on a number we know is
+    /// inexact. Completion is signalled by `backfill_state`, never by this
+    /// value reaching a threshold.
+    public private(set) var backfillFraction: Double?
+
+    /// Hard ceiling for a running bar — see `backfillFraction`.
+    static let backfillFractionCeiling = 0.95
 
     private static let connectAccountBannerText = "Connect an account in Terminal: `hudson auth`"
 
@@ -117,6 +156,7 @@ public final class AppModel {
         let account = try await database.primaryAccount()
         self.account = account
         self.isDemo = false
+        self.isCatchingUp = Self.seedCatchingUp(account: account, isDemo: false)
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
@@ -151,6 +191,7 @@ public final class AppModel {
         self.database = database
         self.account = account
         self.isDemo = isDemo
+        self.isCatchingUp = Self.seedCatchingUp(account: account, isDemo: isDemo)
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         let email = Self.accountEmail(account)
         self.inbox = InboxModel(database: database, account: email)
@@ -202,6 +243,22 @@ public final class AppModel {
         account?.email ?? ""
     }
 
+    /// The synchronous, network-free opening value of `isCatchingUp`, read off
+    /// the persisted `backfill_state` in the record we already hold.
+    ///
+    /// No account means nothing is syncing. The demo mailbox never syncs at
+    /// all, so it is excluded explicitly as well as by `DemoData.seed` marking
+    /// its account complete — belt and braces, since a bar that can never
+    /// advance is worse than no bar.
+    ///
+    /// A missing/unknown state is treated as "complete" (not catching up):
+    /// this runs on every launch, and the failure that matters is claiming
+    /// progress that will never arrive, not briefly under-reporting it.
+    static func seedCatchingUp(account: AccountRecord?, isDemo: Bool) -> Bool {
+        guard !isDemo, let account else { return false }
+        return account.backfillState != "complete"
+    }
+
     /// `ThreadModel`'s on-demand body-fetch closure (Task: reading-pane
     /// on-demand hydration) — thin passthrough to a `LazyHydrator` (below),
     /// which defers `SyncBootstrap.makeHydrator`'s actual Keychain ->
@@ -241,6 +298,7 @@ public final class AppModel {
         pendingCountTask?.cancel()
         unreadCountTask?.cancel()
         autoSyncTask?.cancel()
+        backfillProgressTask?.cancel()
     }
 
     private func subscribeToPendingCount() {
@@ -499,7 +557,23 @@ public final class AppModel {
         // the Keychain via `SyncBootstrap`; a test passes a fake).
         let make = makeStack ?? { SyncBootstrap.makeStack(database: database, account: account) }
         autoSyncTask = Task { [weak self] in
-            guard let stack = make() else { return }
+            // Both of these run REGARDLESS of whether a network stack can be
+            // built. They are local Store reads, and hoisting them above the
+            // guard is what stops a credential-less launch from latching the
+            // synchronously-seeded `isCatchingUp` on forever: everything that
+            // can clear it lives below, so an early `return` used to leave the
+            // footer promising mail that was never coming.
+            await self?.refreshHydrationBacklog()
+            self?.subscribeToBackfillProgress()
+            guard let stack = make() else {
+                // No stored credentials (a disconnected account, or a
+                // half-finished setup). Say so instead of implying a download
+                // is in progress — the loop below, which is deliberately
+                // silent about failures, is not going to run at all.
+                self?.isCatchingUp = false
+                self?.syncBanner = Self.connectAccountBannerText
+                return
+            }
             // Also drain the SEND queue (durable send jobs whose undo-hold has
             // elapsed) — a SEPARATE flusher from `stack.flusher` (which only
             // drains triage `mutation_queue`). Without this, a composed email
@@ -521,13 +595,117 @@ public final class AppModel {
                 // full interval once caught up. The same signal keeps the
                 // footer honest (isCatchingUp) rather than claiming "All
                 // synced" mid-hydration.
-                let catchingUp =
-                    (report?.backfillComplete == false) || ((report?.bodiesHydrated ?? 0) > 0)
+                // A THROWN pass yields nil here. It must not be read as
+                // "nothing left to do": `Optional(nil) == Optional(false)` is
+                // false, so the old unconditional assignment turned one
+                // network blip into "All synced" AND relaxed the poll to the
+                // slow interval. Now a failed pass leaves the last honest
+                // value standing, says so via `isSyncStalled`, and backs off.
+                // A pass takes seconds and the writes below are @MainActor
+                // state. `disconnectAccount` cancels this task, but only after
+                // its own awaited Store calls — so without this check an
+                // in-flight pass could resume afterwards and repopulate the
+                // very flags the disconnect just cleared.
+                guard !Task.isCancelled else { return }
+                guard let report else {
+                    self?.isSyncStalled = true
+                    try? await Task.sleep(for: interval)
+                    continue
+                }
+                self?.isSyncStalled = false
+                let catchingUp = !report.backfillComplete || report.bodiesHydrated > 0
                 self?.isCatchingUp = catchingUp
                 try? await Task.sleep(for: catchingUp ? .seconds(2) : interval)
             }
             self?.isCatchingUp = false
         }
+    }
+
+    /// Sets `isCatchingUp` when bodies still need fetching even though
+    /// backfill itself has finished — the relaunch-mid-hydration case. Only
+    /// ever turns the flag ON: the loop below owns turning it off, once a real
+    /// pass has reported.
+    private func refreshHydrationBacklog() async {
+        guard let account, !isDemo else { return }
+        let windowStart = Int64(
+            Date().addingTimeInterval(-Double(Self.hydrationWindowDays) * 86_400)
+                .timeIntervalSince1970 * 1_000)
+        let pending = (try? await database.messageIDsNeedingBodies(
+            account: account.email, since: windowStart, limit: 1)) ?? []
+        if !pending.isEmpty { isCatchingUp = true }
+    }
+
+    /// Mirrors `SyncEngine`'s own `prefetchWindowDays` default. Hydration
+    /// anchors on `now()` while backfill anchors on `consentedAt`, so these
+    /// two windows are deliberately different quantities and must not be
+    /// merged into one constant.
+    static let hydrationWindowDays = 90
+
+    /// Subscribes to `observeBackfillProgress` and ratchets the fraction.
+    /// Started from inside `startAutoSync`'s task, so a launch with no
+    /// credentials (or `--demo`) never renders a bar that could not advance.
+    private func subscribeToBackfillProgress() {
+        guard let account, !isDemo, backfillProgressTask == nil else { return }
+        let windowStart = SyncEngine.backfillWindowStartMilliseconds(
+            consentedAt: account.consentedAt, lookbackDays: Self.backfillWindowDays)
+        let email = account.email
+        let database = self.database
+        backfillProgressTask = Task { [weak self] in
+            do {
+                for try await progress in database.observeBackfillProgress(
+                    account: email, windowStart: windowStart) {
+                    guard let self, !Task.isCancelled else { return }
+                    self.applyBackfillProgress(progress)
+                }
+            } catch {
+                // Same posture as the other Store subscriptions: a genuine
+                // failure here has no recovery beyond the next launch, and the
+                // synchronously-seeded `isCatchingUp` still tells the truth.
+            }
+        }
+    }
+
+    /// Mirrors `SyncEngine`'s own `backfillLookbackDays` default — the 90-day
+    /// sync window. The progress count MUST use the same boundary the backfill
+    /// lists, or numerator and denominator describe different sets.
+    static let backfillWindowDays = 90
+
+    /// Folds one observation emit into the rendered state, applying the
+    /// ratchet and the ceiling. Split out from the subscription so tests can
+    /// drive the exact sequence of emits that a real backfill produces.
+    func applyBackfillProgress(_ progress: BackfillProgress) {
+        backfillProgress = progress
+        // The observation is persisted truth about backfill and outranks the
+        // report-derived guess for that half. It can only turn catching-up ON
+        // here; hydration (which this does not measure) owns turning it off.
+        if progress.isRunning { isCatchingUp = true }
+
+        guard progress.isRunning else {
+            // Completion is state-driven. Fill the bar out ONLY if one was
+            // actually being drawn, so it leaves the screen full rather than
+            // stranded at the 0.95 ceiling.
+            //
+            // The `!= nil` test is load-bearing, not defensive: the runs that
+            // deliberately get no bar — a re-list of mail already on disk, and
+            // a first download whose estimate came back nil or zero — reach
+            // this line too, and filling unconditionally made a full bar
+            // materialize for them out of nowhere. (The previous form,
+            // `backfillProgress == nil ? nil : 1.0`, could never take its nil
+            // arm at all: `backfillProgress` is assigned from the non-optional
+            // parameter a few lines above.)
+            if backfillFraction != nil { backfillFraction = 1.0 }
+            return
+        }
+        guard progress.isFirstDownload, let total = progress.totalEstimate, total > 0 else {
+            // Either the total isn't known yet (before page one returns) or
+            // this run is re-listing mail already on disk. Both render as the
+            // status line with an empty track, never a moving bar.
+            backfillFraction = nil
+            return
+        }
+        let raw = Double(progress.stored) / Double(total)
+        let capped = min(raw, Self.backfillFractionCeiling)
+        backfillFraction = max(backfillFraction ?? 0, capped)
     }
 
     /// Test seam: whether the background auto-sync loop is running.
@@ -564,7 +742,15 @@ public final class AppModel {
             _ = try await stack.engine.syncOnce()
             _ = try await stack.flusher.flushOnce()
             await refreshLabels()
+            // The manual button and the background loop share one notion of
+            // whether Gmail is reachable. Without this, a successful "Sync
+            // now" left `isSyncStalled` set by an earlier failed background
+            // pass, and the footer kept saying "Waiting for network…" —
+            // outranking every other status — until the loop happened to
+            // succeed on its own.
+            isSyncStalled = false
         } catch {
+            isSyncStalled = true
             syncBanner = "Sync failed — check your connection."
         }
     }
@@ -636,6 +822,26 @@ public final class AppModel {
             syncBanner = Self.disconnectFailedBannerText
             return
         }
+        // Revoke this address's AI consent BEFORE deleting the account row.
+        // `ai_config` has no foreign key to `accounts`, so its rows outlive
+        // the delete — without this, reconnecting the same address later would
+        // silently restore an `opt_in = 1` granted in a previous session, and
+        // the first Summarize tap would egress against a consent the user has
+        // every reason to believe they revoked.
+        //
+        // The ORDER matters and mirrors the Keychain-then-Store reasoning
+        // above: revoking first means a failure here leaves everything intact
+        // and retryable, whereas revoking last would let a crash between the
+        // two writes leave `opt_in = 1` for an address the app has already
+        // forgotten — precisely the resurrection this closes. Not `try?` for
+        // the same reason the other two steps aren't: a partial purge must
+        // never be reported as a completed disconnect.
+        do {
+            try await database.revokeAIOptIn(account: email)
+        } catch {
+            syncBanner = Self.disconnectFailedBannerText
+            return
+        }
         do {
             try await database.deleteAccount(email: email)
         } catch {
@@ -645,6 +851,12 @@ public final class AppModel {
 
         autoSyncTask?.cancel()
         autoSyncTask = nil
+        backfillProgressTask?.cancel()
+        backfillProgressTask = nil
+        backfillProgress = nil
+        backfillFraction = nil
+        isCatchingUp = false
+        isSyncStalled = false
         self.account = nil
     }
 }

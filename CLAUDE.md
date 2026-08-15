@@ -88,6 +88,34 @@ that is a design discussion, not a refactor.
 7. **Store access is `async` through `HudsonDatabase`.** Never reach for the
    GRDB `writer` from another module or block a cooperative-pool thread.
 
+## Git workflow
+
+**Never push directly to `main`.** No exceptions.
+
+```bash
+git checkout -b feat-<what-it-does>    # before you start
+# ... atomic commits ...
+git push -u origin feat-<what-it-does>  # push the BRANCH
+```
+
+Merging into `main` is a separate, deliberate step — at the end of the day, or
+when the owner asks. Never silently.
+
+**Commit one logical unit at a time.** A schema change is a commit. A view
+model change is a commit. A bug fix is a commit. A session's worth of work is
+not a commit.
+
+Each commit must:
+- **build on its own** — `swift build` green at that commit
+- **carry its own tests** — the tests for a change land with the change, not in
+  a trailing "add tests" commit
+- **say what it does and why**, in a message that stands alone
+
+The reason is reverting. A feature on its own branch, built from small
+self-contained commits, backs out cleanly — the whole branch, or one commit
+inside it. A 2,000-line commit already on `main` cannot be unpicked without
+collateral damage.
+
 ## Conventions
 
 **Comments explain why, not what.** This codebase's doc comments are unusually

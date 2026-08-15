@@ -24,8 +24,16 @@ public struct InboxListView: View {
     /// layout pass per frame across a list of up to 200 rows.
     private static let rowPitch = EmailRow.height + 1
 
-    public init(inbox: InboxModel, onOpen: @escaping (String) -> Void) {
+    /// `AppModel.isCatchingUp` — lets the empty state tell "still downloading"
+    /// apart from "genuinely nothing here". Defaulted so previews and the
+    /// existing render tests construct this view unchanged.
+    private let isCatchingUp: Bool
+
+    public init(
+        inbox: InboxModel, isCatchingUp: Bool = false, onOpen: @escaping (String) -> Void
+    ) {
         self.inbox = inbox
+        self.isCatchingUp = isCatchingUp
         self.onOpen = onOpen
     }
 
@@ -101,12 +109,33 @@ public struct InboxListView: View {
     @ViewBuilder
     private var list: some View {
         if inbox.rows.isEmpty {
-            VStack {
-                Text("No messages here")
-                    .font(Typography.ui(13))
-                    .foregroundStyle(Palette.inkTertiary)
+            // Three states, not two. An empty row set means one of three very
+            // different things, and rendering them identically as "No messages
+            // here" is the bug this fixes: on a freshly connected account the
+            // list confidently declared the mailbox empty while hundreds of
+            // messages were still downloading.
+            //
+            // `!inbox.hasLoaded` is the first frames before the store has
+            // answered at all — blank, because a label that appears for two
+            // frames and vanishes is noise, not information.
+            VStack(spacing: Metrics.unit * 2) {
+                if !inbox.hasLoaded {
+                    EmptyView()
+                } else if isCatchingUp {
+                    Text("Getting your mail…")
+                        .font(Typography.ui(13))
+                        .foregroundStyle(Palette.inkSecondary)
+                    Text("Your inbox will fill in as messages arrive.")
+                        .font(Typography.ui(11))
+                        .foregroundStyle(Palette.inkTertiary)
+                } else {
+                    Text("No messages here")
+                        .font(Typography.ui(13))
+                        .foregroundStyle(Palette.inkTertiary)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(Motion.crossfade, value: isCatchingUp)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {

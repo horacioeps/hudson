@@ -27,6 +27,59 @@ public struct OnboardingView: View {
     /// `placeholderToastText` are view-local rather than model state.
     @State private var byoClientID = ""
     @State private var byoClientSecret = ""
+    /// The AI-key step's field. Never persisted from here directly — it is
+    /// handed to `SettingsModel`, which owns the Keychain write.
+    @State private var aiKey = ""
+    /// Consent to egress, deliberately defaulting to OFF and deliberately
+    /// separate from having entered a key. See `aiKeyScreen`.
+    @State private var aiOptIn = false
+    /// A refusal or failure from `SettingsModel.save(optIn:)`, surfaced on the
+    /// step instead of being discarded — the whole point of `save` reporting
+    /// what it actually wrote.
+    @State private var aiBanner: String?
+
+    private var trimmedAIKey: String {
+        aiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Writes the AI configuration, then leaves the step — but only writes at
+    /// all when the user actually supplied something.
+    ///
+    /// The empty-field guard is not a micro-optimization. `SettingsModel.save`
+    /// unconditionally rewrites all four `ai_config` rows with `provider =
+    /// .anthropic` and a nil base URL, so calling it for a user who typed
+    /// nothing would overwrite a RETURNING address's stored provider — turning
+    /// a local, nothing-leaves-the-machine model into cloud Anthropic. That is
+    /// exactly the downgrade `revokeAIOptIn` was introduced to prevent, so
+    /// this screen must not reintroduce it from the other side.
+    private func saveAIKeyAndContinue() async {
+        aiBanner = nil
+        // Nothing typed and no consent given: this is a Skip in all but name.
+        guard !trimmedAIKey.isEmpty || aiOptIn else {
+            model.finishAIKeyStep()
+            return
+        }
+        // No account means nothing to scope the config to; fall through rather
+        // than writing a row under an empty address.
+        guard let email = model.connectedRecord?.email else {
+            model.finishAIKeyStep()
+            return
+        }
+        let settings = SettingsModel(database: model.database, account: email)
+        // Load first, so an address that already has a configuration keeps it
+        // rather than having Anthropic assumed onto it.
+        await settings.load()
+        settings.provider = .anthropic
+        settings.apiKey = aiKey
+        await settings.save(optIn: aiOptIn)
+        // A refusal means the user asked for something that did not happen —
+        // stay on the step and say so, rather than silently continuing.
+        if aiOptIn && !settings.isEnabled {
+            aiBanner = settings.banner
+            return
+        }
+        model.finishAIKeyStep()
+    }
 
     public init(model: OnboardingModel) {
         self.model = model
@@ -54,6 +107,8 @@ public struct OnboardingView: View {
             signInScreen(isSigningIn: false)
         case .signingIn:
             signInScreen(isSigningIn: true)
+        case .aiKey:
+            aiKeyScreen
         case .byoEntry:
             byoEntryScreen
         case .done:
@@ -182,6 +237,83 @@ public struct OnboardingView: View {
     }
 
     // MARK: - BYO credential entry
+
+    /// The optional AI-key step, shown once the account is connected and its
+    /// mail is ALREADY downloading behind this screen (see
+    /// `OnboardingModel.onAccountPersisted`).
+    ///
+    /// Three things this copy has to get right, all of them consent
+    /// questions rather than layout ones:
+    ///
+    /// - **Skip is a peer of Save, not a footnote.** Hudson is a complete mail
+    ///   client with no AI configured. A step that reads as required would be
+    ///   a lie, and would sour the one-click promise for someone who never
+    ///   wants AI.
+    /// - **It names what would leave the machine, and when.** "only when you
+    ///   ask" is the literal enforcement (`Invocation` + `EgressGuard`), not
+    ///   marketing.
+    /// - **Saving a key does not switch AI on.** `save(optIn: false)` stores
+    ///   the key and leaves every feature opted out, because pasting a key and
+    ///   agreeing to send your email to a provider are two different
+    ///   decisions. The toggle below is the second one, and it defaults off.
+    private var aiKeyScreen: some View {
+        VStack(alignment: .leading, spacing: Metrics.unit * 5) {
+            VStack(alignment: .leading, spacing: Metrics.unit * 2) {
+                Text("Add an AI key")
+                    .font(Typography.serif(24, .semibold))
+                    .foregroundStyle(Palette.ink)
+                Text("Optional. Your mail is already downloading in the background.")
+                    .font(Typography.ui(13))
+                    .foregroundStyle(Palette.inkSecondary)
+            }
+
+            labeledField(
+                "Anthropic API key", placeholder: "sk-ant-…", text: $aiKey, isSecure: true)
+
+            Toggle(isOn: $aiOptIn) {
+                Text("Let Hudson send mail to Anthropic when I ask it to")
+                    .font(Typography.ui(12))
+                    .foregroundStyle(Palette.inkSecondary)
+            }
+            .toggleStyle(.switch)
+            .tint(Palette.accent)
+            // Consent is meaningless without a key to consent against, and
+            // `save(optIn:)` would refuse it anyway — disabling here makes the
+            // refusal unreachable instead of surfacing it as an error after
+            // the fact.
+            .disabled(trimmedAIKey.isEmpty)
+            .onChange(of: trimmedAIKey.isEmpty) { _, isEmpty in
+                if isEmpty { aiOptIn = false }
+            }
+
+            HStack(spacing: Metrics.unit * 3) {
+                PrimaryButton(
+                    title: "Save and continue",
+                    action: { Task { await saveAIKeyAndContinue() } })
+                QuietButton(title: "Skip", action: { model.finishAIKeyStep() })
+            }
+
+            if let aiBanner {
+                Text(aiBanner)
+                    .font(Typography.ui(11))
+                    .foregroundStyle(Palette.danger)
+            }
+
+            // Names BOTH things the toggle grants. An earlier draft said "only
+            // the thread or question you explicitly act on leaves your Mac",
+            // which was not true: this single consent also covers
+            // `.voiceProfile`, and `VoiceProfile.generate` reads a sample of
+            // SENT mail — messages unrelated to whatever thread you acted on —
+            // to learn how you write. Consent copy that understates the grant
+            // is worse than no copy.
+            Text(
+                "Nothing is ever sent on its own — no summarizing in the background, no scanning. Only what you explicitly act on leaves your Mac: the thread you summarize, the question you ask, and — when you ask for a draft in your own voice — a sample of your sent mail, so it can learn how you write. Only to the provider whose key you entered. You can change or remove this any time in Settings."
+            )
+            .font(Typography.ui(11))
+            .foregroundStyle(Palette.inkTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 
     private var byoEntryScreen: some View {
         VStack(alignment: .leading, spacing: Metrics.unit * 5) {
