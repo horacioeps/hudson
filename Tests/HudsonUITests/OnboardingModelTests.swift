@@ -205,3 +205,93 @@ private final class OpenSpy {
     // The listener was still cleaned up on the failure path.
     #expect(await loopback.stopped())
 }
+
+// MARK: - The onboarding step itself
+
+/// Mail must start downloading BEFORE the key step is shown, not after it is
+/// resolved — otherwise the step costs the user however long it takes them to
+/// go and create an API key, with nothing arriving in the meantime.
+@MainActor
+@Test func syncStartsWhenTheAccountLandsNotWhenTheKeyStepIsResolved() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = OnboardingModel(
+        database: db,
+        tokenStore: InMemoryTokenStore(),
+        transport: ScriptedTransport(),
+        makeLoopback: { FakeLoopback(code: "auth-code-xyz") },
+        openURL: { _ in })
+
+    var order: [String] = []
+    model.onAccountPersisted = { _ in order.append("persisted") }
+    model.onConnected = { _ in order.append("connected") }
+
+    await model.signInBYO(clientID: "byo-client-id", clientSecret: "byo-secret")
+
+    // Parked on the key step, with the mailbox already syncing behind it.
+    #expect(model.phase == .aiKey)
+    #expect(order == ["persisted"])
+
+    model.finishAIKeyStep()
+
+    #expect(model.phase == .done)
+    #expect(order == ["persisted", "connected"])
+}
+
+/// Skip is a real exit, not a dead end: it hands over to the mailbox exactly
+/// like saving does, with no AI configuration written at all.
+@MainActor
+@Test func skippingTheKeyStepStillReachesTheMailboxWithNoAIConfigured() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = OnboardingModel(
+        database: db,
+        tokenStore: InMemoryTokenStore(),
+        transport: ScriptedTransport(),
+        makeLoopback: { FakeLoopback(code: "auth-code-xyz") },
+        openURL: { _ in })
+    model.onAccountPersisted = { _ in }
+    var connected: AccountRecord?
+    model.onConnected = { connected = $0 }
+
+    await model.signInBYO(clientID: "byo-client-id", clientSecret: "byo-secret")
+    model.finishAIKeyStep()
+
+    #expect(connected?.email == "friend@example.com")
+    let config = try await db.aiConfig(feature: "summarize", account: "friend@example.com")
+    #expect(config == nil)
+}
+
+/// A host that never wires the persisted hook (an older wiring, a preview, a
+/// test) must still complete the flow rather than parking forever on a step it
+/// never asked for.
+@MainActor
+@Test func aHostWithoutThePersistedHookSkipsTheKeyStepEntirely() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = OnboardingModel(
+        database: db,
+        tokenStore: InMemoryTokenStore(),
+        transport: ScriptedTransport(),
+        makeLoopback: { FakeLoopback(code: "auth-code-xyz") },
+        openURL: { _ in })
+    var connected: AccountRecord?
+    model.onConnected = { connected = $0 }
+
+    await model.signInBYO(clientID: "byo-client-id", clientSecret: "byo-secret")
+
+    #expect(model.phase == .done)
+    #expect(connected?.email == "friend@example.com")
+}
+
+/// `finishAIKeyStep` is only meaningful from the step itself — a stray call
+/// must not fire `onConnected` a second time or jump the flow.
+@MainActor
+@Test func finishingTheKeyStepFromAnotherPhaseIsANoOp() async throws {
+    let db = try HudsonDatabase.inMemory()
+    let model = OnboardingModel(database: db, tokenStore: InMemoryTokenStore())
+    var connectedCount = 0
+    model.onConnected = { _ in connectedCount += 1 }
+
+    model.finishAIKeyStep()
+
+    #expect(model.phase == .welcome)
+    #expect(connectedCount == 0)
+}
