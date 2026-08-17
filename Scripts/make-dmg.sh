@@ -26,6 +26,18 @@ APP="dist/Hudson.app"
 DMG="dist/Hudson-${VERSION}.dmg"
 VOLNAME="Hudson"
 
+# Resolve notary credentials up front, because the app is notarized BEFORE the
+# DMG is assembled (see step 2b) and the DMG again after. Both steps need these,
+# so working them out once here beats duplicating the precedence rules twice.
+NOTARIZE=0
+NOTARY_ARGS=()
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+  NOTARIZE=1; NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+  NOTARIZE=1
+  NOTARY_ARGS=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+fi
+
 # 1. Build the .app (with the real icon baked in).
 HUDSON_VERSION="$VERSION" ./Scripts/package-app.sh release
 
@@ -44,6 +56,46 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
   echo "Signed OK"
 else
   echo "No DEVELOPER_ID set — building an UNSIGNED app (right-click→Open on other Macs)."
+fi
+
+# 2b. Notarize and STAPLE THE APP ITSELF, before it goes into the DMG.
+#
+# Stapling only the finished DMG (what this script used to do) is not enough.
+# The ticket lives on the disk image, so the moment the user drags Hudson.app
+# out to /Applications the copy they actually run carries no ticket at all.
+# Gatekeeper then has to ask Apple's notary service over the network on first
+# launch, and when that lookup cannot be resolved — offline, captive wifi, a
+# firewall, or Apple having a bad afternoon — macOS does not degrade politely.
+# It reports "Hudson is damaged and can't be opened. You should move it to the
+# Trash." and refuses to run, which reads to the user as a broken download.
+#
+# This never shows up on the machine that built the release: it has the
+# notarization result cached locally and its own copy was never quarantined.
+# It only bites on other people's Macs, which is the worst possible place to
+# find out. Stapling here puts the ticket inside the app bundle, so a first
+# launch needs no network at all.
+#
+# notarytool needs a zip (or dmg/pkg) rather than a bare bundle, so the app is
+# zipped to a temp path purely as an upload envelope and thrown away after.
+if [[ "$NOTARIZE" == 1 && -n "${DEVELOPER_ID:-}" ]]; then
+  echo "Notarizing the app (this can take a few minutes)…"
+  APP_ZIP="$(mktemp -d)/Hudson.zip"
+  ditto -c -k --keepParent "$APP" "$APP_ZIP"
+  xcrun notarytool submit "$APP_ZIP" "${NOTARY_ARGS[@]}" --wait
+  rm -rf "$(dirname "$APP_ZIP")"
+
+  # Braces are load-bearing: this script uses a UTF-8 ellipsis in its progress
+  # lines, and bash swallows those bytes into the variable name when they sit
+  # directly against `$APP`, so an unbraced `$APP…` dies under `set -u`.
+  echo "Stapling the ticket to ${APP}…"
+  xcrun stapler staple "$APP"
+  # Hard failure on purpose. A silently unstapled app is precisely the bug this
+  # step exists to prevent, and it is invisible until it reaches someone else.
+  xcrun stapler validate "$APP"
+  echo "App notarized + stapled OK"
+elif [[ -n "${DEVELOPER_ID:-}" ]]; then
+  echo "No notary credentials — the app will ship WITHOUT a stapled ticket." >&2
+  echo "  First launch on another Mac will need a working network connection." >&2
 fi
 
 # 3. Assemble a drag-to-install DMG staging folder.
@@ -183,15 +235,6 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
   codesign --force --sign "$DEVELOPER_ID" "$DMG"
 fi
 
-NOTARIZE=0
-NOTARY_ARGS=()
-if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-  NOTARIZE=1; NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
-elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
-  NOTARIZE=1
-  NOTARY_ARGS=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
-fi
-
 if [[ "$NOTARIZE" == 1 ]]; then
   if [[ -z "${DEVELOPER_ID:-}" ]]; then
     echo "Notarization needs a signed app — set DEVELOPER_ID too. Skipping." >&2
@@ -205,6 +248,46 @@ if [[ "$NOTARIZE" == 1 ]]; then
   fi
 else
   echo "No notary credentials — skipping notarization (fine for local testing)."
+fi
+
+# 5. Prove the shipped artifact is actually installable on someone else's Mac.
+#
+# Everything above can report success while still producing a DMG whose app is
+# unstapled — that was the original bug, and it survived a release precisely
+# because nothing ever checked. So mount what was just built and interrogate the
+# app the user will really drag out, rather than trusting the build steps.
+#
+# `stapler validate` on the extracted app is the assertion that matters: it
+# passes only when the ticket is inside the bundle, which is the same question
+# Gatekeeper asks on a first launch with no network.
+if [[ "$NOTARIZE" == 1 && -n "${DEVELOPER_ID:-}" ]]; then
+  echo "Verifying the shipped artifact…"
+  VERIFY_MNT="$(mktemp -d)/verify"
+  mkdir -p "$VERIFY_MNT"
+  hdiutil attach "$DMG" -nobrowse -noautoopen -mountpoint "$VERIFY_MNT" >/dev/null
+
+  VERIFY_FAILED=0
+  xcrun stapler validate "$VERIFY_MNT/Hudson.app" >/dev/null 2>&1 \
+    && echo "  app inside the DMG is stapled" \
+    || { echo "  FAIL: app inside the DMG has NO stapled ticket" >&2; VERIFY_FAILED=1; }
+
+  spctl -a -t exec "$VERIFY_MNT/Hudson.app" >/dev/null 2>&1 \
+    && echo "  Gatekeeper accepts it" \
+    || { echo "  FAIL: Gatekeeper rejects the app" >&2; VERIFY_FAILED=1; }
+
+  # A thin binary silently excludes every Intel Mac. Not fatal — that is a
+  # deliberate arm64-only decision — but it should be stated, not discovered.
+  echo "  architectures: $(lipo -archs "$VERIFY_MNT/Hudson.app/Contents/MacOS/HudsonApp")"
+
+  hdiutil detach "$VERIFY_MNT" >/dev/null 2>&1 || \
+    hdiutil detach "$VERIFY_MNT" -force >/dev/null 2>&1
+  rm -rf "$(dirname "$VERIFY_MNT")"
+
+  if [[ "$VERIFY_FAILED" == 1 ]]; then
+    echo "ERROR: $DMG is not safe to publish — see the failures above." >&2
+    exit 1
+  fi
+  echo "Verified OK"
 fi
 
 echo ""
