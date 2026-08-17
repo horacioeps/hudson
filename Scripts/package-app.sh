@@ -16,11 +16,21 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/HudsonApp"
 
-# SwiftPM resource bundles (bundled fonts, etc.) go in Contents/Resources —
-# that's the FIRST location `Bundle.module` probes (via Bundle.main.resourceURL)
-# AND the only spot codesign accepts a nested bundle. Putting them in
-# Contents/MacOS launches fine unsigned but makes codesign reject the whole
+# SwiftPM resource bundles (bundled fonts, etc.) go in Contents/Resources
+# because that is the only spot codesign accepts a nested bundle. Putting them
+# in Contents/MacOS launches fine unsigned but makes codesign reject the whole
 # app as "bundle format unrecognized," so it must be Resources for notarization.
+#
+# This comment used to also claim Contents/Resources is "the FIRST location
+# Bundle.module probes (via Bundle.main.resourceURL)". That was wrong, and it
+# cost two shipped releases. The generated accessor probes
+# `Bundle.main.bundleURL` — the bundle ROOT, not its Resources directory — and
+# then an absolute .build path from the compiling machine, and `fatalError`s
+# when both miss. So placing the bundle here is correct for codesign and
+# invisible to `Bundle.module`, which is why HudsonUI now resolves its own
+# resources (see `Typography.bundledFontURLs`) instead of relying on it.
+# Anything that reads bundled resources must do the same or it will crash on
+# every Mac except this one.
 shopt -s nullglob
 for b in ".build/$CONFIG"/*.bundle; do cp -R "$b" "$APP/Contents/Resources/"; done
 
