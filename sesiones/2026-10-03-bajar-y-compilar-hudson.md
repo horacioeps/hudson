@@ -61,3 +61,13 @@ Lanza Hudson.
 ## Hecho
 
 `open ~/Applications/Hudson.app` — proceso `HudsonApp` (pid 90054).
+
+---
+
+## Pedido (16:27)
+
+Hudson pide Client ID y Client Secret; extraerlos del proyecto EmailerX local.
+
+## Hecho
+
+`Emailer_X` no tiene OAuth de Google (solo SMTP/IMAP). El par Desktop que sí existe en esta máquina está en `~/.cursor/gestion-ucam/credentials_eps.json` (proyecto `explore-labs-503517`, tipo installed, para `horacio.eps@gmail.com`). Client ID copiado al chat; secret al portapapeles. No se volcó el secret al repo.
