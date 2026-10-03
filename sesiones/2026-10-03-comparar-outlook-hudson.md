@@ -19,3 +19,11 @@ Cuándo Outlook: trabajo Exchange, agenda compartida, varios protocolos, móvil+
 Cuándo Hudson: Gmail en un Mac reciente, triage rápido, correo que no pasa por un servidor del cliente, IA con tu key.
 
 Cierre: sesión + HISTORICO + push a `origin/main`.
+
+## Usuario
+
+vale tambien para mail ionos ???
+
+## Agente
+
+No. Hudson es Gmail API + OAuth (spec: “Gmail only… no IMAP”). IONOS es IMAP/SMTP. En Outlook de este Mac la cuenta IMAP `horacio@horacio-ps.com` encaja ahí; no entra en Hudson. Para IONOS: Outlook, Mail.app u otro cliente IMAP.
