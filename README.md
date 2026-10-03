@@ -1,5 +1,7 @@
 # Hudson
 
+Fork local de Horacio: [horacioeps/hudson](https://github.com/horacioeps/hudson) (upstream: [mannasdev/hudson](https://github.com/mannasdev/hudson)). Diario de trabajo: [HISTORICO.md](HISTORICO.md).
+
 A fast, open-source, Mac-native Gmail client. Superhuman-class speed, AI on
 your own API keys, no subscription, no server, no telemetry.
 

@@ -1,0 +1,17 @@
+---
+description: Volcado de sesión, HISTORICO.md y enlace desde el README
+alwaysApply: true
+---
+
+# Sesiones e HISTORICO
+
+Tras cada interacción (también si Horacio solo pidió un cambio pequeño):
+
+1. Carpeta `sesiones/` en la raíz. Si no existe, crearla.
+2. Volcado en bruto (todas las interacciones de esta conversación) en markdown.
+   - Nombre: `AAAA-MM-DD-tema-corto.md`
+   - Si el fichero de esta sesión ya existe, **añadir** lo nuevo; no sobrescribir.
+3. `HISTORICO.md` en la raíz: tabla compacta Fecha / Pedido / Hecho / Sesión, con enlace al md.
+4. Comprobar que el README (o fichero principal) enlaza `HISTORICO.md`. Si no, añadir el enlace.
+
+Si todo eso ya estaba hecho en este turno, decirlo y no duplicar.
