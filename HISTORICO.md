@@ -8,3 +8,4 @@
 | 2026-10-03 16:27 | Comparar lado a lado Outlook for Mac y Hudson | Matriz de producto (PIM vs cliente Gmail local-first); canvas en Cursor | [2026-10-03-comparar-outlook-hudson](sesiones/2026-10-03-comparar-outlook-hudson.md) |
 | 2026-10-03 16:30 | Datos OAuth de EmailerX para el onboarding de Hudson | Emailer_X no tiene Client ID/Secret; usado el Desktop de `credentials_eps.json` (sin secret en el repo) | [2026-10-03-bajar-y-compilar-hudson](sesiones/2026-10-03-bajar-y-compilar-hudson.md) |
 | 2026-10-03 16:45 | ¿Hudson sirve para mail IONOS? | No: Hudson solo Gmail API; IONOS es IMAP/SMTP | [2026-10-03-comparar-outlook-hudson](sesiones/2026-10-03-comparar-outlook-hudson.md) |
+| 2026-10-03 16:52 | App FOSS compilable en Mac con IONOS y código retocable | Mailspring / Himalaya / Thunderbird / Mailia; no hay Hudson-IMAP | [2026-10-03-comparar-outlook-hudson](sesiones/2026-10-03-comparar-outlook-hudson.md) |

@@ -27,3 +27,20 @@ vale tambien para mail ionos ???
 ## Agente
 
 No. Hudson es Gmail API + OAuth (spec: “Gmail only… no IMAP”). IONOS es IMAP/SMTP. En Outlook de este Mac la cuenta IMAP `horacio@horacio-ps.com` encaja ahí; no entra en Hudson. Para IONOS: Outlook, Mail.app u otro cliente IMAP.
+
+## Usuario
+
+joder. pues que otra app con soruce code en github hay que se pueda compilar par amac y que tb fucnine con ionos? y que you pueda retocar par añadir cosas
+
+## Agente
+
+No hay un Hudson-con-IMAP maduro. Opciones:
+
+1. Mailspring https://github.com/Foundry376/Mailspring — GUI real, IMAP/SMTP, `npm start` en Mac, GPL-3. Sync C++ en Foundry376/Mailspring-Sync. ID opcional; Pro usa servidor cerrado.
+2. Himalaya https://github.com/pimalaya/himalaya — CLI Rust, IMAP+SMTP, fácil de forkear. MIT/Apache.
+3. Thunderbird https://github.com/thunderbird/thunderbird-desktop — IONOS de sobra, build tipo Firefox.
+4. Mailia https://github.com/rhinoc/mailia — SwiftUI + Himalaya, 1 estrella, macOS 26+. Experimental.
+
+No: Inbox Zero Mail (Gmail), MailKeep (backup). Canvas: imap-open-source-mac.canvas.tsx
+
+Cierre: sesión + HISTORICO + push.
