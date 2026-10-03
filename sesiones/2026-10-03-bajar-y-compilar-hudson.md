@@ -51,3 +51,13 @@ Outlook (perfil `Main Profile`) tiene 2 cuentas en `ProfilePreferences.plist`:
 Office ActivationEmail extra: `hperez@ucam.edu` (no aparece como cuenta de correo en el perfil).
 
 No se copiaron tokens ni contraseñas (Keychain / `Outlook.sqlite` / `HxStore`). Hudson es solo Gmail API + OAuth propio: Outlook no puede ceder la sesión. IMAP no entra en Hudson. Alta: Sign in with Google / `hudson auth` con la Gmail.
+
+---
+
+## Pedido (16:26)
+
+Lanza Hudson.
+
+## Hecho
+
+`open ~/Applications/Hudson.app` — proceso `HudsonApp` (pid 90054).
