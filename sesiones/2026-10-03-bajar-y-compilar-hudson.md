@@ -34,3 +34,20 @@ Workspace vacío (`Email Mac Hudson Fork`) salvo `.vscode/`. Flujo Horacio: clon
 origin    https://github.com/horacioeps/hudson.git
 upstream  https://github.com/mannasdev/hudson.git
 ```
+
+---
+
+## Pedido (16:14)
+
+Para añadir las cuentas de email, extraer esa info de Outlook for Mac.
+
+## Hecho
+
+Outlook (perfil `Main Profile`) tiene 2 cuentas en `ProfilePreferences.plist`:
+
+- `horacio.eps@gmail.com` — conector Google (`InternetGoogle`)
+- `horacio@horacio-ps.com` — IMAP genérico (`InternetMailIMAP`)
+
+Office ActivationEmail extra: `hperez@ucam.edu` (no aparece como cuenta de correo en el perfil).
+
+No se copiaron tokens ni contraseñas (Keychain / `Outlook.sqlite` / `HxStore`). Hudson es solo Gmail API + OAuth propio: Outlook no puede ceder la sesión. IMAP no entra en Hudson. Alta: Sign in with Google / `hudson auth` con la Gmail.
